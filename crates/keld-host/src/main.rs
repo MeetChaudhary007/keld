@@ -32,15 +32,7 @@ fn main() {
     #[cfg(windows)]
     let windows_args: Vec<std::ffi::OsString> = env::args_os().collect();
     #[cfg(windows)]
-    if windows_args.get(1).map(std::ffi::OsString::as_os_str)
-        == Some(std::ffi::OsStr::new(WINDOWS_DEV_STAGE_CLEANUP_ARG))
-    {
-        if let Err(error) = run_windows_dev_stage_cleanup(&windows_args) {
-            let mut output = std::io::stdout().lock();
-            let _ = writeln!(output, "{error}");
-            let _ = output.flush();
-            process::exit(1);
-        }
+    if handle_windows_private_role(&windows_args) {
         return;
     }
     let args: Vec<String> = env::args().collect();
@@ -139,6 +131,25 @@ fn main() {
     }
 }
 
+#[cfg(windows)]
+fn handle_windows_private_role(args: &[std::ffi::OsString]) -> bool {
+    if handle_profile_test_root_probe(args) {
+        return true;
+    }
+    if args.get(1).map(std::ffi::OsString::as_os_str)
+        == Some(std::ffi::OsStr::new(WINDOWS_DEV_STAGE_CLEANUP_ARG))
+    {
+        if let Err(error) = run_windows_dev_stage_cleanup(args) {
+            let mut output = std::io::stdout().lock();
+            let _ = writeln!(output, "{error}");
+            let _ = output.flush();
+            process::exit(1);
+        }
+        return true;
+    }
+    false
+}
+
 #[cfg(all(target_os = "macos", feature = "profile-test-hooks", debug_assertions))]
 fn run_macos_profile_fixture_role(args: &[String]) -> bool {
     match args.get(1).map(String::as_str) {
@@ -196,6 +207,33 @@ fn run_macos_profile_fixture_role(args: &[String]) -> bool {
             true
         }
         _ => false,
+    }
+}
+
+#[cfg(windows)]
+fn handle_profile_test_root_probe(args: &[std::ffi::OsString]) -> bool {
+    if args.get(1).map(std::ffi::OsString::as_os_str)
+        != Some(std::ffi::OsStr::new("--keld-profile-test-root-probe-v1"))
+    {
+        return false;
+    }
+    #[cfg(feature = "kel135-profile-test-root")]
+    {
+        if args.len() != 2 {
+            eprintln!("KELD-CORE-037: profile test-root probe arguments are malformed.");
+            process::exit(2);
+        }
+        let Some(root) = env::var_os("KELD_PROFILE_TEST_ROOT") else {
+            eprintln!("KELD-CORE-037: profile test-root probe has no selected root.");
+            process::exit(2);
+        };
+        println!("KELD_PROFILE_TEST_ROOT_FEATURE {}", root.to_string_lossy());
+        return true;
+    }
+    #[cfg(not(feature = "kel135-profile-test-root"))]
+    {
+        eprintln!("KELD-CORE-037: profile test-root probe is unavailable in this host.");
+        process::exit(2);
     }
 }
 
