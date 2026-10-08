@@ -3051,7 +3051,7 @@ fn list_job_process_ids_with(
                 "the Job reported more process IDs than the snapshot buffer holds",
             ));
         }
-        if short_buffer || listed < assigned {
+        if short_buffer || listed == capacity {
             capacity = assigned
                 .max(capacity.saturating_mul(2))
                 .saturating_add(JOB_PROCESS_ID_LIST_GROWTH_SLACK);
@@ -3592,6 +3592,7 @@ impl WindowsHostDeathJob {
             raw_job,
             released.handle.as_raw_handle().cast(),
             deadline,
+            || list_job_process_ids(raw_job, "host-death census snapshot"),
             open_member,
         )?;
         clear_job_kill_on_close(raw_job, "host-death Job release")?;
@@ -3652,6 +3653,7 @@ fn exit_census(
     host_death_job: HANDLE,
     attempt_job: HANDLE,
     deadline: Instant,
+    mut snapshot_ids: impl FnMut() -> Result<WindowsJobProcessIdSnapshot, WindowsHostJobError>,
     mut open_member: impl FnMut(u32) -> io::Result<OwnedHandle>,
 ) -> Result<WindowsExitCensus, WindowsHostJobError> {
     let own_process_id = std::process::id();
@@ -3659,12 +3661,16 @@ fn exit_census(
     let mut snapshots = 0_u32;
     loop {
         snapshots = snapshots.saturating_add(1);
-        let listed = list_job_process_ids(host_death_job, "host-death census snapshot")?.ids;
+        let snapshot = snapshot_ids()?;
+        // The kernel's count and list agree except while a membership change is in
+        // flight (KEL-270 F54); such a snapshot is retaken under the deadline, like
+        // one with an exited or reused ID, and is never a refusal.
+        let mut clean =
+            usize::try_from(snapshot.assigned).is_ok_and(|assigned| assigned == snapshot.ids.len());
         let mut family = 0_u32;
-        let mut clean = true;
         let mut terminating = Vec::new();
         let mut denied = Vec::new();
-        for process_id in listed {
+        for process_id in snapshot.ids {
             if process_id == own_process_id {
                 continue;
             }
@@ -3734,8 +3740,9 @@ fn exit_census(
             return Err(WindowsHostJobError::contract(
                 "host-death census",
                 format!(
-                    "the deadline passed with a member outside the released family still in the \
-                     host-death Job after {snapshots} snapshot(s); not released"
+                    "the deadline passed with a member outside the released family or in \
+                     transition still in the host-death Job after {snapshots} snapshot(s); \
+                     not released"
                 ),
             ));
         }
@@ -6109,6 +6116,13 @@ mod tests {
         // the deadline as a kill switch. When an exited member leaves the list
         // relative to its handle's signal is the kernel's ordering, not this
         // test's, so a list taken straight after `wait` proves nothing.
+        //
+        // This is also the kernel-contract guard for the lister's retake rule
+        // (KEL-270 F54): the lister now treats a successful list shorter than its
+        // buffer as complete, so a kernel that answered a too-small buffer with
+        // success and a truncated list would pass the lister and fail here. The
+        // initial capacities 1, 2 and 32 against three occupants take the
+        // ERROR_MORE_DATA path twice and the plain path once.
         let job = WindowsProcessJob::create().expect("create a kill-on-close Job");
         let raw = job.handle.as_raw_handle().cast();
         let completion_port = create_job_completion_port(raw)
@@ -6239,6 +6253,95 @@ mod tests {
         .expect_err("a Job that outgrows every buffer must be refused");
         assert_eq!(calls, JOB_PROCESS_ID_LIST_GROWTH_LIMIT);
         assert!(refusal.to_string().contains("outgrew"), "{refusal}");
+    }
+
+    /// Two plain Jobs, `outer` standing for the host-death Job and `inner` for the
+    /// released attempt Job nested under it, and two occupants assigned to `outer`
+    /// and then to `inner`: a released family of two, with no console host
+    /// behind the test's back.
+    fn nested_family_of_two() -> (WindowsProcessJob, WindowsProcessJob, Vec<Child>) {
+        let outer = WindowsProcessJob::create().expect("create the host-death stand-in Job");
+        let inner = WindowsProcessJob::create().expect("create the attempt stand-in Job");
+        let occupants: Vec<Child> = (0..2).map(|_| spawn_blocking_descendant()).collect();
+        for occupant in &occupants {
+            for job in [&outer, &inner] {
+                // SAFETY: both handles are live; the occupant is a test-owned
+                // fixture assigned to test-owned Jobs for the duration of the test.
+                assert_ne!(
+                    unsafe {
+                        AssignProcessToJobObject(
+                            job.handle.as_raw_handle().cast(),
+                            occupant.as_raw_handle().cast(),
+                        )
+                    },
+                    0,
+                    "assign an occupant: {}",
+                    io::Error::last_os_error()
+                );
+            }
+        }
+        (outer, inner, occupants)
+    }
+
+    #[test]
+    fn a_snapshot_whose_count_and_list_disagree_is_retaken_not_refused() {
+        // KEL-270 F54: a snapshot whose assigned count exceeds its list names a
+        // member still leaving the Job. It is not clean, and the census retakes it
+        // under the deadline; the next snapshot, in which count and list agree, is
+        // the clean one.
+        let (outer, inner, mut occupants) = nested_family_of_two();
+        let mut ids = vec![std::process::id()];
+        ids.extend(occupants.iter().map(Child::id));
+        let mut taken = 0_u32;
+        let census = exit_census(
+            outer.handle.as_raw_handle().cast(),
+            inner.handle.as_raw_handle().cast(),
+            Instant::now() + RELEASE_WAIT,
+            || {
+                taken += 1;
+                Ok(WindowsJobProcessIdSnapshot {
+                    ids: ids.clone(),
+                    assigned: if taken == 1 { 4 } else { 3 },
+                })
+            },
+            open_census_member,
+        )
+        .expect("a member in transition must not refuse the census");
+        assert_eq!(census.snapshots, 2, "{census:?}");
+        assert_eq!(census.family, 2, "{census:?}");
+        assert_eq!(census.terminated, 0, "{census:?}");
+        for occupant in &mut occupants {
+            occupant.kill().expect("end an occupant");
+            occupant.wait().expect("reap an occupant");
+        }
+    }
+
+    #[test]
+    fn a_job_that_never_settles_is_refused_at_the_deadline_naming_the_transition() {
+        // Negative control for the cell above: with every snapshot reporting one
+        // more assigned process than it lists, the cross-check alone keeps the
+        // census from a clean snapshot, and the deadline is the only refusal.
+        let (outer, inner, mut occupants) = nested_family_of_two();
+        let mut ids = vec![std::process::id()];
+        ids.extend(occupants.iter().map(Child::id));
+        let refusal = exit_census(
+            outer.handle.as_raw_handle().cast(),
+            inner.handle.as_raw_handle().cast(),
+            Instant::now() + Duration::from_millis(200),
+            || {
+                Ok(WindowsJobProcessIdSnapshot {
+                    ids: ids.clone(),
+                    assigned: 4,
+                })
+            },
+            open_census_member,
+        )
+        .expect_err("a Job that never settles must be refused at the deadline");
+        assert!(refusal.to_string().contains("in transition"), "{refusal}");
+        for occupant in &mut occupants {
+            occupant.kill().expect("end an occupant");
+            occupant.wait().expect("reap an occupant");
+        }
     }
 
     #[test]

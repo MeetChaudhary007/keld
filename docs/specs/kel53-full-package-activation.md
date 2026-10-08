@@ -2234,7 +2234,9 @@ only H cleared the candidate dies with the host; with both cleared it survives t
 host's exit; `JobObjectBasicProcessIdList` on H lists every member, and per-member
 `IsProcessInJob(A)` tells the family from the rest; a console child's `conhost.exe` is
 created asynchronously after the child resumes and inherits its creator's Jobs; a
-member's removal from the list can lag its termination; and 64 nested levels and 10
+member's removal from the list can lag its termination, and the Job's assigned count can
+lag that removal by a further scheduling delay (build 26300, KEL-270 finding F54
+measurement); and 64 nested levels and 10
 update generations assigned without failure. Both clears are necessary, and together
 they are sufficient.
 
@@ -2313,8 +2315,12 @@ which no owner can compose while that family runs, so recovery would halt for as
 as the candidate lived.
 
 *Census and policy.* The census takes a snapshot of H's process IDs with
-`QueryInformationJobObject(JobObjectBasicProcessIdList)`; a list shorter than the
-assigned count is retaken with a larger buffer. For every ID other than the host's own
+`QueryInformationJobObject(JobObjectBasicProcessIdList)`; a query that fails with
+`ERROR_MORE_DATA` is retaken with a larger buffer, and a successful list is complete. A
+snapshot whose assigned count differs from its list length (a member still leaving, or
+joining) is not clean and is retaken under the deadline, never refused (KEL-270 finding
+F54; the F54 root-fix proposal, §2a, §2b and §5, is the authority for this rule). For
+every ID other than the host's own
 it opens the process with `PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE |
 PROCESS_SYNCHRONIZE`, one handle per member, through which it classifies, waits and, if
 needed, terminates; a second open for termination would be a second lookup of a
