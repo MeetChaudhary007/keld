@@ -2318,10 +2318,15 @@ as the candidate lived.
 `QueryInformationJobObject(JobObjectBasicProcessIdList)`; a query that fails with
 `ERROR_MORE_DATA` is retaken with a larger buffer, and a successful list is complete. A
 snapshot whose assigned count differs from its list length (a member still leaving, or
-joining) is not clean and is retaken under the deadline, never refused (KEL-270 finding
-F54; the F54 root-fix proposal, §2a, §2b and §5, is the authority for this rule). For
-every ID other than the host's own
-it opens the process with `PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE |
+joining) is not clean and is retaken under the deadline, never refused. The rule rests on
+two facts measured on Windows 11 build 26300 (KEL-270 finding F54, Linear comment
+`ea4c3fbf-ac8d-45e4-bc37-2613db807459`): a too-small buffer is reported as
+`ERROR_MORE_DATA` with the header written, never as a success with a truncated list; and
+the assigned count can exceed the list for one lock release while a member leaves, and
+never drops before the list omits the member. Microsoft does not document that
+count-versus-list ordering, so the cross-check is defence in depth, not a reading of a
+documented contract. For every ID other than the host's own it opens the process with
+`PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE |
 PROCESS_SYNCHRONIZE`, one handle per member, through which it classifies, waits and, if
 needed, terminates; a second open for termination would be a second lookup of a
 reusable ID. An open that fails because no live process has that ID

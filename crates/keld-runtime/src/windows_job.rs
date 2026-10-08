@@ -2939,6 +2939,18 @@ struct WindowsJobProcessIdSnapshot {
     assigned: u32,
 }
 
+impl WindowsJobProcessIdSnapshot {
+    /// Whether the kernel's assigned count and its list agree.
+    ///
+    /// Every census caller MUST require this before it treats a snapshot as clean,
+    /// the Machine-UAC census of S12 included: a disagreement names a membership
+    /// change in flight (KEL-270 finding F54), so the snapshot is retaken under the
+    /// caller's deadline, never refused and never accepted.
+    fn is_settled(&self) -> bool {
+        usize::try_from(self.assigned).is_ok_and(|assigned| assigned == self.ids.len())
+    }
+}
+
 /// Words of the process-ID list record that precede the ID array. The record is
 /// two u32 counts followed by the `ULONG_PTR` ID array, so a usize buffer holds
 /// it at the alignment it requires and the IDs start at a whole-word offset.
@@ -3665,8 +3677,7 @@ fn exit_census(
         // The kernel's count and list agree except while a membership change is in
         // flight (KEL-270 F54); such a snapshot is retaken under the deadline, like
         // one with an exited or reused ID, and is never a refusal.
-        let mut clean =
-            usize::try_from(snapshot.assigned).is_ok_and(|assigned| assigned == snapshot.ids.len());
+        let mut clean = snapshot.is_settled();
         let mut family = 0_u32;
         let mut terminating = Vec::new();
         let mut denied = Vec::new();
@@ -6117,12 +6128,13 @@ mod tests {
         // relative to its handle's signal is the kernel's ordering, not this
         // test's, so a list taken straight after `wait` proves nothing.
         //
-        // This is also the kernel-contract guard for the lister's retake rule
-        // (KEL-270 F54): the lister now treats a successful list shorter than its
-        // buffer as complete, so a kernel that answered a too-small buffer with
-        // success and a truncated list would pass the lister and fail here. The
-        // initial capacities 1, 2 and 32 against three occupants take the
-        // ERROR_MORE_DATA path twice and the plain path once.
+        // What this cell guards (KEL-270 F54): against the real kernel, the lister
+        // returns exactly the Job's members from three initial capacities. A
+        // success truncated at capacity 1 or 2 is not caught here but by the
+        // lister's full-buffer retake
+        // (`the_process_id_lister_retakes_a_success_that_filled_the_buffer`); only
+        // a truncation below capacity would fail this cell. Capacities 1, 2 and 32
+        // take the ERROR_MORE_DATA path twice and the plain path once.
         let job = WindowsProcessJob::create().expect("create a kill-on-close Job");
         let raw = job.handle.as_raw_handle().cast();
         let completion_port = create_job_completion_port(raw)
@@ -6253,6 +6265,28 @@ mod tests {
         .expect_err("a Job that outgrows every buffer must be refused");
         assert_eq!(calls, JOB_PROCESS_ID_LIST_GROWTH_LIMIT);
         assert!(refusal.to_string().contains("outgrew"), "{refusal}");
+    }
+
+    #[test]
+    fn the_process_id_lister_retakes_a_success_that_filled_the_buffer() {
+        // The lister's defensive rule: a success whose list fills the buffer is
+        // retaken with a larger one, because the kernel could not then have shown
+        // whether the list was cut. The second query is the one that settles it.
+        let wanted: Vec<u32> = (200..204).collect();
+        let mut capacities = Vec::new();
+        let snapshot = list_job_process_ids_with(4, "test list", |buffer| {
+            let capacity = buffer.len() - JOB_PROCESS_ID_LIST_HEADER_WORDS;
+            capacities.push(capacity);
+            let listed = capacity.min(wanted.len());
+            write_process_id_record(buffer, 4, &wanted[..listed]);
+            Ok(())
+        })
+        .expect("the retake settles the list");
+        assert_eq!(capacities.len(), 2, "{capacities:?}");
+        assert_eq!(capacities[0], 4);
+        assert!(capacities[1] > 4, "{capacities:?}");
+        assert_eq!(snapshot.ids, wanted);
+        assert_eq!(snapshot.assigned, 4);
     }
 
     /// Two plain Jobs, `outer` standing for the host-death Job and `inner` for the
