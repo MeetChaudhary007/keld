@@ -28,13 +28,17 @@ struct ObservedChild {
 }
 
 impl ObservedChild {
-    fn wait_for_output(mut self, timeout: Duration) -> Result<Output, String> {
+    fn wait_for_output(self, timeout: Duration) -> Result<Output, String> {
+        self.wait_for_output_until(Instant::now() + timeout)
+    }
+
+    fn wait_for_output_until(mut self, deadline: Instant) -> Result<Output, String> {
         let child = self.child.as_mut().expect("observed child present");
-        let started = Instant::now();
+        let pid = child.id();
         let status = loop {
             match child.try_wait() {
                 Ok(Some(status)) => break status,
-                Ok(None) if started.elapsed() < timeout => {
+                Ok(None) if Instant::now() < deadline => {
                     thread::park_timeout(Duration::from_millis(10));
                 }
                 Ok(None) => {
@@ -45,7 +49,8 @@ impl ObservedChild {
                     self.child.take();
                     let output = self.output(status)?;
                     return Err(format!(
-                        "child did not exit within {timeout:?}; stdout={} stderr={}",
+                        "child did not exit by the observation deadline; pid={pid} reaped_status={:?}; stdout={} stderr={}",
+                        output.status,
                         String::from_utf8_lossy(&output.stdout),
                         String::from_utf8_lossy(&output.stderr)
                     ));
@@ -55,6 +60,44 @@ impl ObservedChild {
         };
         self.child.take();
         self.output(status)
+    }
+
+    /// Observes a recorder phase without turning elapsed time into readiness.
+    #[cfg(unix)]
+    fn wait_for_stdout_marker(&mut self, marker: &str, deadline: Instant) -> Result<(), String> {
+        let pid = self.child.as_ref().expect("observed child present").id();
+        loop {
+            let stdout = std::fs::read(&self.stdout_path)
+                .map_err(|error| format!("pid={pid} read recorder progress: {error}"))?;
+            if String::from_utf8_lossy(&stdout)
+                .lines()
+                .any(|line| line == marker)
+            {
+                return Ok(());
+            }
+            let status = self
+                .child
+                .as_mut()
+                .expect("observed child present")
+                .try_wait()
+                .map_err(|error| format!("pid={pid} probe recorder exit: {error}"))?;
+            if let Some(status) = status {
+                return Err(format!(
+                    "pid={pid} exited before marker `{marker}`; {}",
+                    output_diagnostics(&self.output(status)?)
+                ));
+            }
+            if Instant::now() >= deadline {
+                let stderr = std::fs::read(&self.stderr_path)
+                    .map_err(|error| format!("pid={pid} read recorder stderr: {error}"))?;
+                return Err(format!(
+                    "pid={pid} recorder marker `{marker}` absent at deadline; stdout={} stderr={}",
+                    String::from_utf8_lossy(&stdout),
+                    String::from_utf8_lossy(&stderr)
+                ));
+            }
+            thread::yield_now();
+        }
     }
 
     fn output(&self, status: std::process::ExitStatus) -> Result<Output, String> {
@@ -205,6 +248,17 @@ fn spawn_generated_main_with(
     executable: &OsStr,
     preserve_input_spelling: bool,
 ) -> ObservedChild {
+    let (mut command, output_root) =
+        generated_main_command(project, link, executable, preserve_input_spelling);
+    spawn_observed(&mut command, &output_root)
+}
+
+fn generated_main_command(
+    project: &Path,
+    link: &str,
+    executable: &OsStr,
+    preserve_input_spelling: bool,
+) -> (Command, PathBuf) {
     let project = if preserve_input_spelling {
         project.to_path_buf()
     } else {
@@ -222,7 +276,7 @@ fn spawn_generated_main_with(
             .env("KELD185_LAUNCH_MAIN", &main)
             .env("KELD185_LAUNCH_CWD", &project);
     }
-    spawn_observed(&mut command, &project)
+    (command, project)
 }
 
 fn add_entrypoint_diagnostic(project: &Path) {
@@ -540,7 +594,7 @@ fn generated_main_launch_preserves_supplied_path_spelling() {
     let recorder = dir.path().join("record-bun");
     std::fs::write(
         &recorder,
-        "#!/bin/sh\nprintf 'main=%s\\n' \"$2\"\nprintf 'launch_main=%s\\n' \"$KELD185_LAUNCH_MAIN\"\nprintf 'launch_cwd=%s\\n' \"$KELD185_LAUNCH_CWD\"\nprintf 'runtime_cwd=%s\\n' \"$(pwd -P)\"\n",
+        "#!/bin/sh\ngate=\nprintf 'KELD669_STARTED\\n'\nIFS= read -r gate || exit 64\n[ \"$gate\" = RECORD ] || exit 65\nprintf 'main=%s\\n' \"$2\"\nprintf 'launch_main=%s\\n' \"$KELD185_LAUNCH_MAIN\"\nprintf 'launch_cwd=%s\\n' \"$KELD185_LAUNCH_CWD\"\nprintf 'runtime_cwd=%s\\n' \"$(pwd -P)\"\nprintf 'KELD669_COMPLETE\\n'\n",
     )
     .expect("write process-boundary recorder");
     let mut permissions = std::fs::metadata(&recorder)
@@ -549,11 +603,32 @@ fn generated_main_launch_preserves_supplied_path_spelling() {
     permissions.set_mode(0o755);
     std::fs::set_permissions(&recorder, permissions).expect("make recorder executable");
 
-    let output = spawn_generated_main_with(&project, "unused-app-link", recorder.as_os_str(), true)
-        .wait_for_output(Duration::from_secs(2))
-        .expect("bounded command recorder");
+    let (mut command, output_root) =
+        generated_main_command(&project, "unused-app-link", recorder.as_os_str(), true);
+    command.stdin(Stdio::piped());
+    let mut child = spawn_observed(&mut command, &output_root);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    child
+        .wait_for_stdout_marker("KELD669_STARTED", deadline)
+        .expect("recorder interpreter reached its first marker");
+    let mut gate = child
+        .child
+        .as_mut()
+        .expect("retained recorder")
+        .stdin
+        .take()
+        .expect("owned recorder release pipe");
+    writeln!(gate, "RECORD").expect("release the recorder after its start observation");
+    drop(gate);
+    let output = child
+        .wait_for_output_until(deadline)
+        .expect("bounded command recorder after observed start");
     assert!(output.status.success(), "recorder failed: {output:?}");
     let stdout = String::from_utf8(output.stdout).expect("recorder stdout is UTF-8");
+    assert!(
+        stdout.lines().any(|line| line == "KELD669_COMPLETE"),
+        "recorder exited without completing its records: {stdout}"
+    );
     let expected_main = project.join("src/main.ts");
     let expected_main_line = format!("main={}", expected_main.display());
     assert!(
@@ -1099,4 +1174,135 @@ try {
         !stdout.contains("first=\"keld\":1") && !stdout.contains("second=\"keld\":1"),
         "must not print the hardcoded demo payload: {stdout}"
     );
+}
+
+/// Independent control: start is observable while completion is still gated.
+#[cfg(unix)]
+#[test]
+fn recorder_start_is_observed_before_parent_releases_completion() {
+    let dir = tempfile::tempdir().expect("recorder handshake root");
+    let mut command = Command::new("/bin/sh");
+    command.args(["-c", "gate=; printf 'KELD669_STARTED\\n'; IFS= read -r gate; [ \"$gate\" = RECORD ] || exit 65; printf 'KELD669_COMPLETE\\n'"])
+        .stdin(Stdio::piped());
+    let mut child = spawn_observed(&mut command, dir.path());
+    let deadline = Instant::now() + Duration::from_secs(2);
+    child
+        .wait_for_stdout_marker("KELD669_STARTED", deadline)
+        .expect("actual recorder start");
+    assert!(
+        child
+            .child
+            .as_mut()
+            .expect("recorder child")
+            .try_wait()
+            .expect("probe held recorder")
+            .is_none()
+    );
+    assert!(
+        !String::from_utf8_lossy(&std::fs::read(&child.stdout_path).expect("started record"))
+            .lines()
+            .any(|line| line == "KELD669_COMPLETE")
+    );
+    let mut gate = child
+        .child
+        .as_mut()
+        .expect("recorder child")
+        .stdin
+        .take()
+        .expect("release pipe");
+    writeln!(gate, "RECORD").expect("release held recorder");
+    drop(gate);
+    let output = child
+        .wait_for_output_until(deadline)
+        .expect("bounded recorder completion");
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .any(|line| line == "KELD669_COMPLETE")
+    );
+}
+
+/// A real child can exit without readiness; an always-ready observer must fail.
+#[cfg(unix)]
+#[test]
+fn recorder_exit_without_start_marker_preserves_exit_and_output() {
+    let dir = tempfile::tempdir().expect("no-start recorder root");
+    let mut command = Command::new("/bin/sh");
+    command.args([
+        "-c",
+        "printf 'KELD669_EXIT_ONLY\\n'; printf 'KELD669_NO_START_DIAGNOSTIC\\n' >&2; exit 7",
+    ]);
+    let mut child = spawn_observed(&mut command, dir.path());
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let error = child
+        .wait_for_stdout_marker("KELD669_STARTED", deadline)
+        .expect_err("a child that never reports STARTED cannot be ready");
+    assert!(
+        error.contains("exited before marker `KELD669_STARTED`"),
+        "{error}"
+    );
+    assert!(error.contains("status=Some(7)"), "{error}");
+    assert!(error.contains("stdout=KELD669_EXIT_ONLY"), "{error}");
+    assert!(
+        error.contains("stderr=KELD669_NO_START_DIAGNOSTIC"),
+        "{error}"
+    );
+}
+
+/// macOS process census independently checks Drop after a live missing-marker deadline.
+#[cfg(target_os = "macos")]
+#[test]
+fn recorder_live_missing_marker_deadline_preserves_output_and_drop_reaps() {
+    let dir = tempfile::tempdir().expect("live no-start recorder root");
+    let mut command = Command::new("/bin/sh");
+    command
+        .args([
+            "-c",
+            "printf 'KELD669_LIVE_%s\\n' \"$$\"; printf 'KELD669_HELD_DIAGNOSTIC_%s\\n' \"$$\" >&2; IFS= read -r gate",
+        ])
+        .stdin(Stdio::piped());
+    let mut child = spawn_observed(&mut command, dir.path());
+    let pid = child.child.as_ref().expect("owned live recorder").id();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let live = format!("KELD669_LIVE_{pid}");
+    child
+        .wait_for_stdout_marker(&live, deadline)
+        .expect("actual child reached its live marker");
+    let error = child
+        .wait_for_stdout_marker("KELD669_STARTED", deadline)
+        .expect_err("the held live recorder never supplies the requested marker");
+    assert!(
+        error.contains(&format!(
+            "pid={pid} recorder marker `KELD669_STARTED` absent at deadline"
+        )),
+        "{error}"
+    );
+    assert!(
+        Instant::now() >= deadline,
+        "deadline failure preceded the shared deadline: {error}"
+    );
+    assert!(error.contains(&format!("stdout={live}")), "{error}");
+    assert!(
+        error.contains(&format!("stderr=KELD669_HELD_DIAGNOSTIC_{pid}")),
+        "{error}"
+    );
+    assert!(
+        child
+            .child
+            .as_mut()
+            .expect("retained timed-out recorder")
+            .try_wait()
+            .expect("probe child before custody Drop")
+            .is_none(),
+        "the missing-marker observer must leave its live child in custody"
+    );
+    drop(child);
+    let census = Command::new("/bin/ps")
+        .args(["-p", &pid.to_string(), "-o", "pid="])
+        .output()
+        .expect("independent exact-PID census after Drop");
+    assert_eq!(census.status.code(), Some(1), "{census:?}");
+    assert!(census.stdout.is_empty(), "{census:?}");
+    assert!(census.stderr.is_empty(), "{census:?}");
 }
