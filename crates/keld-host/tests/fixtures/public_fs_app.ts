@@ -8,7 +8,24 @@ const target = __TARGET__;
 const outside = __OUTSIDE__;
 const content = new Uint8Array(__CONTENT__);
 const automaticComponent = __AUTOMATIC_COMPONENT__;
+const naturalCase: "deny-read" | "links-limits" | null = __NATURAL_CASE__;
+type NaturalInputs = {
+  readSentinel: string;
+  internalAlias: string;
+  externalAlias: string;
+  oversizedWrite: string;
+  oversizedRead: string;
+  fresh: string;
+  maximumContent: number;
+};
+const naturalInputs: NaturalInputs | null = __NATURAL_INPUTS__;
+const sampleControlBudget = 4096;
 let handlerCalls = 0;
+function rejectedFsOutcome(error: unknown): FsSampleOutcome {
+  if (!isCallError(error)) throw error;
+  // Preserve the registered native code and full original fix text.
+  return { ok: false, code: error.code, message: error.message };
+}
 function isControl(value: unknown): value is Control {
   if (typeof value !== "object" || value === null) return false;
   const record = value as Record<string, unknown>;
@@ -25,9 +42,51 @@ async function performFsOperation(action: "roundtrip" | "deny"): Promise<FsSampl
     await fs.write(outside, new Uint8Array([7, 8, 9]));
     return { ok: true, bytes: [] };
   } catch (error: unknown) {
-    if (!isCallError(error)) throw error;
-    // Preserve the native code and full original text, including its fix.
-    return { ok: false, code: error.code, message: error.message };
+    return rejectedFsOutcome(error);
+  }
+}
+type NaturalAction =
+  | "denied-read"
+  | "internal-read" | "internal-write" | "internal-read-after-write"
+  | "external-read" | "external-write"
+  | "oversize-write" | "oversize-read"
+  | "healthy-write" | "healthy-read";
+async function performNaturalOperation(action: NaturalAction): Promise<FsSampleOutcome> {
+  if (!naturalInputs) throw new Error("natural fixture inputs absent");
+  try {
+    switch (action) {
+      case "denied-read":
+        await fs.read(naturalInputs.readSentinel);
+        // An unexpected allow is visible as success, but no sentinel data leaks.
+        return { ok: true, bytes: [] };
+      case "internal-read":
+      case "internal-read-after-write":
+        return { ok: true, bytes: [...await fs.read(naturalInputs.internalAlias)] };
+      case "internal-write":
+        await fs.write(naturalInputs.internalAlias, content);
+        return { ok: true, bytes: [] };
+      case "external-read":
+        await fs.read(naturalInputs.externalAlias);
+        return { ok: true, bytes: [] };
+      case "external-write":
+        await fs.write(naturalInputs.externalAlias, new Uint8Array([7, 8, 9]));
+        return { ok: true, bytes: [] };
+      case "oversize-write":
+        await fs.write(naturalInputs.oversizedWrite,
+          new Uint8Array(naturalInputs.maximumContent + 1).fill(0x79));
+        return { ok: true, bytes: [] };
+      case "oversize-read":
+        await fs.read(naturalInputs.oversizedRead);
+        // Never serialize an unexpectedly successful large read to the observer.
+        return { ok: true, bytes: [] };
+      case "healthy-write":
+        await fs.write(naturalInputs.fresh, content);
+        return { ok: true, bytes: [] };
+      case "healthy-read":
+        return { ok: true, bytes: [...await fs.read(naturalInputs.fresh)] };
+    }
+  } catch (error: unknown) {
+    return rejectedFsOutcome(error);
   }
 }
 channels.handle(echoChannel, async request => {
@@ -49,7 +108,7 @@ channels.handle(echoChannel, async request => {
     throw new Error("public FS sample unknown action");
   }
   const response = { message: JSON.stringify(outcome), count: request.count };
-  if (echoChannel.encodeResponse(response).byteLength > 4096) {
+  if (echoChannel.encodeResponse(response).byteLength > sampleControlBudget) {
     throw new Error("sample outcome exceeds renderer control budget");
   }
   console.error("KELD_KEL140_PUBLIC_OUTCOME " + JSON.stringify({
@@ -86,6 +145,27 @@ if (automaticComponent) {
   const observed = await fetch(base + "/observe", { method: "POST",
     headers: { "Content-Type": "text/plain" }, body: JSON.stringify(result) });
   if (!observed.ok) throw new Error("public app component observation refused");
+} else if (naturalCase) {
+  // Closed public-main scenarios only: no renderer action or Echo forwarding.
+  const actions: readonly NaturalAction[] = naturalCase === "deny-read"
+    ? ["denied-read"]
+    : ["internal-read", "internal-write", "internal-read-after-write",
+      "external-read", "external-write", "oversize-write", "oversize-read",
+      "healthy-write", "healthy-read"];
+  const outcomes: { action: NaturalAction; outcome: FsSampleOutcome }[] = [];
+  for (const action of actions) {
+    outcomes.push({ action, outcome: await performNaturalOperation(action) });
+  }
+  const result = { phase: "app-result", pid: process.pid, componentOnly: true,
+    naturalCase, outcomes };
+  const body = JSON.stringify(result);
+  if (new TextEncoder().encode(body).byteLength > sampleControlBudget) {
+    throw new Error("natural outcomes exceed existing sample control budget");
+  }
+  console.error("KELD_KEL140_PUBLIC_APP_COMPONENT " + body);
+  const observed = await fetch(base + "/observe", { method: "POST",
+    headers: { "Content-Type": "text/plain" }, body });
+  if (!observed.ok) throw new Error("public natural-case observation refused");
 }
 // The observer retains this stream without blocking other page observations.
 const quit = await fetch(base + "/quit");

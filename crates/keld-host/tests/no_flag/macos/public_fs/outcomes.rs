@@ -1,5 +1,8 @@
 //! Independent page/application outcome binding and native byte/no-effect oracles.
-use super::project::{CONTENT, Policy, SENTINEL};
+use super::project::{
+    CONTENT, INTERNAL_INITIAL, NaturalInputs, Policy, PreparedLaunch, READ_SENTINEL, SENTINEL,
+    WRITE_SENTINEL, file_digest,
+};
 use serde_json::{Value, json};
 use std::fs;
 use std::path::Path;
@@ -190,5 +193,167 @@ pub(super) fn assert_component_trace(stderr: &str, reports: &[Value]) {
     assert_eq!(
         &trace[0], observed[0],
         "public-main terminal outcome bound to HTTP observation"
+    );
+}
+
+pub(super) fn assert_natural_outcomes(
+    reports: &[Value],
+    policy: Policy,
+    prepared: &PreparedLaunch,
+    outside: &Path,
+    bun: u32,
+) {
+    let completed: Vec<_> = reports
+        .iter()
+        .filter(|r| r["phase"] == "app-result")
+        .collect();
+    assert_eq!(
+        completed.len(),
+        1,
+        "one natural public-main terminal result"
+    );
+    let result = completed[0];
+    assert_eq!(result["pid"], bun);
+    assert_eq!(result["componentOnly"], true);
+    let ready = reports
+        .iter()
+        .find(|r| r["phase"] == "page-ready")
+        .expect("natural document ready");
+    assert_eq!(ready["requests"], json!([]));
+    assert_eq!(ready["outcomes"], json!([]));
+    assert!(
+        matches!(fs::symlink_metadata(&prepared.target), Err(error) if error.kind() == std::io::ErrorKind::NotFound),
+        "natural cases must never reuse or create the original component target"
+    );
+    let input = prepared
+        .natural
+        .as_ref()
+        .expect("owned natural fixture inputs");
+    let outcomes = result["outcomes"]
+        .as_array()
+        .expect("closed natural outcome list");
+    if matches!(policy, Policy::Narrow) {
+        assert_oversized_write_no_effect(input);
+        assert_links_limits_results(result, outcomes, input);
+        assert_links_limits_files(input);
+    } else {
+        assert_denied_read_result(result, outcomes, input);
+    }
+    assert_eq!(
+        fs::read(&input.read_sentinel).expect("independent read sentinel"),
+        READ_SENTINEL
+    );
+    assert_eq!(
+        fs::read(outside).expect("independent outside alias no-effect sentinel"),
+        SENTINEL
+    );
+}
+
+fn assert_oversized_write_no_effect(input: &NaturalInputs) {
+    // Check the OS effect before interpreting reported native outcomes. A
+    // missing native limit fails on a short length predicate, never an 8 MiB
+    // byte-array panic dump that obscures the independent sentinel finding.
+    assert_eq!(
+        fs::metadata(&input.oversized_write)
+            .expect("oversized write target metadata")
+            .len(),
+        u64::try_from(WRITE_SENTINEL.len()).expect("sentinel length fits u64"),
+        "oversized write changed the independent target length"
+    );
+    assert_eq!(
+        fs::read(&input.oversized_write).expect("oversized write no-effect sentinel"),
+        WRITE_SENTINEL
+    );
+}
+
+fn assert_denied_read_result(result: &Value, outcomes: &[Value], input: &NaturalInputs) {
+    assert_eq!(result["naturalCase"], "deny-read");
+    assert_eq!(outcomes.len(), 1, "direct read has no preceding write");
+    assert_eq!(outcomes[0]["action"], "denied-read");
+    assert_eq!(
+        outcomes[0]["outcome"],
+        json!({"ok":false,"code":"KELD-GUARD001","message":format!(
+            "KELD-GUARD001: capability `fs.read` is not granted. Append \"{}\" to `/app/fs/read` in keld.permissions.jsonc.",
+            input.read_sentinel.display()
+        )})
+    );
+}
+
+fn assert_links_limits_results(result: &Value, outcomes: &[Value], input: &NaturalInputs) {
+    assert_eq!(result["naturalCase"], "links-limits");
+    let actions = [
+        "internal-read",
+        "internal-write",
+        "internal-read-after-write",
+        "external-read",
+        "external-write",
+        "oversize-write",
+        "oversize-read",
+        "healthy-write",
+        "healthy-read",
+    ];
+    assert_eq!(outcomes.len(), actions.len());
+    for (actual, expected) in outcomes.iter().zip(actions) {
+        assert_eq!(actual["action"], expected);
+    }
+    assert_eq!(
+        outcomes[0]["outcome"],
+        json!({"ok":true,"bytes":INTERNAL_INITIAL})
+    );
+    assert_eq!(outcomes[1]["outcome"], json!({"ok":true,"bytes":[]}));
+    assert_eq!(outcomes[2]["outcome"], json!({"ok":true,"bytes":CONTENT}));
+    // Full literal oracle from FsError::ResolvedOutOfScope Display and the
+    // retained walk's Parent-at-root failure, not the returned message.
+    let escaped = json!({"ok":false,"code":"KELD-NATIVE-002","message":format!(
+        "KELD-NATIVE-002: `{}` escaped or changed outside its retained scope — relative link escaped above the retained root. Move the target beneath the granted root or use a direct approved scope.",
+        input.external_alias.display()
+    )});
+    assert_eq!(outcomes[3]["outcome"], escaped);
+    assert_eq!(outcomes[4]["outcome"], escaped);
+    let limited = json!({"ok":false,"code":"KELD-NATIVE-004","message":format!(
+        "KELD-NATIVE-004: filesystem content-bytes limit exceeded ({} > {}). Shorten the request or use at most 8 MiB.",
+        input.maximum_content + 1, input.maximum_content
+    )});
+    assert_eq!(outcomes[5]["outcome"], limited);
+    assert_eq!(outcomes[6]["outcome"], limited);
+    assert_eq!(outcomes[7]["outcome"], json!({"ok":true,"bytes":[]}));
+    assert_eq!(outcomes[8]["outcome"], json!({"ok":true,"bytes":CONTENT}));
+}
+
+fn assert_links_limits_files(input: &NaturalInputs) {
+    assert_eq!(
+        fs::read(&input.internal_target).expect("independent internal write bytes"),
+        CONTENT
+    );
+    assert_eq!(
+        fs::read(&input.internal_alias).expect("independent internal alias bytes"),
+        CONTENT
+    );
+    assert_eq!(
+        fs::read_link(&input.internal_alias).expect("relative internal alias remains"),
+        Path::new(
+            input
+                .internal_target
+                .file_name()
+                .expect("internal relative leaf")
+        )
+    );
+    assert_eq!(
+        fs::read_link(&input.external_alias).expect("escaping alias remains"),
+        Path::new("../outside.txt")
+    );
+    assert_eq!(
+        fs::metadata(&input.oversized_read)
+            .expect("oversized read source metadata")
+            .len(),
+        u64::try_from(input.maximum_content + 1).expect("fixture length fits u64")
+    );
+    assert_eq!(
+        file_digest(&input.oversized_read),
+        input.oversized_read_digest
+    );
+    assert_eq!(
+        fs::read(&input.fresh).expect("healthy operation after both limits"),
+        CONTENT
     );
 }

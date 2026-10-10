@@ -34,7 +34,7 @@ use application_link::assert_single_application_link;
 use observer::Observation;
 use outcomes::{
     assert_component_outcomes, assert_component_trace, assert_handler_attribution,
-    assert_page_outcomes,
+    assert_natural_outcomes, assert_page_outcomes,
 };
 use process_image::process_image_path;
 use project::{Exercise, Policy, PreparedLaunch, PublicFsProject, TITLE};
@@ -81,9 +81,10 @@ fn run_launch(fixture: &PublicFsProject, launch: usize, exercise: Exercise) -> L
     let prepared = match exercise {
         Exercise::RendererPointer => fixture.prepare(launch, observer.port),
         Exercise::PublicAppComponent => fixture.prepare_component(launch, observer.port),
+        Exercise::PublicAppNaturalCases => fixture.prepare_natural(launch, observer.port),
     };
     let stage = &prepared.stage;
-    if exercise == Exercise::PublicAppComponent {
+    if exercise != Exercise::RendererPointer {
         assert!(
             matches!(fs::symlink_metadata(&prepared.target), Err(error) if error.kind() == std::io::ErrorKind::NotFound),
             "component target must be absent before host spawn"
@@ -169,7 +170,7 @@ fn observe_launch(
         Exercise::RendererPointer => {
             observe_pointer_actions(observer, evidence, fixture, prepared, host_pid);
         }
-        Exercise::PublicAppComponent => {
+        Exercise::PublicAppComponent | Exercise::PublicAppNaturalCases => {
             observe_component_actions(observer, evidence, fixture, prepared, host_pid);
         }
     }
@@ -198,14 +199,25 @@ fn observe_component_actions(
         evidence.click.is_none(),
         "component must issue no synthetic input"
     );
-    assert_component_outcomes(
-        &evidence.reports,
-        fixture.policy,
-        &prepared.target,
-        &fixture.outside,
-        &fixture.scope,
-        evidence.family.expect("observed public app family").bun,
-    );
+    let bun = evidence.family.expect("observed public app family").bun;
+    if prepared.exercise == Exercise::PublicAppNaturalCases {
+        assert_natural_outcomes(
+            &evidence.reports,
+            fixture.policy,
+            prepared,
+            &fixture.outside,
+            bun,
+        );
+    } else {
+        assert_component_outcomes(
+            &evidence.reports,
+            fixture.policy,
+            &prepared.target,
+            &fixture.outside,
+            &fixture.scope,
+            bun,
+        );
+    }
     assert_eq!(
         await_same_native_windows(host_pid, TITLE, &evidence.window),
         evidence.window,
@@ -294,7 +306,7 @@ fn await_ready(
         assert!(
             report["phase"] == "app-ready"
                 || report["phase"] == "page-ready"
-                || (exercise == Exercise::PublicAppComponent && report["phase"] == "app-result"),
+                || (exercise != Exercise::RendererPointer && report["phase"] == "app-result"),
             "{report}"
         );
     }
@@ -372,7 +384,9 @@ fn assert_product_quit(
             evidence.reports.last().expect("final page report"),
             bun,
         ),
-        Exercise::PublicAppComponent => assert_component_trace(stderr, &evidence.reports),
+        Exercise::PublicAppComponent | Exercise::PublicAppNaturalCases => {
+            assert_component_trace(stderr, &evidence.reports);
+        }
     }
     for process in [host_pid, bun, descendant, guardian] {
         await_process_gone(process);

@@ -3,12 +3,16 @@ use crate::renderer_bridge::bundle_public_api_entry;
 use crate::support::native_window::compile_native_window_census;
 use serde_json::{Value, json};
 use std::fs;
+use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 pub(super) const TITLE: &str = "KEL140 Public FS Acceptance";
 pub(super) const CONTENT: &[u8] = &[0, 255, 65, 226, 130, 185];
 pub(super) const SENTINEL: &[u8] = b"KEL140-outside-sentinel-unchanged";
+pub(super) const READ_SENTINEL: &[u8] = b"KEL140-read-sentinel-must-not-be-returned";
+pub(super) const INTERNAL_INITIAL: &[u8] = b"KEL140-internal-link-original";
+pub(super) const WRITE_SENTINEL: &[u8] = b"KEL140-oversize-write-target-unchanged";
 
 #[derive(Clone, Copy, Debug)]
 pub(super) enum Policy {
@@ -33,6 +37,19 @@ pub(super) struct PublicFsProject {
 pub(super) enum Exercise {
     RendererPointer,
     PublicAppComponent,
+    PublicAppNaturalCases,
+}
+
+pub(super) struct NaturalInputs {
+    pub(super) read_sentinel: PathBuf,
+    pub(super) internal_target: PathBuf,
+    pub(super) internal_alias: PathBuf,
+    pub(super) external_alias: PathBuf,
+    pub(super) oversized_write: PathBuf,
+    pub(super) oversized_read: PathBuf,
+    pub(super) fresh: PathBuf,
+    pub(super) maximum_content: usize,
+    pub(super) oversized_read_digest: String,
 }
 
 pub(super) struct PreparedLaunch {
@@ -41,6 +58,7 @@ pub(super) struct PreparedLaunch {
     pub(super) target: PathBuf,
     pub(super) digest: String,
     pub(super) host_digest: String,
+    pub(super) natural: Option<NaturalInputs>,
 }
 
 impl PublicFsProject {
@@ -112,8 +130,92 @@ impl PublicFsProject {
         self.prepare_for(launch, port, Exercise::PublicAppComponent)
     }
 
+    pub(super) fn prepare_natural(&self, launch: usize, port: u16) -> PreparedLaunch {
+        self.prepare_for(launch, port, Exercise::PublicAppNaturalCases)
+    }
+
+    fn natural_inputs(&self, launch: usize) -> NaturalInputs {
+        let read_sentinel = self.allowed.join(format!("read-sentinel-{launch}.bin"));
+        fs::write(&read_sentinel, READ_SENTINEL).expect("independent read-only sentinel");
+        let internal_target = self.allowed.join(format!("internal-target-{launch}.bin"));
+        let internal_alias = self.allowed.join(format!("internal-alias-{launch}"));
+        let external_alias = self.allowed.join(format!("external-alias-{launch}"));
+        let oversized_write = self.allowed.join(format!("oversized-write-{launch}.bin"));
+        let oversized_read = self.allowed.join(format!("oversized-read-{launch}.bin"));
+        let fresh = self.allowed.join(format!("fresh-control-{launch}.bin"));
+        let maximum_content = native_content_ceiling();
+        let mut oversized_read_digest = String::new();
+        if matches!(self.policy, Policy::Narrow) {
+            fs::write(&internal_target, INTERNAL_INITIAL).expect("inside link target");
+            symlink(
+                internal_target.file_name().expect("inside relative leaf"),
+                &internal_alias,
+            )
+            .expect("internal relative alias");
+            // The alias spelling is in scope; its relative target escapes the
+            // retained root, independently of the guard's literal path match.
+            symlink("../outside.txt", &external_alias).expect("external relative alias");
+            fs::write(&oversized_write, WRITE_SENTINEL).expect("oversized write sentinel");
+            fs::write(&oversized_read, vec![0x79; maximum_content + 1])
+                .expect("parent-owned oversized read fixture");
+            oversized_read_digest = file_digest(&oversized_read);
+        }
+        NaturalInputs {
+            read_sentinel,
+            internal_target,
+            internal_alias,
+            external_alias,
+            oversized_write,
+            oversized_read,
+            fresh,
+            maximum_content,
+            oversized_read_digest,
+        }
+    }
+
     fn prepare_for(&self, launch: usize, port: u16, exercise: Exercise) -> PreparedLaunch {
         let target = self.allowed.join(format!("result-{launch}.bin"));
+        let natural =
+            (exercise == Exercise::PublicAppNaturalCases).then(|| self.natural_inputs(launch));
+        self.prepare_application_inputs(&target, port, exercise, natural.as_ref());
+        let (stage, digest, host_digest) = self.stage_and_verify_inputs();
+        PreparedLaunch {
+            exercise,
+            stage,
+            target,
+            digest,
+            host_digest,
+            natural,
+        }
+    }
+
+    fn prepare_application_inputs(
+        &self,
+        target: &Path,
+        port: u16,
+        exercise: Exercise,
+        natural: Option<&NaturalInputs>,
+    ) {
+        let natural_case = if natural.is_some() {
+            if matches!(self.policy, Policy::Narrow) {
+                json!("links-limits")
+            } else {
+                json!("deny-read")
+            }
+        } else {
+            Value::Null
+        };
+        let natural_config = natural.map_or(Value::Null, |input| {
+            json!({
+                "readSentinel":input.read_sentinel,
+                "internalAlias":input.internal_alias,
+                "externalAlias":input.external_alias,
+                "oversizedWrite":input.oversized_write,
+                "oversizedRead":input.oversized_read,
+                "fresh":input.fresh,
+                "maximumContent":input.maximum_content,
+            })
+        });
         let api = serde_json::to_string(
             &self
                 .repo
@@ -122,6 +224,8 @@ impl PublicFsProject {
         )
         .expect("public index path JSON");
         let body = include_str!("../../../fixtures/public_fs_app.ts")
+            .replace("__NATURAL_CASE__", &natural_case.to_string())
+            .replace("__NATURAL_INPUTS__", &natural_config.to_string())
             .replace(
                 "__AUTOMATIC_COMPONENT__",
                 if exercise == Exercise::PublicAppComponent {
@@ -158,6 +262,9 @@ impl PublicFsProject {
                 .replace("__PORT__", &port.to_string()),
         )
         .expect("public FS renderer");
+    }
+
+    fn stage_and_verify_inputs(&self) -> (keld_cli::boot::DevBootStage, String, String) {
         let stage = keld_cli::boot::stage_dev_boot(
             &self.project,
             Path::new(env!("CARGO_BIN_EXE_keld-host")),
@@ -194,17 +301,11 @@ impl PublicFsProject {
             host_digest,
             file_digest(Path::new(env!("CARGO_BIN_EXE_keld-host")))
         );
-        PreparedLaunch {
-            exercise,
-            stage,
-            target,
-            digest,
-            host_digest,
-        }
+        (stage, digest, host_digest)
     }
 }
 
-fn file_digest(path: &Path) -> String {
+pub(super) fn file_digest(path: &Path) -> String {
     let digest = Command::new("/usr/bin/shasum")
         .args(["-a", "256"])
         .arg(path)
@@ -217,4 +318,21 @@ fn file_digest(path: &Path) -> String {
         .next()
         .expect("SHA256 field")
         .to_owned()
+}
+
+fn native_content_ceiling() -> usize {
+    // Fixture input comes from the exact native owner, not a mirrored limit.
+    // Admit only its current numeric-product form and fail on any schema edit.
+    let source = include_str!("../../../../../keld-native/src/fs.rs");
+    let declaration = source
+        .lines()
+        .find_map(|line| line.strip_prefix("pub const MAX_FS_CONTENT_BYTES: usize = "))
+        .expect("owning native content ceiling declaration")
+        .strip_suffix(';')
+        .expect("owning native content ceiling terminator");
+    declaration.split(" * ").fold(1_usize, |product, factor| {
+        product
+            .checked_mul(factor.parse::<usize>().expect("literal native size factor"))
+            .expect("native fixture ceiling fits usize")
+    })
 }

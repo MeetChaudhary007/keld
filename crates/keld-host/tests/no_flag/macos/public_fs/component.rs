@@ -47,3 +47,26 @@ fn public_app_absent_policy_denies_without_effect() {
     let fixture = PublicFsProject::new(Policy::Absent);
     run_launch(&fixture, 0, Exercise::PublicAppComponent);
 }
+
+#[test]
+fn explicit_empty_policy_independently_denies_seeded_public_read() {
+    let fixture = PublicFsProject::new(Policy::Empty);
+    run_launch(&fixture, 0, Exercise::PublicAppNaturalCases);
+    eprintln!("KELD_KEL140_NATURAL_READ_DENY policy=explicit-empty input_actions=0 echo_calls=0");
+}
+
+#[test]
+fn absent_policy_independently_denies_seeded_public_read() {
+    let fixture = PublicFsProject::new(Policy::Absent);
+    run_launch(&fixture, 0, Exercise::PublicAppNaturalCases);
+    eprintln!("KELD_KEL140_NATURAL_READ_DENY policy=absent input_actions=0 echo_calls=0");
+}
+
+#[test]
+fn public_app_static_links_and_native_content_limits_leave_healthy_session() {
+    let fixture = PublicFsProject::new(Policy::Narrow);
+    run_launch(&fixture, 0, Exercise::PublicAppNaturalCases);
+    eprintln!(
+        "KELD_KEL140_NATURAL_LINKS_LIMITS input_actions=0 echo_calls=0 race_acceptance=false deadline_acceptance=false blocked_syscall_acceptance=false"
+    );
+}
