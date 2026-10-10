@@ -70,3 +70,12 @@ fn public_app_static_links_and_native_content_limits_leave_healthy_session() {
         "KELD_KEL140_NATURAL_LINKS_LIMITS input_actions=0 echo_calls=0 race_acceptance=false deadline_acceptance=false blocked_syscall_acceptance=false"
     );
 }
+
+#[test]
+fn public_app_native_traversal_boundaries_preserve_sentinels_and_healthy_session() {
+    let fixture = PublicFsProject::with_traversal_boundaries();
+    run_launch(&fixture, 0, Exercise::PublicAppNaturalCases);
+    eprintln!(
+        "KELD_KEL140_NATURAL_TRAVERSAL_BOUNDS input_actions=0 echo_calls=0 race_acceptance=false deadline_acceptance=false blocked_syscall_acceptance=false"
+    );
+}

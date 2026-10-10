@@ -8,7 +8,7 @@ const target = __TARGET__;
 const outside = __OUTSIDE__;
 const content = new Uint8Array(__CONTENT__);
 const automaticComponent = __AUTOMATIC_COMPONENT__;
-const naturalCase: "deny-read" | "links-limits" | null = __NATURAL_CASE__;
+const naturalCase: "deny-read" | "links-limits" | "traversal-bounds" | null = __NATURAL_CASE__;
 type NaturalInputs = {
   readSentinel: string;
   internalAlias: string;
@@ -17,6 +17,10 @@ type NaturalInputs = {
   oversizedRead: string;
   fresh: string;
   maximumContent: number;
+  componentsPass: string;
+  componentsDeny: string;
+  linksPass: string;
+  linksDeny: string;
 };
 const naturalInputs: NaturalInputs | null = __NATURAL_INPUTS__;
 const sampleControlBudget = 4096;
@@ -50,6 +54,8 @@ type NaturalAction =
   | "internal-read" | "internal-write" | "internal-read-after-write"
   | "external-read" | "external-write"
   | "oversize-write" | "oversize-read"
+  | "components-pass-read" | "components-deny-write"
+  | "links-pass-read" | "links-deny-write"
   | "healthy-write" | "healthy-read";
 async function performNaturalOperation(action: NaturalAction): Promise<FsSampleOutcome> {
   if (!naturalInputs) throw new Error("natural fixture inputs absent");
@@ -78,6 +84,16 @@ async function performNaturalOperation(action: NaturalAction): Promise<FsSampleO
       case "oversize-read":
         await fs.read(naturalInputs.oversizedRead);
         // Never serialize an unexpectedly successful large read to the observer.
+        return { ok: true, bytes: [] };
+      case "components-pass-read":
+        return { ok: true, bytes: [...await fs.read(naturalInputs.componentsPass)] };
+      case "components-deny-write":
+        await fs.write(naturalInputs.componentsDeny, content);
+        return { ok: true, bytes: [] };
+      case "links-pass-read":
+        return { ok: true, bytes: [...await fs.read(naturalInputs.linksPass)] };
+      case "links-deny-write":
+        await fs.write(naturalInputs.linksDeny, content);
         return { ok: true, bytes: [] };
       case "healthy-write":
         await fs.write(naturalInputs.fresh, content);
@@ -149,9 +165,12 @@ if (automaticComponent) {
   // Closed public-main scenarios only: no renderer action or Echo forwarding.
   const actions: readonly NaturalAction[] = naturalCase === "deny-read"
     ? ["denied-read"]
-    : ["internal-read", "internal-write", "internal-read-after-write",
+    : naturalCase === "links-limits"
+    ? ["internal-read", "internal-write", "internal-read-after-write",
       "external-read", "external-write", "oversize-write", "oversize-read",
-      "healthy-write", "healthy-read"];
+      "healthy-write", "healthy-read"]
+    : ["components-pass-read", "components-deny-write", "links-pass-read",
+      "links-deny-write", "healthy-write", "healthy-read"];
   const outcomes: { action: NaturalAction; outcome: FsSampleOutcome }[] = [];
   for (const action of actions) {
     outcomes.push({ action, outcome: await performNaturalOperation(action) });

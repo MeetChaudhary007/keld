@@ -6,6 +6,10 @@ function report(key: string, value: string | number | boolean): void {
 }
 
 const ready = app.whenReady();
+const scenario = process.argv[2] ?? "retirement";
+if (scenario !== "retirement" && scenario !== "reply-wins" && scenario !== "healthy") {
+  throw new Error("invalid private public-FS fixture scenario");
+}
 const control: unknown = JSON.parse(await Bun.stdin.text());
 if (typeof control !== "object" || control === null ||
     !("target" in control) || typeof control.target !== "string" ||
@@ -25,13 +29,19 @@ await pending.then(
     report("call-returned", false);
   },
 );
-try {
-  await fs.write(control.lateTarget, new Uint8Array([108, 97, 116, 101]));
-  throw new Error("post-retirement public write unexpectedly succeeded");
-} catch (error: unknown) {
-  if (!isCallError(error)) throw error;
-  report("after-code", error.code);
+if (scenario === "retirement") {
+  try {
+    await fs.write(control.lateTarget, new Uint8Array([108, 97, 116, 101]));
+    throw new Error("post-retirement public write unexpectedly succeeded");
+  } catch (error: unknown) {
+    if (!isCallError(error)) throw error;
+    report("after-code", error.code);
+  }
+} else if (scenario === "healthy") {
+  const bytes = await fs.read(control.target);
+  report("read-hex", Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join(""));
+  report("read-returned", true);
 }
 report("settlements", settlements);
-// No Quit or reconnect on this already-retired generation. Let its canonical
-// Worker finish the terminal close and flush diagnostics before natural exit.
+// No Quit, reconnect, or extra request in reply-wins mode. Let the canonical
+// Worker reach the parent's terminal EOF and flush diagnostics before natural exit.

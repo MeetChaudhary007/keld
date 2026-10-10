@@ -1,7 +1,7 @@
 //! Independent page/application outcome binding and native byte/no-effect oracles.
 use super::project::{
-    CONTENT, INTERNAL_INITIAL, NaturalInputs, Policy, PreparedLaunch, READ_SENTINEL, SENTINEL,
-    WRITE_SENTINEL, file_digest,
+    COMPONENT_SENTINEL, CONTENT, INTERNAL_INITIAL, LINK_SENTINEL, NaturalCase, NaturalInputs,
+    Policy, PreparedLaunch, READ_SENTINEL, SENTINEL, WRITE_SENTINEL, file_digest,
 };
 use serde_json::{Value, json};
 use std::fs;
@@ -232,12 +232,26 @@ pub(super) fn assert_natural_outcomes(
     let outcomes = result["outcomes"]
         .as_array()
         .expect("closed natural outcome list");
-    if matches!(policy, Policy::Narrow) {
-        assert_oversized_write_no_effect(input);
-        assert_links_limits_results(result, outcomes, input);
-        assert_links_limits_files(input);
-    } else {
-        assert_denied_read_result(result, outcomes, input);
+    match input.case {
+        NaturalCase::TraversalBounds => {
+            assert!(matches!(policy, Policy::Narrow));
+            assert_traversal_sentinels(input);
+            assert_traversal_results(result, outcomes);
+            assert_eq!(
+                fs::read(&input.fresh).expect("healthy file after both traversal refusals"),
+                CONTENT
+            );
+        }
+        NaturalCase::LinksLimits => {
+            assert!(matches!(policy, Policy::Narrow));
+            assert_oversized_write_no_effect(input);
+            assert_links_limits_results(result, outcomes, input);
+            assert_links_limits_files(input);
+        }
+        NaturalCase::DenyRead => {
+            assert!(!matches!(policy, Policy::Narrow));
+            assert_denied_read_result(result, outcomes, input);
+        }
     }
     assert_eq!(
         fs::read(&input.read_sentinel).expect("independent read sentinel"),
@@ -247,6 +261,64 @@ pub(super) fn assert_natural_outcomes(
         fs::read(outside).expect("independent outside alias no-effect sentinel"),
         SENTINEL
     );
+}
+
+fn assert_traversal_sentinels(input: &NaturalInputs) {
+    // Direct OS effects are checked before either returned denial is trusted.
+    // Each distinct seeded file falsifies only its own native-budget atom.
+    for (path, original, boundary) in [
+        (&input.component_sentinel, COMPONENT_SENTINEL, "component"),
+        (&input.link_sentinel, LINK_SENTINEL, "link"),
+    ] {
+        assert_eq!(
+            fs::metadata(path)
+                .expect("traversal sentinel metadata")
+                .len(),
+            u64::try_from(original.len()).expect("small sentinel length fits u64"),
+            "{boundary} boundary write changed independent sentinel length"
+        );
+        assert_eq!(
+            fs::read(path).expect("independent traversal no-effect sentinel"),
+            original,
+            "{boundary} boundary write changed independent sentinel bytes"
+        );
+    }
+}
+
+fn assert_traversal_results(result: &Value, outcomes: &[Value]) {
+    assert_eq!(result["naturalCase"], "traversal-bounds");
+    let actions = [
+        "components-pass-read",
+        "components-deny-write",
+        "links-pass-read",
+        "links-deny-write",
+        "healthy-write",
+        "healthy-read",
+    ];
+    assert_eq!(outcomes.len(), actions.len());
+    for (actual, expected) in outcomes.iter().zip(actions) {
+        assert_eq!(actual["action"], expected);
+    }
+    assert_eq!(
+        outcomes[0]["outcome"],
+        json!({"ok":true,"bytes":COMPONENT_SENTINEL})
+    );
+    assert_eq!(
+        outcomes[1]["outcome"],
+        json!({"ok":false,"code":"KELD-NATIVE-004",
+        "message":"KELD-NATIVE-004: filesystem processed-components limit exceeded (257 > 256). Shorten the request or use at most 8 MiB."})
+    );
+    assert_eq!(
+        outcomes[2]["outcome"],
+        json!({"ok":true,"bytes":LINK_SENTINEL})
+    );
+    assert_eq!(
+        outcomes[3]["outcome"],
+        json!({"ok":false,"code":"KELD-NATIVE-004",
+        "message":"KELD-NATIVE-004: filesystem symlink-expansions limit exceeded (41 > 40). Shorten the request or use at most 8 MiB."})
+    );
+    assert_eq!(outcomes[4]["outcome"], json!({"ok":true,"bytes":[]}));
+    assert_eq!(outcomes[5]["outcome"], json!({"ok":true,"bytes":CONTENT}));
 }
 
 fn assert_oversized_write_no_effect(input: &NaturalInputs) {

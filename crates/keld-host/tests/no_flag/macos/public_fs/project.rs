@@ -13,6 +13,8 @@ pub(super) const SENTINEL: &[u8] = b"KEL140-outside-sentinel-unchanged";
 pub(super) const READ_SENTINEL: &[u8] = b"KEL140-read-sentinel-must-not-be-returned";
 pub(super) const INTERNAL_INITIAL: &[u8] = b"KEL140-internal-link-original";
 pub(super) const WRITE_SENTINEL: &[u8] = b"KEL140-oversize-write-target-unchanged";
+pub(super) const COMPONENT_SENTINEL: &[u8] = b"KEL140-component-boundary-unchanged";
+pub(super) const LINK_SENTINEL: &[u8] = b"KEL140-link-boundary-unchanged";
 
 #[derive(Clone, Copy, Debug)]
 pub(super) enum Policy {
@@ -27,6 +29,7 @@ pub(super) struct PublicFsProject {
     repo: PathBuf,
     allowed: PathBuf,
     policy_bytes: Vec<u8>,
+    natural_case: NaturalCase,
     pub(super) policy: Policy,
     pub(super) outside: PathBuf,
     pub(super) scope: String,
@@ -40,7 +43,15 @@ pub(super) enum Exercise {
     PublicAppNaturalCases,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum NaturalCase {
+    DenyRead,
+    LinksLimits,
+    TraversalBounds,
+}
+
 pub(super) struct NaturalInputs {
+    pub(super) case: NaturalCase,
     pub(super) read_sentinel: PathBuf,
     pub(super) internal_target: PathBuf,
     pub(super) internal_alias: PathBuf,
@@ -50,6 +61,12 @@ pub(super) struct NaturalInputs {
     pub(super) fresh: PathBuf,
     pub(super) maximum_content: usize,
     pub(super) oversized_read_digest: String,
+    pub(super) component_sentinel: PathBuf,
+    pub(super) components_pass: PathBuf,
+    pub(super) components_deny: PathBuf,
+    pub(super) link_sentinel: PathBuf,
+    pub(super) links_pass: PathBuf,
+    pub(super) links_deny: PathBuf,
 }
 
 pub(super) struct PreparedLaunch {
@@ -98,11 +115,22 @@ impl PublicFsProject {
             repo,
             allowed,
             policy_bytes,
+            natural_case: if matches!(policy, Policy::Narrow) {
+                NaturalCase::LinksLimits
+            } else {
+                NaturalCase::DenyRead
+            },
             policy,
             outside,
             scope,
             census,
         }
+    }
+
+    pub(super) fn with_traversal_boundaries() -> Self {
+        let mut fixture = Self::new(Policy::Narrow);
+        fixture.natural_case = NaturalCase::TraversalBounds;
+        fixture
     }
 
     pub(super) fn with_project_policy_source(bytes: &[u8]) -> Self {
@@ -145,7 +173,7 @@ impl PublicFsProject {
         let fresh = self.allowed.join(format!("fresh-control-{launch}.bin"));
         let maximum_content = native_content_ceiling();
         let mut oversized_read_digest = String::new();
-        if matches!(self.policy, Policy::Narrow) {
+        if self.natural_case == NaturalCase::LinksLimits {
             fs::write(&internal_target, INTERNAL_INITIAL).expect("inside link target");
             symlink(
                 internal_target.file_name().expect("inside relative leaf"),
@@ -160,7 +188,50 @@ impl PublicFsProject {
                 .expect("parent-owned oversized read fixture");
             oversized_read_digest = file_digest(&oversized_read);
         }
+        let component_sentinel = self
+            .allowed
+            .join(format!("component-sentinel-{launch}.bin"));
+        let components_pass = self.allowed.join(format!("components-pass-{launch}"));
+        let components_deny = self.allowed.join(format!("components-deny-{launch}"));
+        let link_sentinel = self.allowed.join(format!("link-sentinel-{launch}.bin"));
+        let links_pass = self.allowed.join(format!("links-pass-{launch}-0"));
+        let links_deny = self.allowed.join(format!("links-deny-{launch}-0"));
+        if self.natural_case == NaturalCase::TraversalBounds {
+            fs::write(&component_sentinel, COMPONENT_SENTINEL)
+                .expect("independent component-boundary sentinel");
+            fs::write(&link_sentinel, LINK_SENTINEL).expect("independent link-boundary sentinel");
+            let component_leaf = component_sentinel
+                .file_name()
+                .and_then(|name| name.to_str())
+                .expect("component sentinel relative leaf");
+            // The alias visit, literal Current components and final leaf are
+            // 256/257. Pin the boundary independently of native constants.
+            for (alias, current_components) in
+                [(&components_pass, 254_usize), (&components_deny, 255_usize)]
+            {
+                symlink(
+                    format!("{}{component_leaf}", "./".repeat(current_components)),
+                    alias,
+                )
+                .expect("short component-boundary relative alias");
+            }
+            for (prefix, count) in [
+                (format!("links-pass-{launch}"), 40_usize),
+                (format!("links-deny-{launch}"), 41_usize),
+            ] {
+                for index in 0..count {
+                    let target = if index + 1 == count {
+                        PathBuf::from(link_sentinel.file_name().expect("link sentinel leaf"))
+                    } else {
+                        PathBuf::from(format!("{prefix}-{}", index + 1))
+                    };
+                    symlink(target, self.allowed.join(format!("{prefix}-{index}")))
+                        .expect("relative link-expansion boundary chain");
+                }
+            }
+        }
         NaturalInputs {
+            case: self.natural_case,
             read_sentinel,
             internal_target,
             internal_alias,
@@ -170,6 +241,12 @@ impl PublicFsProject {
             fresh,
             maximum_content,
             oversized_read_digest,
+            component_sentinel,
+            components_pass,
+            components_deny,
+            link_sentinel,
+            links_pass,
+            links_deny,
         }
     }
 
@@ -196,15 +273,13 @@ impl PublicFsProject {
         exercise: Exercise,
         natural: Option<&NaturalInputs>,
     ) {
-        let natural_case = if natural.is_some() {
-            if matches!(self.policy, Policy::Narrow) {
-                json!("links-limits")
-            } else {
-                json!("deny-read")
-            }
-        } else {
-            Value::Null
-        };
+        let natural_case = natural.map_or(Value::Null, |input| {
+            json!(match input.case {
+                NaturalCase::DenyRead => "deny-read",
+                NaturalCase::LinksLimits => "links-limits",
+                NaturalCase::TraversalBounds => "traversal-bounds",
+            })
+        });
         let natural_config = natural.map_or(Value::Null, |input| {
             json!({
                 "readSentinel":input.read_sentinel,
@@ -214,6 +289,10 @@ impl PublicFsProject {
                 "oversizedRead":input.oversized_read,
                 "fresh":input.fresh,
                 "maximumContent":input.maximum_content,
+                "componentsPass":input.components_pass,
+                "componentsDeny":input.components_deny,
+                "linksPass":input.links_pass,
+                "linksDeny":input.links_deny,
             })
         });
         let api = serde_json::to_string(

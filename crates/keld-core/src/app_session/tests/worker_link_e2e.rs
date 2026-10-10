@@ -5,8 +5,8 @@
 //! primary router on a real authenticated app link. macOS only, like the T1
 //! harness; T5 qualifies Linux and Windows.
 //!
-//! KEL-140 owns the added public-index retirement consumer. Keep it with this
-//! existing authenticated router/process owner; review the module's layout
+//! KEL-140 owns the added public-index retirement and reply-wins consumers.
+//! Keep them with this existing authenticated router/process owner; review the module's layout
 //! trigger at KEL-140 acceptance rather than duplicate that owner in another harness.
 
 use super::*;
@@ -51,6 +51,10 @@ impl WorkerLinkRole {
 
     /// Uses the same custody and authenticated router for a public-index caller.
     fn start_public_fs() -> (Self, GuardedTestRouter) {
+        Self::start_public_fs_scenario("retirement")
+    }
+
+    fn start_public_fs_scenario(scenario: &str) -> (Self, GuardedTestRouter) {
         use std::process::{Command, Stdio};
 
         let listener = keld_ipc::BootstrapListener::bind().expect("bind public FS role listener");
@@ -59,10 +63,30 @@ impl WorkerLinkRole {
         let mut command = Command::new("bun");
         command
             .arg(script)
+            .arg(scenario)
             .env("KELD_APP_LINK", listener.app_link())
             .env_remove("KELD_KIPC_TEST_HOOKS")
             .stdin(Stdio::piped());
         Self::spawn_authenticated(&listener, command)
+    }
+
+    /// Supplies the existing private EOF-terminated control to the owned caller.
+    fn supply_public_fs_targets(&mut self, target: &Path, late_target: &Path) {
+        use std::io::Write as _;
+
+        let control = serde_json::json!({
+            "target": target,
+            "lateTarget": late_target,
+        });
+        let mut input = self
+            .child
+            .as_mut()
+            .expect("owned public caller")
+            .stdin
+            .take()
+            .expect("private fixture control pipe");
+        writeln!(input, "{control}").expect("supply owned target paths");
+        drop(input);
     }
 
     fn spawn_authenticated(
@@ -485,5 +509,195 @@ fn public_fs_write_preserves_retirement_error_until_owner_lease_drains() {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound
         ),
         "post-retirement target acquired an effect after owner join"
+    );
+}
+
+/// A successful public Promise is an adapter result, not a wire-answer census.
+fn assert_public_success_report(report: &std::collections::BTreeMap<String, String>) {
+    assert_eq!(
+        [
+            report_value(report, "call-code"),
+            report_value(report, "call-returned"),
+            report_value(report, "settlements"),
+            report_value(report, "after-code"),
+        ],
+        [None, Some("true"), Some("1"), None],
+        "{report:?}"
+    );
+}
+
+/// The real public write REPLY survives retirement while its owner lease is held.
+/// A fresh authenticated public caller then completes a real write/read after drain.
+/// `retire_after_a_real_reply_sends_no_023` separately owns the raw wire census.
+#[test]
+fn public_fs_reply_wins_retirement_then_a_fresh_session_reads_its_write() {
+    completed_public_write_preserves_reply_after_retirement();
+    // The old helper has drained and dropped its complete owned scope.
+    fresh_public_fs_session_reads_its_write();
+}
+
+fn completed_public_write_preserves_reply_after_retirement() {
+    let (mut role, t) = WorkerLinkRole::start_public_fs_scenario("reply-wins");
+    let target = t.allowed.join("public-reply-wins.txt");
+    let late_target = t.allowed.join("public-reply-wins-unused.txt");
+    fs::write(&target, b"unchanged").expect("seed reply-wins native sentinel");
+    role.supply_public_fs_targets(&target, &late_target);
+    let (written_tx, written) = mpsc::sync_channel(1);
+    let (resume, resume_rx) = mpsc::channel();
+    t.snapshot
+        .fs
+        .hold_next_terminal_write(written_tx, resume_rx);
+    t.router.handle().signal_ready().expect("real router Ready");
+    t.taken
+        .recv_timeout(Duration::from_secs(5))
+        .expect("public write reached the held native worker");
+    assert_eq!(
+        fs::read(&target).expect("held reply-wins sentinel"),
+        b"unchanged"
+    );
+    assert_eq!(
+        t.snapshot.fs.state.lock().expect("held FS state").in_flight,
+        1
+    );
+
+    t.release.send(()).expect("release public native write");
+    written
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the real FS REPLY was written and its correlation retired");
+    assert_eq!(fs::read(&target).expect("completed native write"), b"t2");
+    assert_eq!(
+        t.snapshot
+            .fs
+            .state
+            .lock()
+            .expect("replied held FS state")
+            .in_flight,
+        1,
+        "reply publication must not masquerade as owner lease drain"
+    );
+    t.router
+        .handle()
+        .retire_generation(1)
+        .expect("retire after the real public FS REPLY");
+    // Release promptly: the terminal hook's existing bound is a kill switch.
+    resume.send(()).expect("resume the replied FS worker");
+    t.snapshot
+        .fs
+        .drain()
+        .expect("observe reply-wins owner drain");
+    assert_eq!(
+        t.snapshot
+            .fs
+            .state
+            .lock()
+            .expect("drained FS state")
+            .in_flight,
+        0
+    );
+    let report = role.finish();
+    assert_public_success_report(&report);
+    t.router
+        .shutdown()
+        .expect("join reply-wins router readers and worker");
+    assert_eq!(fs::read(&target).expect("post-join replied bytes"), b"t2");
+    assert!(
+        matches!(
+            t.taken.try_recv(),
+            Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected)
+        ),
+        "the public reply-wins caller replayed its operation"
+    );
+    assert!(
+        matches!(
+            fs::symlink_metadata(&late_target),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound
+        ),
+        "the closed public scenario acquired an unused target effect"
+    );
+}
+
+// A fresh realm/router has one canonical link; this is not supervisor recovery.
+fn fresh_public_fs_session_reads_its_write() {
+    let (mut role, t) = WorkerLinkRole::start_public_fs_scenario("healthy");
+    let target = t.allowed.join("public-fresh-write-read.txt");
+    let late_target = t.allowed.join("public-fresh-unused.txt");
+    fs::write(&target, b"unchanged").expect("seed fresh native sentinel");
+    role.supply_public_fs_targets(&target, &late_target);
+    t.router.handle().signal_ready().expect("fresh real Ready");
+    t.taken
+        .recv_timeout(Duration::from_secs(5))
+        .expect("fresh public write reached the held worker");
+    assert_eq!(
+        fs::read(&target).expect("fresh held sentinel"),
+        b"unchanged"
+    );
+    t.release.send(()).expect("release fresh public write");
+    t.taken
+        .recv_timeout(Duration::from_secs(5))
+        .expect("fresh public read follows its completed write");
+    let (written_tx, written) = mpsc::sync_channel(1);
+    let (resume, resume_rx) = mpsc::channel();
+    // Arm only after the read is taken, so this fence cannot hold the write.
+    t.snapshot
+        .fs
+        .hold_next_terminal_write(written_tx, resume_rx);
+    t.release.send(()).expect("release fresh public read");
+    written
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the real public read REPLY was written");
+    assert_eq!(fs::read(&target).expect("fresh written OS bytes"), b"t2");
+    assert_eq!(
+        t.snapshot
+            .fs
+            .state
+            .lock()
+            .expect("fresh replied held FS state")
+            .in_flight,
+        1
+    );
+    t.router
+        .handle()
+        .retire_generation(1)
+        .expect("close fresh owned link after its real read REPLY");
+    resume.send(()).expect("resume fresh read terminal path");
+    t.snapshot.fs.drain().expect("observe fresh owner drain");
+    assert_eq!(
+        t.snapshot
+            .fs
+            .state
+            .lock()
+            .expect("fresh drained state")
+            .in_flight,
+        0
+    );
+    let report = role.finish();
+    assert_public_success_report(&report);
+    assert_eq!(
+        report_value(&report, "read-returned"),
+        Some("true"),
+        "{report:?}"
+    );
+    assert_eq!(
+        report_value(&report, "read-hex"),
+        Some("7432"),
+        "{report:?}"
+    );
+    t.router
+        .shutdown()
+        .expect("join fresh router readers and worker");
+    assert_eq!(fs::read(&target).expect("fresh post-join OS bytes"), b"t2");
+    assert!(
+        matches!(
+            t.taken.try_recv(),
+            Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected)
+        ),
+        "fresh public write/read acquired an extra worker entry"
+    );
+    assert!(
+        matches!(
+            fs::symlink_metadata(&late_target),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound
+        ),
+        "fresh public caller acquired an unused target effect"
     );
 }
