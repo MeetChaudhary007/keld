@@ -2,7 +2,7 @@
 
 #![allow(clippy::expect_used)] // extra test crate: expect is the assertion oracle
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -21,10 +21,72 @@ use keld_ipc::{
     LifecycleEvent, LifecycleRequest, LifecycleResponse,
 };
 
+#[derive(Clone, Copy)]
+enum CapturedStream {
+    Stdout,
+    Stderr,
+}
+
+struct CaptureSnapshot {
+    object: Result<std::fs::Metadata, String>,
+    path: Result<std::fs::Metadata, String>,
+    same_object: Option<bool>,
+}
+
+impl CaptureSnapshot {
+    fn describe(&self) -> String {
+        format!(
+            "object={} path={} same_object={:?}",
+            capture_metadata_description(&self.object),
+            capture_metadata_description(&self.path),
+            self.same_object,
+        )
+    }
+}
+
+fn capture_metadata_description(metadata: &Result<std::fs::Metadata, String>) -> String {
+    let metadata = match metadata {
+        Ok(metadata) => metadata,
+        Err(error) => return format!("unavailable({error})"),
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        format!(
+            "dev={} ino={} type={:?} len={}",
+            metadata.dev(),
+            metadata.ino(),
+            metadata.file_type(),
+            metadata.len(),
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        format!("type={:?} len={}", metadata.file_type(), metadata.len())
+    }
+}
+
+#[derive(Default, Debug)]
+struct ObservationCounts {
+    loops: usize,
+    reads: usize,
+    polls: usize,
+    bytes: usize,
+}
+
 struct ObservedChild {
     child: Option<Child>,
     stdout_path: PathBuf,
     stderr_path: PathBuf,
+    stdout_object: File,
+    stderr_object: File,
+    pid: u32,
+    program: OsString,
+    cwd: Option<PathBuf>,
+    spawn_duration: Duration,
+    observation_started: Option<Instant>,
+    counts: ObservationCounts,
+    last_try_wait: Option<Result<Option<std::process::ExitStatus>, String>>,
 }
 
 impl ObservedChild {
@@ -33,29 +95,34 @@ impl ObservedChild {
     }
 
     fn wait_for_output_until(mut self, deadline: Instant) -> Result<Output, String> {
-        let child = self.child.as_mut().expect("observed child present");
-        let pid = child.id();
+        self.begin_observation();
+        let pid = self.pid;
         let status = loop {
-            match child.try_wait() {
+            self.counts.loops += 1;
+            match self.poll_child() {
                 Ok(Some(status)) => break status,
                 Ok(None) if Instant::now() < deadline => {
                     thread::park_timeout(Duration::from_millis(10));
                 }
                 Ok(None) => {
-                    let _ = child.kill();
-                    let status = child
-                        .wait()
-                        .map_err(|error| format!("reap timed-out child: {error}"))?;
+                    let diagnostic = self.diagnostics();
+                    let reaped = {
+                        let child = self.child.as_mut().expect("observed child present");
+                        let _ = child.kill();
+                        child.wait()
+                    };
+                    let status = reaped
+                        .map_err(|error| self.failure(format!("reap timed-out child: {error}")))?;
                     self.child.take();
                     let output = self.output(status)?;
                     return Err(format!(
-                        "child did not exit by the observation deadline; pid={pid} reaped_status={:?}; stdout={} stderr={}",
+                        "child did not exit by the observation deadline; pid={pid} reaped_status={:?}; stdout={} stderr={}; {diagnostic}",
                         output.status,
                         String::from_utf8_lossy(&output.stdout),
                         String::from_utf8_lossy(&output.stderr)
                     ));
                 }
-                Err(error) => return Err(format!("poll child exit: {error}")),
+                Err(error) => return Err(self.failure(format!("poll child exit: {error}"))),
             }
         };
         self.child.take();
@@ -65,10 +132,13 @@ impl ObservedChild {
     /// Observes a recorder phase without turning elapsed time into readiness.
     #[cfg(unix)]
     fn wait_for_stdout_marker(&mut self, marker: &str, deadline: Instant) -> Result<(), String> {
-        let pid = self.child.as_ref().expect("observed child present").id();
+        self.begin_observation();
+        let pid = self.pid;
         loop {
-            let stdout = std::fs::read(&self.stdout_path)
-                .map_err(|error| format!("pid={pid} read recorder progress: {error}"))?;
+            self.counts.loops += 1;
+            let stdout = self
+                .read_capture(CapturedStream::Stdout)
+                .map_err(|error| self.failure(error))?;
             if String::from_utf8_lossy(&stdout)
                 .lines()
                 .any(|line| line == marker)
@@ -76,37 +146,124 @@ impl ObservedChild {
                 return Ok(());
             }
             let status = self
-                .child
-                .as_mut()
-                .expect("observed child present")
-                .try_wait()
-                .map_err(|error| format!("pid={pid} probe recorder exit: {error}"))?;
+                .poll_child()
+                .map_err(|error| self.failure(format!("pid={pid} probe recorder exit: {error}")))?;
             if let Some(status) = status {
-                return Err(format!(
+                let output = self.output(status)?;
+                return Err(self.failure(format!(
                     "pid={pid} exited before marker `{marker}`; {}",
-                    output_diagnostics(&self.output(status)?)
-                ));
+                    output_diagnostics(&output)
+                )));
             }
             if Instant::now() >= deadline {
-                let stderr = std::fs::read(&self.stderr_path)
-                    .map_err(|error| format!("pid={pid} read recorder stderr: {error}"))?;
-                return Err(format!(
+                let stderr = self
+                    .read_capture(CapturedStream::Stderr)
+                    .map_err(|error| self.failure(error))?;
+                return Err(self.failure(format!(
                     "pid={pid} recorder marker `{marker}` absent at deadline; stdout={} stderr={}",
                     String::from_utf8_lossy(&stdout),
                     String::from_utf8_lossy(&stderr)
-                ));
+                )));
             }
             thread::yield_now();
         }
     }
 
-    fn output(&self, status: std::process::ExitStatus) -> Result<Output, String> {
+    fn begin_observation(&mut self) {
+        if self.observation_started.is_none() {
+            self.observation_started = Some(Instant::now());
+        }
+    }
+
+    fn poll_child(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        self.counts.polls += 1;
+        let result = self
+            .child
+            .as_mut()
+            .expect("observed child present")
+            .try_wait();
+        self.last_try_wait = Some(
+            result
+                .as_ref()
+                .copied()
+                .map_err(std::string::ToString::to_string),
+        );
+        result
+    }
+
+    fn read_capture(&mut self, stream: CapturedStream) -> Result<Vec<u8>, String> {
+        self.counts.reads += 1;
+        let (path, label) = match stream {
+            CapturedStream::Stdout => (&self.stdout_path, "stdout"),
+            CapturedStream::Stderr => (&self.stderr_path, "stderr"),
+        };
+        let bytes = std::fs::read(path).map_err(|error| format!("read child {label}: {error}"))?;
+        self.counts.bytes += bytes.len();
+        Ok(bytes)
+    }
+
+    fn capture_snapshot(&self, stream: CapturedStream) -> CaptureSnapshot {
+        let (object, path) = match stream {
+            CapturedStream::Stdout => (&self.stdout_object, &self.stdout_path),
+            CapturedStream::Stderr => (&self.stderr_object, &self.stderr_path),
+        };
+        let object = object.metadata().map_err(|error| error.to_string());
+        let path = std::fs::symlink_metadata(path).map_err(|error| error.to_string());
+        #[cfg(unix)]
+        let same_object = {
+            use std::os::unix::fs::MetadataExt as _;
+            match (&object, &path) {
+                (Ok(object), Ok(path)) => Some(
+                    object.dev() == path.dev()
+                        && object.ino() == path.ino()
+                        && object.file_type() == path.file_type(),
+                ),
+                _ => None,
+            }
+        };
+        // Generic metadata is retained on other platforms; length/type alone
+        // do not establish object identity. Concurrent writers can change length.
+        #[cfg(not(unix))]
+        let same_object = None;
+        CaptureSnapshot {
+            object,
+            path,
+            same_object,
+        }
+    }
+
+    fn diagnostics(&self) -> String {
+        format!(
+            "observation pid={} program=\"{}\" cwd={:?} spawn_duration={:?} observation_elapsed={:?} counts={:?} last_try_wait={:?} stdout_capture=[{}] stderr_capture=[{}]",
+            self.pid,
+            self.program.to_string_lossy().escape_debug(),
+            self.cwd,
+            self.spawn_duration,
+            self.observation_started.map(|started| started.elapsed()),
+            self.counts,
+            self.last_try_wait,
+            self.capture_snapshot(CapturedStream::Stdout).describe(),
+            self.capture_snapshot(CapturedStream::Stderr).describe(),
+        )
+    }
+
+    fn failure(&self, mut detail: String) -> String {
+        detail.push_str("; ");
+        detail.push_str(&self.diagnostics());
+        detail
+    }
+
+    fn output(&mut self, status: std::process::ExitStatus) -> Result<Output, String> {
+        let stdout = self
+            .read_capture(CapturedStream::Stdout)
+            .map_err(|error| self.failure(error))?;
+        let stderr = self
+            .read_capture(CapturedStream::Stderr)
+            .map_err(|error| self.failure(error))?;
         Ok(Output {
             status,
-            stdout: std::fs::read(&self.stdout_path)
-                .map_err(|error| format!("read child stdout: {error}"))?,
-            stderr: std::fs::read(&self.stderr_path)
-                .map_err(|error| format!("read child stderr: {error}"))?,
+            stdout,
+            stderr,
         })
     }
 }
@@ -127,15 +284,35 @@ fn spawn_observed(command: &mut Command, output_root: &Path) -> ObservedChild {
     let stderr_path = output_root.join("child.stderr.log");
     let stdout = File::create(&stdout_path).expect("create child stdout log");
     let stderr = File::create(&stderr_path).expect("create child stderr log");
+    let stdout_object = stdout
+        .try_clone()
+        .expect("retain actual stdout capture object");
+    let stderr_object = stderr
+        .try_clone()
+        .expect("retain actual stderr capture object");
+    let program = command.get_program().to_os_string();
+    let cwd = command.get_current_dir().map(Path::to_path_buf);
+    let spawn_started = Instant::now();
     let child = command
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr))
         .spawn()
         .expect("spawn observed child");
+    let spawn_duration = spawn_started.elapsed();
+    let pid = child.id();
     ObservedChild {
         child: Some(child),
         stdout_path,
         stderr_path,
+        stdout_object,
+        stderr_object,
+        pid,
+        program,
+        cwd,
+        spawn_duration,
+        observation_started: None,
+        counts: ObservationCounts::default(),
+        last_try_wait: None,
     }
 }
 
@@ -1305,4 +1482,102 @@ fn recorder_live_missing_marker_deadline_preserves_output_and_drop_reaps() {
     assert_eq!(census.status.code(), Some(1), "{census:?}");
     assert!(census.stdout.is_empty(), "{census:?}");
     assert!(census.stderr.is_empty(), "{census:?}");
+}
+
+/// The child retains its output object even when its capture pathname is replaced.
+#[cfg(unix)]
+#[test]
+fn held_recorder_capture_path_replacement_is_observed_as_object_mismatch() {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let dir = tempfile::tempdir().expect("capture identity root");
+    let mut command = Command::new("/bin/sh");
+    command
+        .args([
+            "-c",
+            "printf 'KELD669_OBJECT_HELD\\n'; IFS= read -r gate; [ \"$gate\" = RECORD ] || exit 65",
+        ])
+        .stdin(Stdio::piped());
+    let mut child = spawn_observed(&mut command, dir.path());
+    let deadline = Instant::now() + Duration::from_secs(2);
+    child
+        .wait_for_stdout_marker("KELD669_OBJECT_HELD", deadline)
+        .expect("actual held child output");
+    assert!(
+        child
+            .poll_child()
+            .expect("probe held capture child")
+            .is_none(),
+        "capture replacement control needs its actual child still in custody"
+    );
+    let original = child.capture_snapshot(CapturedStream::Stdout);
+    assert_eq!(original.same_object, Some(true));
+    let original_object = original.object.as_ref().expect("actual capture metadata");
+    assert!(original_object.len() > 0);
+    std::fs::rename(&child.stdout_path, dir.path().join("moved.stdout.log"))
+        .expect("move only the capture pathname");
+    File::create(&child.stdout_path).expect("create distinct empty capture pathname");
+    let replaced = child.capture_snapshot(CapturedStream::Stdout);
+    assert_eq!(replaced.same_object, Some(false));
+    assert!(
+        replaced
+            .object
+            .as_ref()
+            .expect("retained object metadata")
+            .len()
+            > 0
+    );
+    let replacement_path = replaced.path.as_ref().expect("replacement path metadata");
+    assert_eq!(replacement_path.len(), 0);
+    let mut gate = child
+        .child
+        .as_mut()
+        .expect("owned held recorder")
+        .stdin
+        .take()
+        .expect("owned release pipe");
+    writeln!(gate, "RECORD").expect("release held recorder after identity proof");
+    drop(gate);
+    let error = child
+        .wait_for_stdout_marker("KELD669_OBJECT_ABSENT", deadline)
+        .expect_err("the released recorder cannot report through its empty replacement path");
+    let exited = error.contains("exited before marker `KELD669_OBJECT_ABSENT`");
+    let expired = error.contains("recorder marker `KELD669_OBJECT_ABSENT` absent at deadline");
+    assert!(exited || expired, "{error}");
+    let expected_status = if exited {
+        "last_try_wait=Some(Ok(Some("
+    } else {
+        "last_try_wait=Some(Ok(None))"
+    };
+    assert!(error.contains(expected_status), "{error}");
+    let observer = format!(
+        "observation pid={} program=\"/bin/sh\" cwd=None spawn_duration=",
+        child.pid
+    );
+    let object = format!(
+        "stdout_capture=[object=dev={} ino={} ",
+        original_object.dev(),
+        original_object.ino()
+    );
+    let path = format!(
+        " path=dev={} ino={} ",
+        replacement_path.dev(),
+        replacement_path.ino()
+    );
+    let fields = [
+        observer.as_str(),
+        "observation_elapsed=Some(",
+        "counts=ObservationCounts { loops:",
+        "reads:",
+        "polls:",
+        "bytes:",
+        object.as_str(),
+        path.as_str(),
+        "same_object=Some(false)] stderr_capture=[",
+    ];
+    assert!(fields.iter().all(|field| error.contains(*field)), "{error}");
+    let output = child
+        .wait_for_output_until(deadline)
+        .expect("bounded recorder exit");
+    assert!(output.status.success(), "{output:?}");
 }
