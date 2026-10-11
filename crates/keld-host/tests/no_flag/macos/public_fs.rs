@@ -21,6 +21,8 @@ use std::time::Instant;
 mod application_link;
 #[path = "public_fs/component.rs"]
 mod component;
+#[path = "public_fs/descendant_quit.rs"]
+mod descendant_quit;
 #[path = "public_fs/observer.rs"]
 mod observer;
 #[path = "public_fs/outcomes.rs"]
@@ -120,6 +122,15 @@ fn run(policy: Policy, launches: usize) {
 }
 
 fn run_launch(fixture: &PublicFsProject, launch: usize, exercise: Exercise) -> LaunchEvidence {
+    run_launch_with_descendant_quit(fixture, launch, exercise, None)
+}
+
+fn run_launch_with_descendant_quit(
+    fixture: &PublicFsProject,
+    launch: usize,
+    exercise: Exercise,
+    mut descendant: Option<&mut descendant_quit::DescendantQuit>,
+) -> LaunchEvidence {
     let observer = if exercise == Exercise::RendererRecovery {
         Observation::bind_recovery()
     } else {
@@ -154,6 +165,14 @@ fn run_launch(fixture: &PublicFsProject, launch: usize, exercise: Exercise) -> L
             &prepared,
             host_pid,
         );
+        if let Some(descendant) = descendant.as_deref_mut() {
+            assert_eq!(exercise, Exercise::PublicAppComponent);
+            descendant.arm(
+                evidence
+                    .family
+                    .expect("independently attributed product family"),
+            );
+        }
         eprintln!(
             "KELD_KEL140_PUBLIC_WITNESS policy={:?} launch={launch} host={host_pid} window={:?} identities={:?} policy_sha256={} host_sha256={} reports={:?} exercise={exercise:?}",
             fixture.policy,
@@ -173,6 +192,15 @@ fn run_launch(fixture: &PublicFsProject, launch: usize, exercise: Exercise) -> L
             .send(())
             .expect("release public app Quit after observations");
     }
+    // Keep the existing launch/group custody and collect host output even when
+    // a post-Quit kernel/descendant assertion fails under the production mutation.
+    let descendant_result = catch_unwind(AssertUnwindSafe(|| {
+        if observation_result.is_ok()
+            && let Some(descendant) = descendant.as_deref_mut()
+        {
+            descendant.observe_cooperative_exit_and_guardian_reap();
+        }
+    }));
     let output = wait_child_output(
         cleanup.cli.take().expect("capture host before unwind"),
         EVENT_DEADLINE,
@@ -182,6 +210,9 @@ fn run_launch(fixture: &PublicFsProject, launch: usize, exercise: Exercise) -> L
         fixture.policy, evidence.click, evidence.reports,
     );
     if let Err(failure) = observation_result {
+        resume_unwind(failure);
+    }
+    if let Err(failure) = descendant_result {
         resume_unwind(failure);
     }
     assert_product_quit(&output, &evidence, stage.root(), host_pid, exercise);

@@ -8,6 +8,8 @@ const target = __TARGET__;
 const outside = __OUTSIDE__;
 const content = new Uint8Array(__CONTENT__);
 const automaticComponent = __AUTOMATIC_COMPONENT__;
+type DescendantQuitInputs = { python: string; helper: string; control: string; token: string };
+const descendantQuit: DescendantQuitInputs | null = __DESCENDANT_QUIT__;
 const naturalCase: "deny-read" | "links-limits" | "traversal-bounds" | null = __NATURAL_CASE__;
 type NaturalInputs = {
   readSentinel: string;
@@ -171,14 +173,23 @@ if (process.env.KELD_DEV_LEASE !== undefined ||
     process.env.KELD_INTERNAL_MACOS_GUARDIAN_REGISTRATION !== undefined) {
   throw new Error("public FS application inherited host-only authority");
 }
-const descendant = Bun.spawn(["/usr/bin/tail", "-f", "/dev/null"], {
-  stdin: "ignore", stdout: "ignore", stderr: "ignore",
-});
+const descendant = descendantQuit
+  ? Bun.spawn([descendantQuit.python, descendantQuit.helper], {
+      env: { KEL118_FIXTURE_CONTROL: descendantQuit.control,
+        KEL118_FIXTURE_TOKEN: descendantQuit.token },
+      stdin: "ignore", stdout: "inherit", stderr: "inherit",
+      // Same non-detached Python-peer class actually measured by the root probe.
+      // No child.kill or child.exited wait occurs in the public-Quit path.
+    })
+  : Bun.spawn(["/usr/bin/tail", "-f", "/dev/null"], {
+      stdin: "ignore", stdout: "ignore", stderr: "ignore",
+    });
 const appLink = process.env.KELD_APP_LINK;
 if (!appLink) throw new Error("public FS app has no host-minted link");
 const ready = await fetch(base + "/observe", { method: "POST",
   headers: { "Content-Type": "text/plain" }, body: JSON.stringify({
     phase: "app-ready", pid: process.pid, descendantPid: descendant.pid,
+    descendantKind: descendantQuit ? "python-peer-inherited-stdout" : "tail-ignored-stdio",
     endpoint: appLink.slice(0, appLink.lastIndexOf("#")),
     executable: process.execPath, bunVersion: Bun.version,
   }),

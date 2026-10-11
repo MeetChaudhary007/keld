@@ -79,3 +79,20 @@ fn public_app_native_traversal_boundaries_preserve_sentinels_and_healthy_session
         "KELD_KEL140_NATURAL_TRAVERSAL_BOUNDS input_actions=0 echo_calls=0 race_acceptance=false deadline_acceptance=false blocked_syscall_acceptance=false"
     );
 }
+
+/// KEL-118: actual public Quit with the measured Python-peer fork shape.
+#[test]
+fn public_quit_reaps_a_stdout_inheriting_descendant_after_bun_exit_zero() {
+    let mut descendant = super::descendant_quit::DescendantQuit::bind();
+    let mut fixture = PublicFsProject::new(Policy::Narrow);
+    fixture.set_descendant_quit(descendant.configuration());
+    super::run_launch_with_descendant_quit(
+        &fixture,
+        0,
+        Exercise::PublicAppComponent,
+        Some(&mut descendant),
+    );
+    // Healthy next launch retains the existing ordinary component/FS/policy route.
+    fixture.set_descendant_quit(serde_json::Value::Null);
+    run_launch(&fixture, 1, Exercise::PublicAppComponent);
+}

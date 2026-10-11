@@ -31,6 +31,7 @@ pub(super) struct PublicFsProject {
     allowed: PathBuf,
     policy_bytes: Vec<u8>,
     natural_case: NaturalCase,
+    descendant_quit: Value,
     pub(super) policy: Policy,
     pub(super) outside: PathBuf,
     pub(super) scope: String,
@@ -129,6 +130,7 @@ impl PublicFsProject {
             } else {
                 NaturalCase::DenyRead
             },
+            descendant_quit: Value::Null,
             policy,
             outside,
             scope,
@@ -157,6 +159,12 @@ impl PublicFsProject {
         self.project
             .parent()
             .expect("canonical owned project parent")
+    }
+
+    /// Ordinary fixture data only; no host flag, grant, principal or policy change.
+    pub(super) fn set_descendant_quit(&mut self, configuration: Value) {
+        assert!(configuration.is_null() || configuration.is_object());
+        self.descendant_quit = configuration;
     }
 
     pub(super) fn prepare(&self, launch: usize, port: u16) -> PreparedLaunch {
@@ -338,6 +346,7 @@ impl PublicFsProject {
         )
         .expect("public index path JSON");
         let body = include_str!("../../../fixtures/public_fs_app.ts")
+            .replace("__DESCENDANT_QUIT__", &self.descendant_quit.to_string())
             .replace("__RECOVERY_INPUTS__", &recovery_config.to_string())
             .replace("__NATURAL_CASE__", &natural_case.to_string())
             .replace("__NATURAL_INPUTS__", &natural_config.to_string())
