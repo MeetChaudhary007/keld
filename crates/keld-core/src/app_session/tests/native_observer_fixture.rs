@@ -134,7 +134,10 @@ impl NativeFixture {
     }
 
     pub(super) fn finish_caller(&mut self) -> std::collections::BTreeMap<String, String> {
-        self.role.take().expect("one public caller").finish()
+        let role = self.role.take().expect("one public caller");
+        let (report, pid, status) = role.finish_with_status();
+        support::record_owned_caller_exit(pid, status);
+        report
     }
 
     pub(super) fn assert_held_drain(&self, probe: &DrainProbe) {

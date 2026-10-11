@@ -150,8 +150,20 @@ impl WorkerLinkRole {
 
     /// Waits for the role to exit (kill switch only) and returns its
     /// `KELD_WL key=value` report.
-    fn finish(mut self) -> std::collections::BTreeMap<String, String> {
+    fn finish(self) -> std::collections::BTreeMap<String, String> {
+        self.finish_with_status().0
+    }
+
+    /// Retains the actual owning Child wait result for independent observers.
+    fn finish_with_status(
+        mut self,
+    ) -> (
+        std::collections::BTreeMap<String, String>,
+        u32,
+        std::process::ExitStatus,
+    ) {
         let mut child = self.child.take().expect("role child present");
+        let pid = child.id();
         let started = Instant::now();
         let status = loop {
             if let Some(status) = child.try_wait().expect("poll role") {
@@ -179,7 +191,7 @@ impl WorkerLinkRole {
                 "duplicate role report key `{key}`: {stdout}"
             );
         }
-        report
+        (report, pid, status)
     }
 
     /// Joins whichever output readers remain; each runs to its pipe's EOF.
