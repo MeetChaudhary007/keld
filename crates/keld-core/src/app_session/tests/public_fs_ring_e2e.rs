@@ -17,6 +17,9 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
+#[path = "public_fs_ring_occupied_e2e.rs"]
+mod public_fs_ring_occupied_e2e;
+
 /// Constants come from the actual transport export; the native codec owns size.
 /// The separate captured process opens no app-link and uses the existing child
 /// custody/exit/report owner. The public application imports only its API index.
