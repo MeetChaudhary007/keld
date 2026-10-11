@@ -11,6 +11,12 @@
 
 use super::*;
 
+#[cfg(feature = "fs-acceptance-observer")]
+keld_native::keld_native_fs_observer_items! {
+    #[path = "native_observer_e2e.rs"]
+    mod native_observer_e2e;
+}
+
 /// One Bun role running the GH-527 `WorkerLink` fixture
 /// (`packages/@keld/kipc/test/worker-link-role.ts`) on a real
 /// authenticated app link, and the guarded router serving that link.
@@ -55,6 +61,13 @@ impl WorkerLinkRole {
     }
 
     fn start_public_fs_scenario(scenario: &str) -> (Self, GuardedTestRouter) {
+        Self::start_public_fs_with_test_setup(scenario, None)
+    }
+
+    fn start_public_fs_with_test_setup(
+        scenario: &str,
+        setup: Option<GuardedFsTestSetup>,
+    ) -> (Self, GuardedTestRouter) {
         use std::process::{Command, Stdio};
 
         let listener = keld_ipc::BootstrapListener::bind().expect("bind public FS role listener");
@@ -67,7 +80,7 @@ impl WorkerLinkRole {
             .env("KELD_APP_LINK", listener.app_link())
             .env_remove("KELD_KIPC_TEST_HOOKS")
             .stdin(Stdio::piped());
-        Self::spawn_authenticated(&listener, command)
+        Self::spawn_authenticated_with_test_setup(&listener, command, setup)
     }
 
     /// Supplies the existing private EOF-terminated control to the owned caller.
@@ -91,7 +104,15 @@ impl WorkerLinkRole {
 
     fn spawn_authenticated(
         listener: &keld_ipc::BootstrapListener,
+        command: std::process::Command,
+    ) -> (Self, GuardedTestRouter) {
+        Self::spawn_authenticated_with_test_setup(listener, command, None)
+    }
+
+    fn spawn_authenticated_with_test_setup(
+        listener: &keld_ipc::BootstrapListener,
         mut command: std::process::Command,
+        setup: Option<GuardedFsTestSetup>,
     ) -> (Self, GuardedTestRouter) {
         use std::io::Read as _;
         use std::process::Stdio;
@@ -124,7 +145,7 @@ impl WorkerLinkRole {
             // Dropping `role` kills and reaps the child.
             panic!("role did not authenticate: {admission:?}");
         };
-        (role, guarded_router(stream))
+        (role, guarded_router_with_test_setup(stream, setup))
     }
 
     /// Waits for the role to exit (kill switch only) and returns its

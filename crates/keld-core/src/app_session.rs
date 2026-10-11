@@ -522,13 +522,30 @@ enum FsWorkerCommand {
 }
 
 #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+type FsWorkerTestInitializer =
+    Box<dyn FnOnce() -> Result<Box<dyn std::any::Any>, HostAppError> + Send>;
+
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 struct FsWorkerTestGate {
     taken: SyncSender<()>,
     release: Mutex<Receiver<()>>,
+    // The historical gate still follows accepted entry. This fence precedes it.
+    before_entry: Option<Arc<Self>>,
+    // The erased, possibly !Send guard is created and dropped on the FS worker.
+    initializer: Mutex<Option<FsWorkerTestInitializer>>,
 }
 
 #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 impl FsWorkerTestGate {
+    fn initialize_worker(&self) -> Result<Option<Box<dyn std::any::Any>>, HostAppError> {
+        let initialize = self
+            .initializer
+            .lock()
+            .map_err(|_| app_detail("filesystem worker fixture", "initializer lock poisoned"))?
+            .take();
+        initialize.map_or(Ok(None), |initialize| initialize().map(Some))
+    }
+
     fn wait_after_take(&self) -> Result<(), HostAppError> {
         self.taken
             .send(())
@@ -5820,6 +5837,13 @@ fn run_fs_worker(
         &FsWorkerTestGate,
     >,
 ) -> Result<(), HostAppError> {
+    // Retain this exact worker's scope through its final call and loop exit.
+    // A thread-affine erased value is never transferred back to the fixture.
+    #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+    let _worker_scope = test_gate
+        .map(FsWorkerTestGate::initialize_worker)
+        .transpose()?
+        .flatten();
     while let Ok(command) = receiver.recv() {
         let FsWorkerCommand::Work(work) = command else {
             return Ok(());
@@ -5831,6 +5855,10 @@ fn run_fs_worker(
             correlation,
             cancellation,
         } = work;
+        #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+        if let Some(fence) = test_gate.and_then(|gate| gate.before_entry.as_deref()) {
+            fence.wait_after_take()?;
+        }
         let outcome = admitted.handle_with(|| {
             #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
             if let Some(gate) = test_gate {
@@ -7656,6 +7684,17 @@ mod tests {
     /// authenticated app link.
     #[cfg(target_os = "macos")]
     fn guarded_router(server: std::os::unix::net::UnixStream) -> GuardedTestRouter {
+        guarded_router_with_test_setup(server, None)
+    }
+
+    #[cfg(target_os = "macos")]
+    type GuardedFsTestSetup = Box<dyn FnOnce(&mut FsWorkerTestGate)>;
+
+    #[cfg(target_os = "macos")]
+    fn guarded_router_with_test_setup(
+        server: std::os::unix::net::UnixStream,
+        setup: Option<GuardedFsTestSetup>,
+    ) -> GuardedTestRouter {
         use sha2::{Digest as _, Sha256};
 
         let temp = tempfile::tempdir().expect("guarded router root");
@@ -7676,10 +7715,16 @@ mod tests {
         let snapshot = GuardSnapshot::prepare(verified).expect("prepare guarded router broker");
         let (taken_tx, taken) = mpsc::sync_channel(1);
         let (release, release_rx) = mpsc::channel();
-        let gate = Arc::new(FsWorkerTestGate {
+        let mut gate = FsWorkerTestGate {
             taken: taken_tx,
             release: Mutex::new(release_rx),
-        });
+            before_entry: None,
+            initializer: Mutex::new(None),
+        };
+        if let Some(setup) = setup {
+            setup(&mut gate);
+        }
+        let gate = Arc::new(gate);
         let (window_tx, window) = mpsc::channel();
         let (guardian_tx, guardian) = mpsc::channel();
         let router = PrimaryRouter::start_with_fs_test_gate(
@@ -8311,6 +8356,8 @@ mod tests {
             let gate = Arc::new(FsWorkerTestGate {
                 taken: taken_tx,
                 release: Mutex::new(release_rx),
+                before_entry: None,
+                initializer: Mutex::new(None),
             });
             let (server, mut client) = UnixStream::pair().expect("FS worker primary pair");
             client
@@ -8876,6 +8923,8 @@ mod tests {
         let gate = Arc::new(FsWorkerTestGate {
             taken: taken_tx,
             release: Mutex::new(release_rx),
+            before_entry: None,
+            initializer: Mutex::new(None),
         });
         let (server, mut client) = UnixStream::pair().expect("second FS Call primary pair");
         client
