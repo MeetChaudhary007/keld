@@ -3155,6 +3155,150 @@ mod tests {
         assert!(revoked < provisioned, "g2 provisioned before g1 revocation");
     }
 
+    #[test]
+    fn unmarked_successor_preparation_errors_preserve_failed_outcome() {
+        use crate::SupervisorEvent;
+        use PreparationAttribution::{Accepted, Requested, Unattributed};
+        use io::ErrorKind::{Interrupted, InvalidData};
+
+        const DIAGNOSTIC_PHASE: &str = "macOS guardian generation control transition";
+        // Ordinary I/O kinds and public diagnostic phases do not mark an
+        // intentional runtime cancellation, even after a stop fact is set.
+        for attribution in [Accepted, Requested, Unattributed] {
+            for (phase, kind) in [
+                (DIAGNOSTIC_PHASE, Interrupted),
+                (DIAGNOSTIC_PHASE, InvalidData),
+                ("test unrelated preparation I/O", Interrupted),
+                ("test unrelated preparation I/O", InvalidData),
+            ] {
+                let (entered_tx, entered_rx) = mpsc::channel();
+                let (release_tx, release_rx) = mpsc::channel();
+                let mut command = Command::new("/bin/sh");
+                command.args([
+                    "-c",
+                    "printf KEL143_UNMARKED_G1_STDOUT; \
+                 printf KEL143_UNMARKED_G1_STDERR >&2; exit 1",
+                ]);
+                let supervisor = Supervisor::start_prepared(
+                    RestartPolicy::default(),
+                    GatedUnmarkedFailurePreparer {
+                        initial: Some(command),
+                        entered_tx,
+                        release_rx,
+                        phase,
+                        kind,
+                    },
+                )
+                .expect("initial real child must spawn");
+                // Only attempt 2 reaches this fence, after actual G1 retirement.
+                let entered = entered_rx.recv_timeout(Duration::from_secs(5));
+                match attribution {
+                    Accepted => supervisor.accept_shutdown(),
+                    Requested => supervisor.shutdown(),
+                    Unattributed => {}
+                }
+                if entered.is_err() {
+                    supervisor.shutdown();
+                }
+                // Release before asserting so Drop cannot wait on our own gate.
+                let released = release_tx.send(());
+                drop(release_tx);
+                entered.expect("successor preparation must reach the existing trait fence");
+                released.expect("release the controlled preparation error");
+
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let terminal = loop {
+                    let remaining = deadline
+                        .checked_duration_since(Instant::now())
+                        .expect("successor preparation terminal event deadline");
+                    match supervisor.recv_event(remaining) {
+                        Some(SupervisorEvent::Started { attempt: 2, .. }) => {
+                            panic!("failed successor preparation spawned G2");
+                        }
+                        Some(
+                            event @ (SupervisorEvent::Stopped | SupervisorEvent::Failed { .. }),
+                        ) => {
+                            break event;
+                        }
+                        Some(_) => {}
+                        None => panic!("no terminal successor event for {attribution:?}/{kind:?}"),
+                    }
+                };
+                let outcome = supervisor.wait_for_outcome();
+                assert!(
+                    supervisor.current_pid().is_none(),
+                    "G2 must not remain live"
+                );
+                let ledger = supervisor.crash_ledger();
+                assert_eq!(ledger.self_termination_count, 1);
+                assert!(
+                    ledger
+                        .last_self_termination
+                        .is_some_and(|exit| exit.exit_code == Some(1)),
+                    "shutdown must preserve the already-observed G1 exit"
+                );
+                let output = supervisor.output();
+                assert!(output.stdout.contains("KEL143_UNMARKED_G1_STDOUT"));
+                assert!(output.stderr.contains("KEL143_UNMARKED_G1_STDERR"));
+                assert!(
+                    matches!(terminal, SupervisorEvent::Failed { attempt: 2 }),
+                    "unmarked error became a stop: {attribution:?}/{phase}/{kind:?}: {terminal:?}"
+                );
+                match outcome {
+                    SupervisorOutcome::Failed(RuntimeError::Lifecycle {
+                        phase: actual,
+                        source,
+                    }) => {
+                        assert_eq!(actual, phase);
+                        assert_eq!(source.kind(), kind);
+                        assert_eq!(
+                            source.to_string(),
+                            "controlled successor preparation failure"
+                        );
+                    }
+                    other => panic!("unmarked preparation failure was hidden: {other:?}"),
+                }
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum PreparationAttribution {
+        Accepted,
+        Requested,
+        Unattributed,
+    }
+
+    struct GatedUnmarkedFailurePreparer {
+        initial: Option<Command>,
+        entered_tx: mpsc::Sender<()>,
+        release_rx: mpsc::Receiver<()>,
+        phase: &'static str,
+        kind: io::ErrorKind,
+    }
+
+    impl ChildPreparer for GatedUnmarkedFailurePreparer {
+        type Lease = crate::NoLease;
+
+        fn prepare(&mut self, attempt: u32) -> Result<PreparedChild<Self::Lease>, RuntimeError> {
+            if attempt == 1 {
+                return Ok(PreparedChild {
+                    command: self.initial.take().expect("one initial command").into(),
+                    lease: crate::NoLease,
+                });
+            }
+            assert_eq!(attempt, 2, "the failed preparation must not be retried");
+            self.entered_tx.send(()).expect("observe successor prepare");
+            self.release_rx
+                .recv()
+                .expect("controlled preparation release");
+            Err(RuntimeError::Lifecycle {
+                phase: self.phase,
+                source: io::Error::new(self.kind, "controlled successor preparation failure"),
+            })
+        }
+    }
+
     fn guardian_exchange(
         guardian: &mut std::os::unix::net::UnixStream,
         request: &GenerationControlRecord,

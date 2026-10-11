@@ -8,6 +8,10 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+[features]
+default = []
+fs-acceptance-observer = []
+
 [dependencies]
 cap-fs-ext = { workspace = true }
 cap-std = { workspace = true }
