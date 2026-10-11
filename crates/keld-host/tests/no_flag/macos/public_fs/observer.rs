@@ -1,5 +1,6 @@
 use crate::support::EVENT_DEADLINE;
 use serde_json::Value;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read as _, Write as _};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -11,8 +12,109 @@ pub(super) struct Observation {
     pub(super) port: u16,
     pub(super) reports: mpsc::Receiver<Value>,
     pub(super) quit: mpsc::Sender<()>,
+    recovery_commands: Option<mpsc::Sender<RecoveryCommand>>,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) enum RecoveryPhase {
+    Before,
+    After,
+}
+
+impl RecoveryPhase {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::Before => "before",
+            Self::After => "after",
+        }
+    }
+}
+
+pub(super) enum RecoveryCommand {
+    Admit(u32),
+    Invoke(RecoveryPhase),
+    Quit(u32),
+}
+
+/// Owns only ordinary fixture HTTP waits; two app generations, one real page.
+struct RecoveryObserver {
+    commands: mpsc::Receiver<RecoveryCommand>,
+    admitted: BTreeSet<u32>,
+    admissions: BTreeMap<u32, TcpStream>,
+    page: Option<TcpStream>,
+    invoke: Option<RecoveryPhase>,
+    quits: BTreeMap<u32, TcpStream>,
+    quitting: Option<u32>,
+}
+
+impl RecoveryObserver {
+    fn new(commands: mpsc::Receiver<RecoveryCommand>) -> Self {
+        Self {
+            commands,
+            admitted: BTreeSet::new(),
+            admissions: BTreeMap::new(),
+            page: None,
+            invoke: None,
+            quits: BTreeMap::new(),
+            quitting: None,
+        }
+    }
+
+    fn poll(&mut self) {
+        while let Ok(command) = self.commands.try_recv() {
+            match command {
+                RecoveryCommand::Admit(pid) => {
+                    assert!(self.admitted.insert(pid), "one admission per owned app");
+                    assert!(self.admitted.len() <= 2, "exactly two recovery apps");
+                }
+                RecoveryCommand::Invoke(phase) => {
+                    assert!(self.invoke.replace(phase).is_none(), "one page command");
+                }
+                RecoveryCommand::Quit(pid) => {
+                    assert!(self.quitting.replace(pid).is_none(), "one recovery Quit");
+                }
+            }
+        }
+        self.respond_ready();
+    }
+
+    fn accept_wait(&mut self, path: &str, stream: TcpStream) {
+        if path == "/recovery-page" {
+            assert!(self.page.replace(stream).is_none(), "one real page wait");
+        } else if let Some(pid) = path.strip_prefix("/recovery-admit/") {
+            let pid = pid.parse::<u32>().expect("owned recovery admission PID");
+            assert!(self.admissions.insert(pid, stream).is_none());
+            assert!(self.admissions.len() <= 2);
+        } else if let Some(pid) = path.strip_prefix("/recovery-quit/") {
+            let pid = pid.parse::<u32>().expect("owned recovery Quit PID");
+            assert!(self.quits.insert(pid, stream).is_none());
+            assert!(self.quits.len() <= 2);
+        } else {
+            panic!("unexpected recovery fixture route {path}");
+        }
+        self.respond_ready();
+    }
+
+    fn respond_ready(&mut self) {
+        for pid in &self.admitted {
+            if let Some(mut stream) = self.admissions.remove(pid) {
+                respond(&mut stream, "admit");
+            }
+        }
+        if self.page.is_some() && self.invoke.is_some() {
+            let mut stream = self.page.take().expect("retained real page wait");
+            let phase = self.invoke.take().expect("one page command");
+            respond(&mut stream, phase.as_str());
+        }
+        if let Some(pid) = self.quitting
+            && let Some(mut stream) = self.quits.remove(&pid)
+        {
+            // G1's dead HTTP wait is never answered or mistaken for G2.
+            respond(&mut stream, "quit");
+        }
+    }
 }
 
 impl Observation {
@@ -38,6 +140,22 @@ impl Observation {
     }
 
     pub(super) fn bind() -> Self {
+        Self::bind_with_recovery(false)
+    }
+
+    pub(super) fn bind_recovery() -> Self {
+        Self::bind_with_recovery(true)
+    }
+
+    pub(super) fn send_recovery_command(&self, command: RecoveryCommand) {
+        self.recovery_commands
+            .as_ref()
+            .expect("recovery observer owns these fixture commands")
+            .send(command)
+            .expect("recovery observer remains live");
+    }
+
+    fn bind_with_recovery(recovery_mode: bool) -> Self {
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("prearm public FS observer");
         let port = listener.local_addr().expect("observer address").port();
         listener
@@ -45,12 +163,21 @@ impl Observation {
             .expect("responsive observer accept loop");
         let (send, reports) = mpsc::channel();
         let (quit, commands) = mpsc::channel();
+        let (recovery_commands, mut recovery) = if recovery_mode {
+            let (send, receive) = mpsc::channel();
+            (Some(send), Some(RecoveryObserver::new(receive)))
+        } else {
+            (None, None)
+        };
         let stop = Arc::new(AtomicBool::new(false));
         let stopping = Arc::clone(&stop);
         let thread = thread::spawn(move || {
             let mut pending_quit = None;
             let mut released = false;
             while !stopping.load(Ordering::Acquire) {
+                if let Some(recovery) = recovery.as_mut() {
+                    recovery.poll();
+                }
                 released |= commands.try_recv().is_ok();
                 if released && let Some(mut stream) = pending_quit.take() {
                     respond(&mut stream, "quit");
@@ -74,7 +201,10 @@ impl Observation {
                                     pending_quit = Some(stream);
                                 }
                             }
-                            _ => panic!("unexpected public FS observation route {path}"),
+                            _ => match recovery.as_mut() {
+                                Some(recovery) => recovery.accept_wait(&path, stream),
+                                None => panic!("unexpected public FS observation route {path}"),
+                            },
                         }
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -88,6 +218,7 @@ impl Observation {
             port,
             reports,
             quit,
+            recovery_commands,
             stop,
             thread: Some(thread),
         }

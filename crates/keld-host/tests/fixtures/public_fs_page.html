@@ -13,6 +13,7 @@ const initial = { bridge: typeof window.keld?.invoke === "function",
   nativeHidden: window.webkit?.messageHandlers?.__keld_wv_link_v1 === undefined };
 const requests = [];
 const outcomes = [];
+const recoveryMode = __RECOVERY_MODE__;
 function encodeRequest(message, count) {
   const bytes = new TextEncoder().encode(message);
   if (bytes.length >= 128 || count >= 128) throw new Error("bounded sample request encoding");
@@ -58,6 +59,27 @@ go.addEventListener("click", async event => {
     go.remove();
   } catch (error) { await report("error", { error: String(error) }); }
 }, { once: true });
-// The parent sees this only after the actual listener is installed.
-report("page-ready", { button: go.id }).catch(error => { result.textContent = String(error); });
+async function runRecoveryConsumer() {
+  go.remove();
+  await report("page-ready", { automaticRecovery: true });
+  for (const phase of ["before", "after"]) {
+    const command = await fetch(base + "/recovery-page");
+    if (!command.ok || await command.text() !== phase) throw new Error("invalid recovery page command");
+    for (const [index, action] of ["recovery-" + phase, "deny"].entries()) {
+      const request = { action, nonce: nonce(), count: index + 1 };
+      requests.push(request);
+      const payload = encodeRequest(JSON.stringify({ action, nonce: request.nonce }), request.count);
+      const outcome = decodeResponse(await window.keld.invoke(1, payload), request.count);
+      outcomes.push({ action, outcome });
+    }
+    await report("recovery-" + phase, { automaticRecovery: true });
+  }
+}
+// Recovery uses the real renderer dataplane and no DOM or OS input action.
+if (recoveryMode) {
+  runRecoveryConsumer().catch(error => report("error", { error: String(error) }));
+} else {
+  // The parent sees this only after the actual listener is installed.
+  report("page-ready", { button: go.id }).catch(error => { result.textContent = String(error); });
+}
 </script></body></html>

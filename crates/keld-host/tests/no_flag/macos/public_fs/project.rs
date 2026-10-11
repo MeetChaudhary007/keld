@@ -15,6 +15,7 @@ pub(super) const INTERNAL_INITIAL: &[u8] = b"KEL140-internal-link-original";
 pub(super) const WRITE_SENTINEL: &[u8] = b"KEL140-oversize-write-target-unchanged";
 pub(super) const COMPONENT_SENTINEL: &[u8] = b"KEL140-component-boundary-unchanged";
 pub(super) const LINK_SENTINEL: &[u8] = b"KEL140-link-boundary-unchanged";
+pub(super) const RECOVERY_AFTER_CONTENT: &[u8] = &[7, 0, 128, 255, 42];
 
 #[derive(Clone, Copy, Debug)]
 pub(super) enum Policy {
@@ -39,6 +40,7 @@ pub(super) struct PublicFsProject {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Exercise {
     RendererPointer,
+    RendererRecovery,
     PublicAppComponent,
     PublicAppNaturalCases,
 }
@@ -76,6 +78,13 @@ pub(super) struct PreparedLaunch {
     pub(super) digest: String,
     pub(super) host_digest: String,
     pub(super) natural: Option<NaturalInputs>,
+    pub(super) recovery: Option<RecoveryInputs>,
+    pub(super) bun_image: PathBuf,
+}
+
+pub(super) struct RecoveryInputs {
+    pub(super) after: PathBuf,
+    pub(super) witness: PathBuf,
 }
 
 impl PublicFsProject {
@@ -160,6 +169,10 @@ impl PublicFsProject {
 
     pub(super) fn prepare_natural(&self, launch: usize, port: u16) -> PreparedLaunch {
         self.prepare_for(launch, port, Exercise::PublicAppNaturalCases)
+    }
+
+    pub(super) fn prepare_recovery(&self, launch: usize, port: u16) -> PreparedLaunch {
+        self.prepare_for(launch, port, Exercise::RendererRecovery)
     }
 
     fn natural_inputs(&self, launch: usize) -> NaturalInputs {
@@ -254,8 +267,23 @@ impl PublicFsProject {
         let target = self.allowed.join(format!("result-{launch}.bin"));
         let natural =
             (exercise == Exercise::PublicAppNaturalCases).then(|| self.natural_inputs(launch));
-        self.prepare_application_inputs(&target, port, exercise, natural.as_ref());
+        let recovery = (exercise == Exercise::RendererRecovery).then(|| {
+            let witness = self.allowed.join(format!("recovery-witness-{launch}.bin"));
+            fs::write(&witness, []).expect("seed independent completed-call witness");
+            RecoveryInputs {
+                after: self.allowed.join(format!("recovery-after-{launch}.bin")),
+                witness,
+            }
+        });
+        self.prepare_application_inputs(
+            &target,
+            port,
+            exercise,
+            natural.as_ref(),
+            recovery.as_ref(),
+        );
         let (stage, digest, host_digest) = self.stage_and_verify_inputs();
+        let bun_image = expected_source_bun_image(stage.root());
         PreparedLaunch {
             exercise,
             stage,
@@ -263,6 +291,8 @@ impl PublicFsProject {
             digest,
             host_digest,
             natural,
+            recovery,
+            bun_image,
         }
     }
 
@@ -272,7 +302,12 @@ impl PublicFsProject {
         port: u16,
         exercise: Exercise,
         natural: Option<&NaturalInputs>,
+        recovery: Option<&RecoveryInputs>,
     ) {
+        let recovery_config = recovery.map_or(Value::Null, |input| {
+            json!({"after":input.after,"witness":input.witness,
+                "afterContent":RECOVERY_AFTER_CONTENT})
+        });
         let natural_case = natural.map_or(Value::Null, |input| {
             json!(match input.case {
                 NaturalCase::DenyRead => "deny-read",
@@ -303,6 +338,7 @@ impl PublicFsProject {
         )
         .expect("public index path JSON");
         let body = include_str!("../../../fixtures/public_fs_app.ts")
+            .replace("__RECOVERY_INPUTS__", &recovery_config.to_string())
             .replace("__NATURAL_CASE__", &natural_case.to_string())
             .replace("__NATURAL_INPUTS__", &natural_config.to_string())
             .replace(
@@ -338,7 +374,11 @@ impl PublicFsProject {
         fs::write(
             self.project.join("index.html"),
             include_str!("../../../fixtures/public_fs_page.html")
-                .replace("__PORT__", &port.to_string()),
+                .replace("__PORT__", &port.to_string())
+                .replace(
+                    "__RECOVERY_MODE__",
+                    if recovery.is_some() { "true" } else { "false" },
+                ),
         )
         .expect("public FS renderer");
     }
@@ -382,6 +422,20 @@ impl PublicFsProject {
         );
         (stage, digest, host_digest)
     }
+}
+
+fn expected_source_bun_image(stage_root: &Path) -> PathBuf {
+    // Resolve the same source Bun command/current directory as the guardian,
+    // independently of every ordinary HTTP application identity report.
+    let output = Command::new("bun")
+        .current_dir(stage_root)
+        .args(["-e", "process.stdout.write(process.execPath)"])
+        .output()
+        .expect("independent source Bun executable selection");
+    assert!(output.status.success(), "source Bun selection: {output:?}");
+    let image = PathBuf::from(String::from_utf8(output.stdout).expect("source Bun path UTF-8"));
+    assert!(image.is_absolute(), "source Bun image must be absolute");
+    fs::canonicalize(image).expect("canonical expected source Bun image")
 }
 
 pub(super) fn file_digest(path: &Path) -> String {

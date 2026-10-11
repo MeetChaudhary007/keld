@@ -23,6 +23,8 @@ type NaturalInputs = {
   linksDeny: string;
 };
 const naturalInputs: NaturalInputs | null = __NATURAL_INPUTS__;
+type RecoveryInputs = { after: string; witness: string; afterContent: number[] };
+const recoveryInputs: RecoveryInputs | null = __RECOVERY_INPUTS__;
 const sampleControlBudget = 4096;
 let handlerCalls = 0;
 function rejectedFsOutcome(error: unknown): FsSampleOutcome {
@@ -45,6 +47,20 @@ async function performFsOperation(action: "roundtrip" | "deny"): Promise<FsSampl
     }
     await fs.write(outside, new Uint8Array([7, 8, 9]));
     return { ok: true, bytes: [] };
+  } catch (error: unknown) {
+    return rejectedFsOutcome(error);
+  }
+}
+async function performRecoveryOperation(action: "recovery-before" | "recovery-after"): Promise<FsSampleOutcome> {
+  if (!recoveryInputs) throw new Error("recovery fixture inputs absent");
+  try {
+    const marker = action === "recovery-before" ? 1 : 2;
+    const destination = marker === 1 ? target : recoveryInputs.after;
+    const bytes = marker === 1 ? content : new Uint8Array(recoveryInputs.afterContent);
+    const completed = await fs.read(recoveryInputs.witness);
+    await fs.write(recoveryInputs.witness, new Uint8Array([...completed, marker]));
+    await fs.write(destination, bytes);
+    return { ok: true, bytes: [...await fs.read(destination)] };
   } catch (error: unknown) {
     return rejectedFsOutcome(error);
   }
@@ -115,7 +131,10 @@ channels.handle(echoChannel, async request => {
     call: handlerCalls, action: control.action, nonce: control.nonce, pid: process.pid,
   }));
   let outcome: FsSampleOutcome;
-  if (control.action === "roundtrip" && request.count === 1) {
+  if (recoveryInputs && request.count === 1 &&
+      (control.action === "recovery-before" || control.action === "recovery-after")) {
+    outcome = await performRecoveryOperation(control.action);
+  } else if (control.action === "roundtrip" && request.count === 1) {
     outcome = await performFsOperation("roundtrip");
   } else if (control.action === "deny" && request.count === 2) {
     outcome = await performFsOperation("deny");
@@ -132,6 +151,21 @@ channels.handle(echoChannel, async request => {
   }));
   return response;
 });
+if (recoveryInputs) {
+  // Ordinary fixture data holds only this app's first public whenReady call.
+  // It gives the observer time to test old credentials before fresh HELLO.
+  const bootstrap = process.env.KELD_APP_LINK;
+  if (!bootstrap) throw new Error("recovery app has no host-minted link");
+  const boot = await fetch(base + "/observe", { method: "POST",
+    headers: { "Content-Type": "text/plain" }, body: JSON.stringify({
+      phase: "recovery-app-boot", pid: process.pid, appLink: bootstrap,
+    }) });
+  if (!boot.ok) throw new Error("recovery boot observation refused");
+  const admission = await fetch(base + "/recovery-admit/" + process.pid);
+  if (!admission.ok || await admission.text() !== "admit") {
+    throw new Error("invalid recovery fixture admission command");
+  }
+}
 await app.whenReady();
 if (process.env.KELD_DEV_LEASE !== undefined ||
     process.env.KELD_INTERNAL_MACOS_GUARDIAN_REGISTRATION !== undefined) {
@@ -187,7 +221,7 @@ if (automaticComponent) {
   if (!observed.ok) throw new Error("public natural-case observation refused");
 }
 // The observer retains this stream without blocking other page observations.
-const quit = await fetch(base + "/quit");
+const quit = await fetch(base + (recoveryInputs ? "/recovery-quit/" + process.pid : "/quit"));
 if (!quit.ok || await quit.text() !== "quit") throw new Error("invalid sample quit command");
 console.error("KELD_KEL140_PUBLIC_QUIT_REQUEST calls=" + handlerCalls);
 await app.quit();
