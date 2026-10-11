@@ -1,6 +1,7 @@
 //! Registers the native acceptance-observer cfg and admits only explicit macOS
 //! dev-profile builds; Rust debug assertions separately gate operational support.
 
+#[cfg(not(test))]
 fn main() {
     println!("cargo:rustc-check-cfg=cfg(keld_native_fs_observer_eligible)");
     for name in [

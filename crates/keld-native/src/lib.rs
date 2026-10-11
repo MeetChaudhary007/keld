@@ -8,6 +8,10 @@
 
 pub mod fs;
 
+#[cfg(test)]
+#[path = "../build.rs"]
+mod build_eligibility;
+
 #[cfg(all(test, windows))]
 #[path = "../tests/support/windows_handle_census.rs"]
 mod windows_handle_census;
