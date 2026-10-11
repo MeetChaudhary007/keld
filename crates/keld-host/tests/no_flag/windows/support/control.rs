@@ -92,7 +92,7 @@ fn accept_ready_generation_inner(
     let descendant_record =
         read_control_line_or_host_failure_after_phase(&mut reader, child, "DESCENDANT", "HELLO");
     let descendant_pid = parse_descendant_pid(&descendant_record);
-    let (lease_handle, _last_valid_phase) = if expect_lease_handle {
+    let (lease_handle, last_valid_phase) = if expect_lease_handle {
         let lease_record = read_control_line_or_host_failure_after_phase(
             &mut reader,
             child,
@@ -110,7 +110,12 @@ fn accept_ready_generation_inner(
         (None, "DESCENDANT")
     };
     assert_eq!(
-        read_control_line_or_host_failure_after_phase(&mut reader, child, "READY", "READY"),
+        read_control_line_or_host_failure_after_phase(
+            &mut reader,
+            child,
+            "READY",
+            last_valid_phase
+        ),
         "READY"
     );
     assert_eq!(
@@ -273,7 +278,7 @@ fn read_control_line_or_host_failure_after_phase(
                 }
                 assert!(
                     Instant::now() < deadline,
-                    "control failed while awaiting {label}: last valid phase={last_valid_phase}; child pid={}; child status=still running; read={result:?}; stdout/stderr=not read while child is alive",
+                    "control failed while awaiting {label}: last valid phase={last_valid_phase}; child pid={}; child status=exit code: 0; read={result:?}; stdout/stderr=not read while child is alive",
                     child.id(),
                 );
                 thread::park_timeout(Duration::from_millis(10));
