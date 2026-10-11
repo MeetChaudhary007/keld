@@ -8794,6 +8794,109 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "macos")]
+    fn shutdown_during_retired_fs_drain_does_not_publish_successor() {
+        use std::io::Read as _;
+        use std::os::unix::net::UnixStream;
+
+        use keld_ipc::link::AppLinkDeadlines as _;
+        use sha2::{Digest as _, Sha256};
+
+        let temp = tempfile::tempdir().expect("shutdown during drain root");
+        let manifest_text = "{}\n";
+        let manifest_path = temp.path().join(PERMISSIONS_FILE);
+        fs::write(&manifest_path, manifest_text).expect("write drain shutdown manifest");
+        let digest: [u8; 32] = Sha256::digest(manifest_text.as_bytes()).into();
+        let verified = load_verified_manifest(
+            File::open(&manifest_path).expect("open drain shutdown manifest"),
+            manifest_path,
+            digest,
+        )
+        .expect("verify drain shutdown manifest");
+        let snapshot = GuardSnapshot::prepare(verified).expect("prepare drain shutdown broker");
+
+        let (g1_server, _g1_client) = UnixStream::pair().expect("G1 drain shutdown pair");
+        let (mut router, _window_rx) = successor_drain_test_router(&snapshot, g1_server);
+        let old_call = snapshot
+            .fs
+            .begin_call(PendingFsCall {
+                attempt: 1,
+                correlation: CorrelationId(110),
+            })
+            .expect("admit old generation FS call")
+            .expect("old generation FS admission remains open");
+        router
+            .handle
+            .retire_generation(1)
+            .expect("retire G1 with an outstanding native lease");
+
+        let (drain_wait_tx, drain_wait_rx) = mpsc::sync_channel(1);
+        snapshot.fs.observe_next_drain_wait(drain_wait_tx);
+        let (g2_server, mut g2_client) = UnixStream::pair().expect("G2 drain shutdown pair");
+        g2_client
+            .set_app_link_deadlines(Some(Duration::from_secs(5)))
+            .expect("G2 deadlines");
+        let install_handle = router.handle.clone();
+        let (installed_tx, installed_rx) = mpsc::sync_channel(1);
+        let install = thread::spawn(move || {
+            let result = install_handle.install_generation(2, g2_server);
+            installed_tx.send(result).expect("report G2 install");
+        });
+
+        // The installer has passed its first shutdown check. Retaining old_call
+        // keeps it inside drain until shutdown is accepted, even on a spurious wake.
+        drain_wait_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("G2 install must reach the held retired-FS drain");
+        assert!(
+            matches!(installed_rx.try_recv(), Err(mpsc::TryRecvError::Empty)),
+            "G2 install completed while the old native lease was held"
+        );
+        assert!(router.handle.shutdown.claim_cli_lease_lost());
+        assert!(router.handle.shutdown.reader_stop.load(Ordering::Acquire));
+        drop(old_call);
+
+        installed_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("G2 install completion after shutdown")
+            .expect("shutdown refuses the late G2 without an install error");
+        install.join().expect("G2 installer joins");
+
+        // Observe completed installation before stop_and_join can erase an
+        // incorrectly published generation or close its peer on the test's behalf.
+        assert!(
+            router
+                .handle
+                .current
+                .lock()
+                .expect("generation state after installer join")
+                .is_none(),
+            "accepted shutdown during retired-FS drain must prevent G2 publication"
+        );
+        assert!(
+            !router
+                .handle
+                .readers
+                .lock()
+                .expect("readers after installer join")
+                .contains_key(&2),
+            "accepted shutdown during retired-FS drain must not register a G2 reader"
+        );
+        let mut byte = [0_u8; 1];
+        assert_eq!(
+            g2_client
+                .read(&mut byte)
+                .expect("refused G2 must reach EOF"),
+            0,
+            "refused G2 must close without Ready or another response"
+        );
+
+        router
+            .stop_and_join()
+            .expect("drain shutdown router cleanup");
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
     fn retired_generation_correlation_does_not_release_global_fs_single_flight() {
         use std::io::Cursor;
 
