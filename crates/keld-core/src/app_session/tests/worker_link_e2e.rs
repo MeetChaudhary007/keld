@@ -11,6 +11,9 @@
 
 use super::*;
 
+#[path = "public_fs_ring_e2e.rs"]
+mod public_fs_ring_e2e;
+
 #[cfg(feature = "fs-acceptance-observer")]
 keld_native::keld_native_fs_observer_items! {
     #[path = "native_observer_e2e.rs"]
@@ -109,11 +112,8 @@ impl WorkerLinkRole {
         Self::spawn_authenticated_with_test_setup(listener, command, None)
     }
 
-    fn spawn_authenticated_with_test_setup(
-        listener: &keld_ipc::BootstrapListener,
-        mut command: std::process::Command,
-        setup: Option<GuardedFsTestSetup>,
-    ) -> (Self, GuardedTestRouter) {
+    /// Captures an owned helper process with the same bounded finish/Drop custody.
+    fn spawn_captured(mut command: std::process::Command) -> Self {
         use std::io::Read as _;
         use std::process::Stdio;
 
@@ -124,7 +124,7 @@ impl WorkerLinkRole {
             .expect("bun must be on PATH (same contract as keld-cli bun_echo)");
         let mut out = child.stdout.take().expect("role stdout");
         let mut err = child.stderr.take().expect("role stderr");
-        let role = Self {
+        Self {
             child: Some(child),
             stdout: Some(std::thread::spawn(move || {
                 let mut text = String::new();
@@ -136,14 +136,26 @@ impl WorkerLinkRole {
                 let _ = err.read_to_string(&mut text);
                 text
             })),
-        };
+        }
+    }
+
+    fn spawn_authenticated_with_test_setup(
+        listener: &keld_ipc::BootstrapListener,
+        command: std::process::Command,
+        setup: Option<GuardedFsTestSetup>,
+    ) -> (Self, GuardedTestRouter) {
+        let mut role = Self::spawn_captured(command);
         let deadline = Instant::now() + Duration::from_secs(20);
-        let admission = listener
-            .accept_authenticated_until(deadline, &NoRejections)
-            .expect("accept role");
-        let keld_ipc::BootstrapAdmission::Authenticated(stream) = admission else {
-            // Dropping `role` kills and reaps the child.
-            panic!("role did not authenticate: {admission:?}");
+        let admission = listener.accept_authenticated_until(deadline, &NoRejections);
+        let Ok(keld_ipc::BootstrapAdmission::Authenticated(stream)) = admission else {
+            let child = role.child.as_mut().expect("owned unauthenticated role");
+            let terminated = child.kill();
+            let status = child.wait().expect("reap unauthenticated role");
+            role.child = None;
+            let (stdout, stderr) = role.join_output();
+            panic!(
+                "role did not authenticate: {admission:?}; terminate={terminated:?}; status={status:?}\n{stdout}\n{stderr}"
+            );
         };
         (role, guarded_router_with_test_setup(stream, setup))
     }
