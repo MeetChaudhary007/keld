@@ -40,6 +40,7 @@ pub struct Hold {
 impl Hold {
     /// Constructs a fixture wait of more than zero and at most ten seconds.
     /// This bound does not renew or replace the native operation budget.
+    #[must_use]
     pub fn new(
         held_sink: SyncSender<Snapshot>,
         release: Receiver<()>,
@@ -108,6 +109,7 @@ fn publish(state: &mut State, sink: &SyncSender<Snapshot>) {
 /// Installs only on the current thread, rejecting nesting or an existing private hook.
 /// Every `None`, missing final fence or fault snapshot is invalid fixture evidence.
 /// Sinks are bounded and nonblocking; neither their failure nor a hold changes results.
+#[must_use]
 pub fn install_current_thread(
     hold: Option<Hold>,
     native_return_sink: SyncSender<Snapshot>,
