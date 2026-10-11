@@ -8,8 +8,9 @@ const target = __TARGET__;
 const outside = __OUTSIDE__;
 const content = new Uint8Array(__CONTENT__);
 const automaticComponent = __AUTOMATIC_COMPONENT__;
+const retireAfterQuit = __RETIRE_AFTER_QUIT__;
 type DescendantQuitInputs = { python: string; helper: string; control: string; token: string };
-const descendantQuit: DescendantQuitInputs | null = __DESCENDANT_QUIT__;
+const descendantQuit = __DESCENDANT_QUIT__ as DescendantQuitInputs | null;
 const naturalCase: "deny-read" | "links-limits" | "traversal-bounds" | null = __NATURAL_CASE__;
 type NaturalInputs = {
   readSentinel: string;
@@ -235,5 +236,33 @@ if (automaticComponent) {
 const quit = await fetch(base + (recoveryInputs ? "/recovery-quit/" + process.pid : "/quit"));
 if (!quit.ok || await quit.text() !== "quit") throw new Error("invalid sample quit command");
 console.error("KELD_KEL140_PUBLIC_QUIT_REQUEST calls=" + handlerCalls);
-await app.quit();
+const pendingQuit = app.quit();
+if (retireAfterQuit) {
+  // Reserve the ordinary public Quit first, without waiting for its REPLY.
+  // Report actual outcomes before awaiting Quit; teardown owns process exit.
+  const describeFailure = (action: "write" | "read", error: unknown) => ({
+    action, status: "rejected",
+    errorName: error instanceof Error ? error.name : null,
+    message: error instanceof Error ? error.message : String(error),
+    codePresent: typeof error === "object" && error !== null && "code" in error,
+    callError: isCallError(error),
+  });
+  const outcomes = await Promise.all([
+    fs.write(target, new Uint8Array([7, 8, 9])).then(
+      () => ({ action: "write", status: "fulfilled", bytes: [] }),
+      (error: unknown) => describeFailure("write", error),
+    ),
+    fs.read(target).then(
+      bytes => ({ action: "read", status: "fulfilled", bytes: [...bytes] }),
+      (error: unknown) => describeFailure("read", error),
+    ),
+  ]);
+  const body = JSON.stringify({ phase: "app-retirement", pid: process.pid,
+    componentOnly: true, outcomes });
+  if (new TextEncoder().encode(body).byteLength > sampleControlBudget) {
+    throw new Error("retirement outcomes exceed existing sample control budget");
+  }
+  console.error("KELD_KEL140_PUBLIC_FS_RETIRED " + body);
+}
+await pendingQuit;
 process.exit(0);

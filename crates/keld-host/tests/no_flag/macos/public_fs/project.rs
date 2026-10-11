@@ -44,6 +44,7 @@ pub(super) enum Exercise {
     RendererRecovery,
     PublicAppComponent,
     PublicAppNaturalCases,
+    PublicAppRetirement,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -177,6 +178,10 @@ impl PublicFsProject {
 
     pub(super) fn prepare_natural(&self, launch: usize, port: u16) -> PreparedLaunch {
         self.prepare_for(launch, port, Exercise::PublicAppNaturalCases)
+    }
+
+    pub(super) fn prepare_retirement(&self, launch: usize, port: u16) -> PreparedLaunch {
+        self.prepare_for(launch, port, Exercise::PublicAppRetirement)
     }
 
     pub(super) fn prepare_recovery(&self, launch: usize, port: u16) -> PreparedLaunch {
@@ -346,13 +351,24 @@ impl PublicFsProject {
         )
         .expect("public index path JSON");
         let body = include_str!("../../../fixtures/public_fs_app.ts")
+            .replace(
+                "__RETIRE_AFTER_QUIT__",
+                if exercise == Exercise::PublicAppRetirement {
+                    "true"
+                } else {
+                    "false"
+                },
+            )
             .replace("__DESCENDANT_QUIT__", &self.descendant_quit.to_string())
             .replace("__RECOVERY_INPUTS__", &recovery_config.to_string())
             .replace("__NATURAL_CASE__", &natural_case.to_string())
             .replace("__NATURAL_INPUTS__", &natural_config.to_string())
             .replace(
                 "__AUTOMATIC_COMPONENT__",
-                if exercise == Exercise::PublicAppComponent {
+                if matches!(
+                    exercise,
+                    Exercise::PublicAppComponent | Exercise::PublicAppRetirement
+                ) {
                     "true"
                 } else {
                     "false"

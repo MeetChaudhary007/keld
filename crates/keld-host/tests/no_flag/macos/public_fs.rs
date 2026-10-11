@@ -35,6 +35,8 @@ mod preclick;
 mod process_image;
 #[path = "public_fs/project.rs"]
 mod project;
+#[path = "public_fs/retirement.rs"]
+mod retirement;
 use application_link::assert_single_application_link;
 use observer::{Observation, RecoveryCommand, RecoveryPhase};
 use outcomes::{
@@ -141,6 +143,7 @@ fn run_launch_with_descendant_quit(
         Exercise::RendererRecovery => fixture.prepare_recovery(launch, observer.port),
         Exercise::PublicAppComponent => fixture.prepare_component(launch, observer.port),
         Exercise::PublicAppNaturalCases => fixture.prepare_natural(launch, observer.port),
+        Exercise::PublicAppRetirement => fixture.prepare_retirement(launch, observer.port),
     };
     let stage = &prepared.stage;
     if exercise != Exercise::RendererPointer {
@@ -216,6 +219,9 @@ fn run_launch_with_descendant_quit(
         resume_unwind(failure);
     }
     assert_product_quit(&output, &evidence, stage.root(), host_pid, exercise);
+    if exercise == Exercise::PublicAppRetirement {
+        retirement::assert_after_quit(&output, &evidence, &prepared.target);
+    }
     cleanup.bun_group = None;
     eprintln!(
         "KELD_KEL140_PUBLIC_CLEANUP launch={launch} exact_stage={} family_gone=true window_gone=true fixture_drop_pending=true",
@@ -257,7 +263,9 @@ fn observe_launch(
         Exercise::RendererRecovery => {
             observe_recovery_actions(observer, cleanup, evidence, fixture, prepared, host_pid);
         }
-        Exercise::PublicAppComponent | Exercise::PublicAppNaturalCases => {
+        Exercise::PublicAppComponent
+        | Exercise::PublicAppNaturalCases
+        | Exercise::PublicAppRetirement => {
             observe_component_actions(observer, evidence, fixture, prepared, host_pid);
         }
     }
@@ -789,7 +797,9 @@ fn assert_product_quit(
     let expected_calls = match exercise {
         Exercise::RendererPointer => 3,
         Exercise::RendererRecovery => 4,
-        Exercise::PublicAppComponent | Exercise::PublicAppNaturalCases => 0,
+        Exercise::PublicAppComponent
+        | Exercise::PublicAppNaturalCases
+        | Exercise::PublicAppRetirement => 0,
     };
     for marker in [
         "KELD_KEL142_RENDERER_ADMIT webview=",
@@ -822,7 +832,9 @@ fn assert_product_quit(
             bun,
         ),
         Exercise::RendererRecovery => assert_recovery_trace(stderr, evidence),
-        Exercise::PublicAppComponent | Exercise::PublicAppNaturalCases => {
+        Exercise::PublicAppComponent
+        | Exercise::PublicAppNaturalCases
+        | Exercise::PublicAppRetirement => {
             assert_component_trace(stderr, &evidence.reports);
         }
     }
