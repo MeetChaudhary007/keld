@@ -71,6 +71,22 @@ impl WorkerLinkRole {
         scenario: &str,
         setup: Option<GuardedFsTestSetup>,
     ) -> (Self, GuardedTestRouter) {
+        Self::start_public_fs_with_test_setup_and_report(scenario, setup, None)
+    }
+
+    fn start_public_fs_with_report(
+        scenario: &str,
+        key: &'static str,
+        observed: SyncSender<()>,
+    ) -> (Self, GuardedTestRouter) {
+        Self::start_public_fs_with_test_setup_and_report(scenario, None, Some((key, observed)))
+    }
+
+    fn start_public_fs_with_test_setup_and_report(
+        scenario: &str,
+        setup: Option<GuardedFsTestSetup>,
+        report: Option<(&'static str, SyncSender<()>)>,
+    ) -> (Self, GuardedTestRouter) {
         use std::process::{Command, Stdio};
 
         let listener = keld_ipc::BootstrapListener::bind().expect("bind public FS role listener");
@@ -83,11 +99,19 @@ impl WorkerLinkRole {
             .env("KELD_APP_LINK", listener.app_link())
             .env_remove("KELD_KIPC_TEST_HOOKS")
             .stdin(Stdio::piped());
-        Self::spawn_authenticated_with_test_setup(&listener, command, setup)
+        Self::spawn_authenticated_with_test_setup_and_report(&listener, command, setup, report)
     }
 
     /// Supplies the existing private EOF-terminated control to the owned caller.
     fn supply_public_fs_targets(&mut self, target: &Path, late_target: &Path) {
+        drop(self.supply_public_fs_targets_retained(target, late_target));
+    }
+
+    fn supply_public_fs_targets_retained(
+        &mut self,
+        target: &Path,
+        late_target: &Path,
+    ) -> std::process::ChildStdin {
         use std::io::Write as _;
 
         let control = serde_json::json!({
@@ -102,7 +126,8 @@ impl WorkerLinkRole {
             .take()
             .expect("private fixture control pipe");
         writeln!(input, "{control}").expect("supply owned target paths");
-        drop(input);
+        input.flush().expect("flush owned target control line");
+        input
     }
 
     fn spawn_authenticated(
@@ -113,8 +138,15 @@ impl WorkerLinkRole {
     }
 
     /// Captures an owned helper process with the same bounded finish/Drop custody.
-    fn spawn_captured(mut command: std::process::Command) -> Self {
-        use std::io::Read as _;
+    fn spawn_captured(command: std::process::Command) -> Self {
+        Self::spawn_captured_with_report(command, None)
+    }
+
+    fn spawn_captured_with_report(
+        mut command: std::process::Command,
+        mut report: Option<(&'static str, SyncSender<()>)>,
+    ) -> Self {
+        use std::io::{BufRead as _, Read as _};
         use std::process::Stdio;
 
         let mut child = command
@@ -122,13 +154,30 @@ impl WorkerLinkRole {
             .stderr(Stdio::piped())
             .spawn()
             .expect("bun must be on PATH (same contract as keld-cli bun_echo)");
-        let mut out = child.stdout.take().expect("role stdout");
+        let out = child.stdout.take().expect("role stdout");
         let mut err = child.stderr.take().expect("role stderr");
         Self {
             child: Some(child),
             stdout: Some(std::thread::spawn(move || {
+                let mut reader = std::io::BufReader::new(out);
                 let mut text = String::new();
-                let _ = out.read_to_string(&mut text);
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).expect("read owned role stdout") == 0 {
+                        break;
+                    }
+                    text.push_str(&line);
+                    if report.as_ref().is_some_and(|(key, _)| {
+                        line.strip_prefix("KELD_WL ")
+                            .and_then(|record| record.split_once('='))
+                            .is_some_and(|(observed_key, value)| {
+                                observed_key == *key && value.trim_end() == "true"
+                            })
+                    }) {
+                        let (_, observed) = report.take().expect("matched owned report observer");
+                        observed.send(()).expect("publish owned role report");
+                    }
+                }
                 text
             })),
             stderr: Some(std::thread::spawn(move || {
@@ -144,7 +193,16 @@ impl WorkerLinkRole {
         command: std::process::Command,
         setup: Option<GuardedFsTestSetup>,
     ) -> (Self, GuardedTestRouter) {
-        let mut role = Self::spawn_captured(command);
+        Self::spawn_authenticated_with_test_setup_and_report(listener, command, setup, None)
+    }
+
+    fn spawn_authenticated_with_test_setup_and_report(
+        listener: &keld_ipc::BootstrapListener,
+        command: std::process::Command,
+        setup: Option<GuardedFsTestSetup>,
+        report: Option<(&'static str, SyncSender<()>)>,
+    ) -> (Self, GuardedTestRouter) {
+        let mut role = Self::spawn_captured_with_report(command, report);
         let deadline = Instant::now() + Duration::from_secs(20);
         let admission = listener.accept_authenticated_until(deadline, &NoRejections);
         let Ok(keld_ipc::BootstrapAdmission::Authenticated(stream)) = admission else {
