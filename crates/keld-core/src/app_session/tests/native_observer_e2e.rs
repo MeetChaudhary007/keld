@@ -15,6 +15,8 @@ mod sensor;
 mod support;
 #[path = "native_namespace_race.rs"]
 mod namespace_race;
+#[path = "native_create_new_race.rs"]
+mod create_new_race;
 use fixture::{DrainProbe, NativeFixture, held_snapshot};
 
 const OBSERVATION_BOUND: Duration = Duration::from_secs(5);
