@@ -19,6 +19,9 @@ mod namespace_race;
 mod create_new_race;
 use fixture::{DrainProbe, NativeFixture, held_snapshot};
 
+#[path = "native_deadline_e2e.rs"]
+mod native_deadline_e2e;
+
 const OBSERVATION_BOUND: Duration = Duration::from_secs(5);
 
 #[test]

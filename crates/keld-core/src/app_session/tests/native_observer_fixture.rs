@@ -98,8 +98,19 @@ pub(super) struct NativeFixture {
 
 impl NativeFixture {
     pub(super) fn start(case: &str, scenario: &str, hold_native: bool, pre_entry: bool) -> Self {
+        Self::start_with_caller(case, hold_native, pre_entry, |setup| {
+            WorkerLinkRole::start_public_fs_with_test_setup(scenario, Some(setup))
+        })
+    }
+
+    pub(super) fn start_with_caller(
+        case: &str,
+        hold_native: bool,
+        pre_entry: bool,
+        caller: impl FnOnce(GuardedFsTestSetup) -> (WorkerLinkRole, GuardedTestRouter),
+    ) -> Self {
         let (setup, signals) = native_setup(hold_native, pre_entry);
-        let (role, router) = WorkerLinkRole::start_public_fs_with_test_setup(scenario, Some(setup));
+        let (role, router) = caller(setup);
         signals
             .initialized
             .recv_timeout(OBSERVATION_BOUND)
