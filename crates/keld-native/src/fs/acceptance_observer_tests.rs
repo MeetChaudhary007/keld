@@ -128,10 +128,11 @@ fn hold_schedule(fixture_root: &Path) {
     let (release, released) = mpsc::sync_channel(1);
     let (returned, returns) = mpsc::sync_channel(1);
     let (final_sink, final_rows) = mpsc::sync_channel(1);
-    let hold = Hold::new(held, released, Duration::from_secs(2)).expect("bounded hold");
+    let wait_control = Hold::new(held, released, Duration::from_secs(2)).expect("bounded hold");
     let worker = std::thread::spawn(move || {
         let broker = FsBroker::prepare(&verified).expect("real broker on worker");
-        let guard = install_current_thread(Some(hold), returned, final_sink).expect("worker scope");
+        let guard =
+            install_current_thread(Some(wait_control), returned, final_sink).expect("worker scope");
         let result = broker.handle_request(
             &verified,
             keld_guard::Principal::AppProcess,
@@ -278,8 +279,8 @@ fn assert_sink_fault(fault: SinkFault) {
     let return_capacity = usize::from(!matches!(fault, SinkFault::ReturnFull));
     let (returned, returns) = mpsc::sync_channel(return_capacity);
     let (final_sink, final_rows) = mpsc::sync_channel(1);
-    let hold = Hold::new(held, released, Duration::from_secs(1)).expect("bounded hold");
-    let guard = install_current_thread(Some(hold), returned, final_sink).expect("scope");
+    let wait_control = Hold::new(held, released, Duration::from_secs(1)).expect("bounded hold");
+    let guard = install_current_thread(Some(wait_control), returned, final_sink).expect("scope");
     assert!(matches!(
         broker
             .handle_request(
@@ -302,17 +303,17 @@ fn assert_sink_fault(fault: SinkFault) {
                 .fixture_fault
         );
     }
-    if !matches!(fault, SinkFault::ReturnFull) {
+    if matches!(fault, SinkFault::ReturnFull) {
+        assert!(
+            returns.try_recv().is_err(),
+            "full return sink admits no notification"
+        );
+    } else {
         assert!(
             returns
                 .recv_timeout(Duration::from_secs(2))
                 .expect("healthy return sink")
                 .fixture_fault
-        );
-    } else {
-        assert!(
-            returns.try_recv().is_err(),
-            "full return sink admits no notification"
         );
     }
     drop(guard);

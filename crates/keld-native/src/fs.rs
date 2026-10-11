@@ -1500,7 +1500,7 @@ mod tests {
     #[cfg(any(windows, all(keld_native_fs_observer_eligible, debug_assertions)))]
     use keld_guard::verified_manifest::{VerifiedManifest, load_verified_manifest};
     #[cfg(any(windows, all(keld_native_fs_observer_eligible, debug_assertions)))]
-    use sha2::{Digest as _, Sha256};
+    use sha2::Sha256;
 
     std::thread_local! {
         static TEST_NOW: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
@@ -1535,6 +1535,8 @@ mod tests {
 
     #[cfg(any(windows, all(keld_native_fs_observer_eligible, debug_assertions)))]
     pub(super) fn test_verified_manifest(fixture: &Path, root: &Path) -> VerifiedManifest {
+        use sha2::Digest as _;
+
         let scope = root.to_str().expect("UTF-8 fixture").replace('\\', "/");
         let text =
             format!(r#"{{"app":{{"fs":{{"read":["{scope}/**"],"write":["{scope}/**"]}}}}}}"#);
