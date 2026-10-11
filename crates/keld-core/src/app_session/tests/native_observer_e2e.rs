@@ -1,4 +1,4 @@
-//! Three AC7 native/public-index mechanism scenarios; no no-flag app/ring claim.
+//! AC7 native/public-index mechanism scenarios; no no-flag app/ring claim.
 use super::{
     assert_public_retirement_report, assert_public_success_report,
     fresh_public_fs_session_reads_its_write,
@@ -13,6 +13,8 @@ mod fixture;
 mod sensor;
 #[path = "native_observer_support.rs"]
 mod support;
+#[path = "native_namespace_race.rs"]
+mod namespace_race;
 use fixture::{DrainProbe, NativeFixture, held_snapshot};
 
 const OBSERVATION_BOUND: Duration = Duration::from_secs(5);
