@@ -18,7 +18,7 @@ const NATIVE_HOLD_BOUND: Duration = Duration::from_secs(10);
 
 pub(super) struct NativeSignals {
     initialized: Receiver<()>,
-    held: Receiver<Snapshot>,
+    pub(super) held: Receiver<Snapshot>,
     pub(super) returned: Receiver<Snapshot>,
     final_snapshot: Receiver<Snapshot>,
     pub(super) native_release: Option<Sender<()>>,
