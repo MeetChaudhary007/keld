@@ -357,7 +357,7 @@
         "tools/llms_docs.rs",
         "crates/keld-host/tests/no_flag/macos/public_fs/project.rs"
       ],
-      "sha256": "86d2c0735af908d752eb6e1ca969e1d29034a1ffd107ba79f1807ccc70c856e2"
+      "sha256": "9f690d385431f97a3ee580fc4b4f6f1d2a087938d403d8741677a5007b42437e"
     },
     "bun-readers": {
       "patterns": [
@@ -420,7 +420,7 @@
     "patterns": [
       "crates/*"
     ],
-    "membership_sha256": "e66f2883bb315a0f3bf4f2cb30f60e916b813a26dd3b5adca384198cc49d03d6",
+    "membership_sha256": "dd9cd1cd818baf147e2d186cdf70839fe2cf90dcf8359ee28cc5603fe631fc6c",
     "contract": "Broad census binds path membership only: new/removed crate paths fail closed. Existing crate-content edits select Rust through the crates/* input edge. A new cross-tree read in an existing source must register that reader and its input edge in the same change; exact-reader content digests then guard future drift."
   },
   "rust_package_inputs": {
