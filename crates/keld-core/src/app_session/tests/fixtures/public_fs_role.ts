@@ -7,7 +7,8 @@ function report(key: string, value: string | number | boolean): void {
 
 const ready = app.whenReady();
 const scenario = process.argv[2] ?? "retirement";
-if (scenario !== "retirement" && scenario !== "reply-wins" && scenario !== "healthy") {
+if (scenario !== "retirement" && scenario !== "reply-wins" && scenario !== "healthy" &&
+    scenario !== "ring-fit" && scenario !== "ring-over") {
   throw new Error("invalid private public-FS fixture scenario");
 }
 const control: unknown = JSON.parse(await Bun.stdin.text());
@@ -19,9 +20,20 @@ if (typeof control !== "object" || control === null ||
 await ready;
 // This counts one public Promise handler, not wire ERRs or native syscall entries.
 let settlements = 0;
-const pending = fs.write(control.target, new Uint8Array([116, 50]));
+const ringRead = scenario === "ring-fit" || scenario === "ring-over";
+const pending = ringRead
+  ? fs.read(control.target)
+  : fs.write(control.target, new Uint8Array([116, 50]));
 await pending.then(
-  () => { settlements += 1; report("call-returned", true); },
+  (bytes) => {
+    settlements += 1;
+    if (ringRead) {
+      if (!(bytes instanceof Uint8Array)) throw new Error("public ring read returned no bytes");
+      report("read-length", bytes.length);
+      report("read-sha256", new Bun.CryptoHasher("sha256").update(bytes).digest("hex"));
+    }
+    report("call-returned", true);
+  },
   (error: unknown) => {
     settlements += 1;
     if (!isCallError(error)) throw error;
@@ -43,5 +55,5 @@ if (scenario === "retirement") {
   report("read-returned", true);
 }
 report("settlements", settlements);
-// No Quit, reconnect, or extra request in reply-wins mode. Let the canonical
+// No Quit, reconnect, or extra request in reply-wins/ring modes. Let the canonical
 // Worker reach the parent's terminal EOF and flush diagnostics before natural exit.
