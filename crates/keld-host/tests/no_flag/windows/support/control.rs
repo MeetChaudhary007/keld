@@ -74,12 +74,7 @@ fn accept_ready_generation_inner(
         .expect("generation control read deadline");
     let writer = control.try_clone().expect("generation control writer");
     let mut reader = BufReader::new(control);
-    let hello = read_control_line_or_host_failure_after_phase(
-        &mut reader,
-        child,
-        "HELLO",
-        "CONTROL_CONNECTED",
-    );
+    let hello = read_control_line_or_host_failure(&mut reader, child, "HELLO");
     let mut fields = hello.split_whitespace();
     assert_eq!(fields.next(), Some("HELLO"), "{hello}");
     let pid = fields
@@ -89,41 +84,27 @@ fn accept_ready_generation_inner(
         .expect("numeric generation pid");
     let link = fields.next().expect("generation app link").to_owned();
     assert!(fields.next().is_none(), "{hello}");
-    let descendant_record =
-        read_control_line_or_host_failure_after_phase(&mut reader, child, "DESCENDANT", "HELLO");
+    let descendant_record = read_control_line_or_host_failure(&mut reader, child, "DESCENDANT");
     let descendant_pid = parse_descendant_pid(&descendant_record);
-    let (lease_handle, last_valid_phase) = if expect_lease_handle {
-        let lease_record = read_control_line_or_host_failure_after_phase(
-            &mut reader,
-            child,
-            "LEASE_HANDLE",
-            "DESCENDANT",
-        );
+    let lease_handle = if expect_lease_handle {
+        let lease_record = read_control_line_or_host_failure(&mut reader, child, "LEASE_HANDLE");
         let value = lease_record
             .strip_prefix("LEASE_HANDLE ")
             .expect("lease census line prefix");
-        (
-            Some(usize::from_str_radix(value, 16).expect("hexadecimal host lease handle")),
-            "LEASE_HANDLE",
-        )
+        Some(usize::from_str_radix(value, 16).expect("hexadecimal host lease handle"))
     } else {
-        (None, "DESCENDANT")
+        None
     };
     assert_eq!(
-        read_control_line_or_host_failure_after_phase(
-            &mut reader,
-            child,
-            "READY",
-            last_valid_phase
-        ),
+        read_control_line_or_host_failure(&mut reader, child, "READY"),
         "READY"
     );
     assert_eq!(
-        read_control_line_or_host_failure_after_phase(&mut reader, child, "ECHO1", "READY"),
+        read_control_line_or_host_failure(&mut reader, child, "ECHO1"),
         "ECHO1"
     );
     assert_eq!(
-        read_control_line_or_host_failure_after_phase(&mut reader, child, "ECHO2", "ECHO1"),
+        read_control_line_or_host_failure(&mut reader, child, "ECHO2"),
         "ECHO2"
     );
     (reader, writer, pid, link, descendant_pid, lease_handle)
@@ -242,15 +223,6 @@ pub(crate) fn read_control_line_or_host_failure(
     child: &mut Child,
     label: &str,
 ) -> String {
-    read_control_line_or_host_failure_after_phase(reader, child, label, "not tracked")
-}
-
-fn read_control_line_or_host_failure_after_phase(
-    reader: &mut BufReader<TcpStream>,
-    child: &mut Child,
-    label: &str,
-    last_valid_phase: &'static str,
-) -> String {
     match try_read_control_line(reader, Instant::now() + PRODUCT_DEADLINE) {
         Ok(line) if line != "LINK_EOF" => line,
         result => {
@@ -272,14 +244,12 @@ fn read_control_line_or_host_failure_after_phase(
                         .read_to_string(&mut stderr)
                         .expect("read failed host stderr");
                     panic!(
-                        "host exited while awaiting {label}: {status}; last valid phase={last_valid_phase}; child pid={}; read={result:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
-                        child.id(),
+                        "host exited while awaiting {label}: {status}; read={result:?}\nstdout:\n{stdout}\nstderr:\n{stderr}"
                     );
                 }
                 assert!(
                     Instant::now() < deadline,
-                    "control failed while awaiting {label}: last valid phase={last_valid_phase}; child pid={}; child status=still running; read={result:?}; stdout/stderr=not read while child is alive",
-                    child.id(),
+                    "control failed while awaiting {label}: read={result:?}"
                 );
                 thread::park_timeout(Duration::from_millis(10));
             }
