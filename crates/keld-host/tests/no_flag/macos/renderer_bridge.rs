@@ -14,10 +14,15 @@ use std::thread;
 const TITLE: &str = "KEL142 Renderer Bridge Acceptance";
 const RESPONSE_PATH: &str = "/KEL142_RENDERED_renderer-click_42";
 const BEACON_GIF: &[u8] = b"GIF89a\x01\x00\x01\x00\x80\x00\x00\x00\x00\x00\xff\xff\xff!\xf9\x04\x01\x00\x00\x00\x00,\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02D\x01\x00;";
+// Reuse GH-652's notification drain and fresh front-to-back window census.
+// The geometric candidate is a posting prerequisite, not delivery proof.
+// Keep the existing 10-second helper budget; actual page/handler oracles and
+// all existing failure-pipe ownership remain with the callers.
 pub(crate) const CLICK_SCRIPT: &str = r#"
+import AppKit
 import CoreGraphics
 import Foundation
-let pid = Int(CommandLine.arguments[1])!
+let pid = pid_t(CommandLine.arguments[1])!
 let title = CommandLine.arguments[2]
 // Query the actual poster. An emitted CLICKED line alone proves no delivery.
 if !CGPreflightPostEventAccess() {
@@ -26,28 +31,88 @@ if !CGPreflightPostEventAccess() {
   exit(5)
 }
 let deadline = Date().addingTimeInterval(10)
+let clickPulseMicroseconds: useconds_t = 30_000
+final class Active { var pid: pid_t = -1; var name = "none" }
+let active = Active()
+let workspace = NSWorkspace.shared
+// Register before the first read, so an activation in between is still delivered.
+let observer = workspace.notificationCenter.addObserver(
+  forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main
+) { note in
+  let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
+  active.pid = app?.processIdentifier ?? -1
+  active.name = app?.localizedName ?? "unknown"
+  // Ends the run-loop pass that delivered it, so a blocked wait re-checks now.
+  CFRunLoopStop(CFRunLoopGetMain())
+}
+active.pid = workspace.frontmostApplication?.processIdentifier ?? -1
+active.name = workspace.frontmostApplication?.localizedName ?? "none"
+// Zero-timeout passes until one delivers nothing, so `active` is current.
+func drainActivations() {
+  var result: CFRunLoopRunResult
+  repeat {
+    if Date() >= deadline { return }
+    result = CFRunLoopRunInMode(.defaultMode, 0, true)
+  } while result == .handledSource || result == .stopped
+}
+func census() -> [[String: Any]] {
+  CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
+    as! [[String: Any]]
+}
+func int(_ row: [String: Any], _ key: CFString) -> Int { (row[key as String] as? NSNumber)?.intValue ?? -1 }
+func frame(_ row: [String: Any]) -> CGRect {
+  var rect = CGRect.zero
+  precondition(CGRectMakeWithDictionaryRepresentation(row[kCGWindowBounds as String] as! CFDictionary, &rect))
+  return rect
+}
+func hostWindow(_ rows: [[String: Any]]) -> [String: Any]? {
+  rows.first { int($0, kCGWindowOwnerPID) == Int(pid) && $0[kCGWindowName as String] as? String == title && int($0, kCGWindowLayer) == 0 }
+}
+func hitAt(_ point: CGPoint, _ rows: [[String: Any]]) -> [String: Any]? {
+  rows.first { int($0, kCGWindowLayer) == 0 && (($0[kCGWindowAlpha as String] as? NSNumber)?.doubleValue ?? 1) > 0 && frame($0).contains(point) }
+}
+func describe(_ row: [String: Any]?) -> String {
+  guard let row else { return "none" }
+  return "pid=\(int(row, kCGWindowOwnerPID)) owner=\((row[kCGWindowOwnerName as String] as? String) ?? "?") title=\((row[kCGWindowName as String] as? String) ?? "?")"
+}
+func failAtDeadline() -> Never {
+  drainActivations()
+  let rows = census()
+  let host = hostWindow(rows)
+  let hit = host.flatMap { hitAt(CGPoint(x: frame($0).midX, y: frame($0).midY), rows) }
+  print("CLICK_TARGET_NOT_HOST active_pid=\(active.pid) active_name=\(active.name) hit=\(describe(hit)) host=\(describe(host))")
+  exit(3)
+}
+while hostWindow(census()) == nil {
+  if Date() >= deadline { print("NOT_PRESENTED pid=\(pid) title=\(title)"); exit(3) }
+  sched_yield()
+}
 while true {
-  let rows = CGWindowListCopyWindowInfo(
-    [.optionOnScreenOnly, .excludeDesktopElements],
-    kCGNullWindowID
-  ) as! [[String: Any]]
-  if let row = rows.first(where: {
-    ($0[kCGWindowOwnerPID as String] as? NSNumber)?.intValue == pid &&
-    $0[kCGWindowName as String] as? String == title &&
-    ($0[kCGWindowLayer as String] as? NSNumber)?.intValue == 0
-  }) {
-    let bounds = row[kCGWindowBounds as String] as! CFDictionary
-    var rect = CGRect.zero
-    precondition(CGRectMakeWithDictionaryRepresentation(bounds, &rect))
-    let point = CGPoint(x: rect.midX, y: rect.midY)
-    CGEvent(mouseEventSource: nil, mouseType: .mouseMoved, mouseCursorPosition: point, mouseButton: .left)!.post(tap: .cghidEventTap)
-    CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown, mouseCursorPosition: point, mouseButton: .left)!.post(tap: .cghidEventTap)
-    usleep(30_000)
-    CGEvent(mouseEventSource: nil, mouseType: .leftMouseUp, mouseCursorPosition: point, mouseButton: .left)!.post(tap: .cghidEventTap)
-    print("CLICKED window=\((row[kCGWindowNumber as String] as! NSNumber).uint32Value) x=\(point.x) y=\(point.y)")
-    exit(0)
+  drainActivations()
+  if Date() >= deadline { failAtDeadline() }
+  if active.pid != pid {
+    if Date() >= deadline { failAtDeadline() }
+    // Blocks until the next activation notification or the deadline.
+    _ = CFRunLoopRunInMode(.defaultMode, deadline.timeIntervalSinceNow, true)
+    continue
   }
-  if Date() >= deadline { exit(3) }
+  let rows = census()
+  if let row = hostWindow(rows) {
+    let point = CGPoint(x: frame(row).midX, y: frame(row).midY)
+    if let hit = hitAt(point, rows), int(hit, kCGWindowNumber) == int(row, kCGWindowNumber) {
+      // The deadline bounds selection/admission. Once down is admitted, always
+      // release it; an OS scheduling delay must not leave pressed input behind.
+      if deadline.timeIntervalSinceNow <= TimeInterval(clickPulseMicroseconds) / 1_000_000 { failAtDeadline() }
+      CGEvent(mouseEventSource: nil, mouseType: .mouseMoved, mouseCursorPosition: point, mouseButton: .left)!.post(tap: .cghidEventTap)
+      CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown, mouseCursorPosition: point, mouseButton: .left)!.post(tap: .cghidEventTap)
+      usleep(clickPulseMicroseconds)
+      CGEvent(mouseEventSource: nil, mouseType: .leftMouseUp, mouseCursorPosition: point, mouseButton: .left)!.post(tap: .cghidEventTap)
+      print("CLICKED window=\(int(row, kCGWindowNumber)) x=\(point.x) y=\(point.y) active=\(active.pid)")
+      exit(0)
+    }
+  }
+  if Date() >= deadline { failAtDeadline() }
+  // Active but not yet the hit target: the next window-server census decides.
   sched_yield()
 }
 "#;
