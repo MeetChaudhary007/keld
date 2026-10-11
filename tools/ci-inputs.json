@@ -357,7 +357,7 @@
         "tools/llms_docs.rs",
         "crates/keld-host/tests/no_flag/macos/public_fs/project.rs"
       ],
-      "sha256": "c7d9cabd3b87bf95223c0e7bb0c7a59e5a26d96bf850cab935a4039ac31f90da"
+      "sha256": "aee17249ed164af43d401b1050d1b4f487bb98b47430db189adca4cf3c36edca"
     },
     "bun-readers": {
       "patterns": [
