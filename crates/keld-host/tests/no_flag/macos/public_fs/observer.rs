@@ -19,6 +19,7 @@ pub(super) struct Observation {
 
 #[derive(Clone, Copy, Debug)]
 pub(super) enum RecoveryPhase {
+    Pending,
     Before,
     After,
 }
@@ -26,6 +27,7 @@ pub(super) enum RecoveryPhase {
 impl RecoveryPhase {
     pub(super) fn as_str(self) -> &'static str {
         match self {
+            Self::Pending => "pending",
             Self::Before => "before",
             Self::After => "after",
         }
@@ -36,6 +38,7 @@ pub(super) enum RecoveryCommand {
     Admit(u32),
     Invoke(RecoveryPhase),
     Quit(u32),
+    RetirePending(u32),
 }
 
 /// Owns only ordinary fixture HTTP waits; two app generations, one real page.
@@ -47,6 +50,7 @@ struct RecoveryObserver {
     invoke: Option<RecoveryPhase>,
     quits: BTreeMap<u32, TcpStream>,
     quitting: Option<u32>,
+    pending: Option<(u32, TcpStream)>,
 }
 
 impl RecoveryObserver {
@@ -59,6 +63,7 @@ impl RecoveryObserver {
             invoke: None,
             quits: BTreeMap::new(),
             quitting: None,
+            pending: None,
         }
     }
 
@@ -72,6 +77,11 @@ impl RecoveryObserver {
                 RecoveryCommand::Invoke(phase) => {
                     assert!(self.invoke.replace(phase).is_none(), "one page command");
                 }
+                RecoveryCommand::RetirePending(pid) => {
+                    let (held, stream) = self.pending.take().expect("one pending handler stream");
+                    assert_eq!(held, pid, "retire only the observed old handler");
+                    drop(stream);
+                }
                 RecoveryCommand::Quit(pid) => {
                     assert!(self.quitting.replace(pid).is_none(), "one recovery Quit");
                 }
@@ -80,7 +90,17 @@ impl RecoveryObserver {
         self.respond_ready();
     }
 
-    fn accept_wait(&mut self, path: &str, stream: TcpStream) {
+    fn accept_wait(&mut self, path: &str, stream: TcpStream) -> Option<Value> {
+        if let Some(identity) = path.strip_prefix("/recovery-pending/") {
+            let (pid, nonce) = identity.split_once('/').expect("pending handler identity");
+            let pid = pid.parse::<u32>().expect("owned pending handler PID");
+            assert!(self.admitted.contains(&pid));
+            assert_eq!(nonce.len(), 32);
+            assert!(nonce.bytes().all(|byte| byte.is_ascii_hexdigit()));
+            assert!(self.pending.replace((pid, stream)).is_none());
+            return Some(serde_json::json!({"phase":"recovery-handler-pending",
+                "pid":pid,"nonce":nonce,"barrier":"application-handler-only"}));
+        }
         if path == "/recovery-page" {
             assert!(self.page.replace(stream).is_none(), "one real page wait");
         } else if let Some(pid) = path.strip_prefix("/recovery-admit/") {
@@ -95,6 +115,7 @@ impl RecoveryObserver {
             panic!("unexpected recovery fixture route {path}");
         }
         self.respond_ready();
+        None
     }
 
     fn respond_ready(&mut self) {
@@ -202,7 +223,11 @@ impl Observation {
                                 }
                             }
                             _ => match recovery.as_mut() {
-                                Some(recovery) => recovery.accept_wait(&path, stream),
+                                Some(recovery) => {
+                                    if let Some(report) = recovery.accept_wait(&path, stream) {
+                                        send.send(report).expect("pending handler observation");
+                                    }
+                                }
                                 None => panic!("unexpected public FS observation route {path}"),
                             },
                         }

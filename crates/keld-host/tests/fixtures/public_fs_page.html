@@ -14,6 +14,47 @@ const initial = { bridge: typeof window.keld?.invoke === "function",
 const requests = [];
 const outcomes = [];
 const recoveryMode = __RECOVERY_MODE__;
+const pendingRecovery = __PENDING_RECOVERY__;
+const terminals = [];
+const invokeNonces = new Map();
+const resultEnvelopes = new Map();
+const terminalWaiters = new Map();
+function captureTerminal(requestId) {
+  if (!invokeNonces.has(requestId) || !resultEnvelopes.has(requestId)) return;
+  const requestNonce = invokeNonces.get(requestId);
+  const rows = resultEnvelopes.get(requestId);
+  resultEnvelopes.delete(requestId);
+  for (const value of rows) {
+    terminals.push({ nonce: requestNonce, ok: value.ok,
+      code: value.code ?? null, detail: value.detail ?? null });
+  }
+  const waiter = terminalWaiters.get(requestNonce);
+  if (waiter) { terminalWaiters.delete(requestNonce); waiter(); }
+}
+function awaitPassiveTerminal(requestNonce) {
+  if (terminals.some(terminal => terminal.nonce === requestNonce)) return Promise.resolve();
+  return new Promise(resolve => { terminalWaiters.set(requestNonce, resolve); });
+}
+// Passive existing-bridge observations only; never post a bridge message.
+window.addEventListener("message", event => {
+  if (!pendingRecovery || event.source !== window) return;
+  const value = event.data;
+  if (value?.__keldRelay === "invoke-v1" && value.channel === 1 && Array.isArray(value.payload)) {
+    const request = requests.find(request => {
+      const bytes = encodeRequest(JSON.stringify({ action: request.action, nonce: request.nonce }), request.count);
+      return bytes.length === value.payload.length && bytes.every((byte, index) => byte === value.payload[index]);
+    });
+    if (request) {
+      invokeNonces.set(value.request, request.nonce);
+      captureTerminal(value.request);
+    }
+  } else if (value?.__keldRelay === "result-v1") {
+    const rows = resultEnvelopes.get(value.request) ?? [];
+    rows.push({ ok: value.ok, code: value.code ?? null, detail: value.detail ?? null });
+    resultEnvelopes.set(value.request, rows);
+    captureTerminal(value.request);
+  }
+});
 function encodeRequest(message, count) {
   const bytes = new TextEncoder().encode(message);
   if (bytes.length >= 128 || count >= 128) throw new Error("bounded sample request encoding");
@@ -35,7 +76,12 @@ function decodeResponse(bytes, expectedCount) {
   return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes.slice(offset, offset + length)));
 }
 async function report(phase, extra) {
-  const value = { phase, documentNonce, javascriptToken, initial, requests, outcomes, ...extra };
+  // The facade may settle its Promise before this later passive listener runs.
+  // Fence the actual matching result event, not a timer or an invented result.
+  if (pendingRecovery) {
+    await Promise.all(outcomes.map((_outcome, index) => awaitPassiveTerminal(requests[index].nonce)));
+  }
+  const value = { phase, documentNonce, javascriptToken, initial, requests, outcomes, ...(pendingRecovery ? { terminals } : {}), ...extra };
   result.textContent = JSON.stringify(value);
   const response = await fetch(base + "/observe", { method: "POST",
     headers: { "Content-Type": "text/plain" }, body: JSON.stringify(value) });
@@ -73,6 +119,21 @@ async function runRecoveryConsumer() {
       outcomes.push({ action, outcome });
     }
     await report("recovery-" + phase, { automaticRecovery: true });
+    if (pendingRecovery && phase === "before") {
+      const command = await fetch(base + "/recovery-page");
+      if (!command.ok || await command.text() !== "pending") throw new Error("invalid pending page command");
+      const request = { action: "recovery-pending", nonce: nonce(), count: 3 };
+      requests.push(request);
+      await report("recovery-pending-start", { automaticRecovery: true });
+      try {
+        const payload = encodeRequest(JSON.stringify({ action: request.action, nonce: request.nonce }), request.count);
+        const outcome = decodeResponse(await window.keld.invoke(1, payload), request.count);
+        outcomes.push({ action: request.action, outcome });
+      } catch (error) {
+        outcomes.push({ action: request.action, name: error.name, error: error.message, code: error.code ?? null });
+      }
+      await report("recovery-pending-settled", { automaticRecovery: true });
+    }
   }
 }
 // Recovery uses the real renderer dataplane and no DOM or OS input action.

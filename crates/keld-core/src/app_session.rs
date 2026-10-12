@@ -176,6 +176,7 @@ struct DevHostLease {
 #[derive(Clone)]
 struct SessionShutdownState {
     cause: Arc<AtomicU8>,
+    reserved_cause: Arc<AtomicU8>,
     transition: Arc<Mutex<()>>,
     reader_stop: Arc<AtomicBool>,
     generation_reader_stops: Arc<Mutex<Vec<Arc<AtomicBool>>>>,
@@ -232,6 +233,7 @@ struct GuardSnapshot {
     // child/listener/window resource exists.
     verified: VerifiedManifest,
     fs: Arc<FsDispatchSession>,
+    initial_broker: Mutex<Option<FsBroker>>,
     #[cfg(all(test, target_os = "macos"))]
     drop_observer: Option<Arc<AtomicBool>>,
 }
@@ -240,10 +242,11 @@ struct GuardSnapshot {
 impl GuardSnapshot {
     fn prepare(verified: VerifiedManifest) -> Result<Self, FsPrepareError> {
         let broker = FsBroker::prepare(&verified)?;
-        let fs = Arc::new(FsDispatchSession::new(verified.clone(), broker));
+        let fs = Arc::new(FsDispatchSession::new(verified.clone()));
         Ok(Self {
             verified,
             fs,
+            initial_broker: Mutex::new(Some(broker)),
             #[cfg(all(test, target_os = "macos"))]
             drop_observer: None,
         })
@@ -252,11 +255,25 @@ impl GuardSnapshot {
     fn fs_weak(&self) -> Weak<FsDispatchSession> {
         Arc::downgrade(&self.fs)
     }
+
+    fn take_initial_broker(&self) -> Result<FsBroker, HostAppError> {
+        self.initial_broker
+            .lock()
+            .map_err(|_| app_detail("filesystem worker startup", "broker transfer lock poisoned"))?
+            .take()
+            .ok_or_else(|| {
+                app_detail(
+                    "filesystem worker startup",
+                    "initial broker already transferred",
+                )
+            })
+    }
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
 struct FsDispatchState {
     accepting: bool,
+    prepared_attempt: Option<u32>,
     in_flight: usize,
     call_outstanding: bool,
     pending_call: Option<PendingFsCall>,
@@ -273,7 +290,6 @@ struct PendingFsCall {
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
 struct FsDispatchSession {
     verified: VerifiedManifest,
-    broker: FsBroker,
     state: Mutex<FsDispatchState>,
     handler_transition: Mutex<()>,
     drained: Condvar,
@@ -285,12 +301,12 @@ struct FsDispatchSession {
 
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
 impl FsDispatchSession {
-    fn new(verified: VerifiedManifest, broker: FsBroker) -> Self {
+    fn new(verified: VerifiedManifest) -> Self {
         Self {
             verified,
-            broker,
             state: Mutex::new(FsDispatchState {
                 accepting: true,
+                prepared_attempt: Some(1),
                 in_flight: 0,
                 call_outstanding: false,
                 pending_call: None,
@@ -427,6 +443,21 @@ impl FsDispatchSession {
         Ok(())
     }
 
+    fn install_prepared_attempt(&self, attempt: u32) -> Result<(), HostAppError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| app_detail("filesystem generation", "in-flight lock poisoned"))?;
+        if state.prepared_attempt != Some(attempt) || state.in_flight != 0 {
+            return Err(app_detail(
+                "filesystem generation",
+                "generation broker is not prepared",
+            ));
+        }
+        state.accepting = true;
+        Ok(())
+    }
+
     fn wait_for_handler_transition(&self) -> Result<(), HostAppError> {
         let _transition = self.handler_transition.lock().map_err(|_| {
             app_detail(
@@ -518,7 +549,276 @@ struct FsWorkItem {
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
 enum FsWorkerCommand {
     Work(FsWorkItem),
+    #[cfg(target_os = "macos")]
+    Retire(u32, SyncSender<FsWorkerCompletion>),
+    #[cfg(target_os = "macos")]
+    Prepare {
+        retired: u32,
+        attempt: u32,
+        reply: SyncSender<FsWorkerCompletion>,
+    },
     Stop,
+}
+
+#[cfg(target_os = "macos")]
+enum FsWorkerCompletion {
+    Retired(u32),
+    Prepared {
+        retired: u32,
+        attempt: u32,
+        result: Result<(), HostAppError>,
+    },
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+impl FsWorkerNativeState {
+    fn take_work(
+        &mut self,
+        #[cfg(target_os = "macos")] session: &FsDispatchSession,
+        command: FsWorkerCommand,
+        #[cfg(target_os = "macos")] retiring: &mut Option<(u32, SyncSender<FsWorkerCompletion>)>,
+        stop_requested: &mut bool,
+    ) -> Result<Option<FsWorkItem>, HostAppError> {
+        match command {
+            FsWorkerCommand::Work(work) => Ok(Some(work)),
+            #[cfg(target_os = "macos")]
+            FsWorkerCommand::Retire(attempt, reply) => {
+                if self.attempt != attempt || retiring.is_some() {
+                    return Err(app_detail(
+                        "filesystem retirement",
+                        "unexpected retired broker attempt",
+                    ));
+                }
+                session.close_admission()?;
+                *retiring = Some((attempt, reply));
+                Ok(None)
+            }
+            #[cfg(target_os = "macos")]
+            FsWorkerCommand::Prepare {
+                retired,
+                attempt,
+                reply,
+            } => {
+                let result = if retiring.is_some() {
+                    Err(app_detail(
+                        "filesystem preparation",
+                        "old generation broker has not retired",
+                    ))
+                } else {
+                    self.prepare_generation(session, retired, attempt)
+                };
+                let _ = reply.send(FsWorkerCompletion::Prepared {
+                    retired,
+                    attempt,
+                    result,
+                });
+                Ok(None)
+            }
+            FsWorkerCommand::Stop => {
+                *stop_requested = true;
+                Ok(None)
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn prepare_generation(
+        &mut self,
+        session: &FsDispatchSession,
+        retired: u32,
+        attempt: u32,
+    ) -> Result<(), HostAppError> {
+        if self.attempt != retired || self.broker.is_some() {
+            return Err(app_detail(
+                "filesystem preparation",
+                "old generation broker has not retired",
+            ));
+        }
+        let fresh = FsBroker::prepare(&session.verified)
+            .map_err(|error| HostAppError::fs_prepare(&error))?;
+        let mut state = session
+            .state
+            .lock()
+            .map_err(|_| app_detail("filesystem preparation", "in-flight lock poisoned"))?;
+        self.broker = Some(fresh);
+        self.attempt = attempt;
+        state.prepared_attempt = Some(attempt);
+        state.accepting = false;
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "macos")]
+struct FsRecoveryAttempt {
+    retired: u32,
+    prepared: u32,
+    pending: Option<FsWorkerCommand>,
+    completion: Option<Receiver<FsWorkerCompletion>>,
+    ready: bool,
+    preparing: bool,
+    released: bool,
+}
+
+#[cfg(target_os = "macos")]
+impl FsRecoveryAttempt {
+    fn retire(router: &PrimaryRouterHandle, retired: u32) -> Result<Self, HostAppError> {
+        let prepared = retired
+            .checked_add(1)
+            .ok_or_else(|| app_detail("filesystem recovery", "generation counter overflow"))?;
+        let mut recovery = Self {
+            retired,
+            prepared,
+            pending: None,
+            completion: None,
+            ready: router.fs.is_none(),
+            preparing: false,
+            released: false,
+        };
+        if let Some(session) = router.fs.as_ref().and_then(Weak::upgrade) {
+            let _transition = router.shutdown.transition_guard();
+            session.close_admission()?;
+            let (reply, completion) = mpsc::sync_channel(1);
+            recovery.pending = Some(FsWorkerCommand::Retire(retired, reply));
+            recovery.completion = Some(completion);
+        } else if router.fs.is_some() {
+            return Err(app_detail(
+                "filesystem recovery",
+                "dispatch metadata disappeared",
+            ));
+        }
+        Ok(recovery)
+    }
+
+    fn poll(&mut self, router: &PrimaryRouterHandle) -> Result<(), HostAppError> {
+        if !router.shutdown.is_running() {
+            self.pending.take();
+            self.completion.take();
+            return Ok(());
+        }
+        if let Some(command) = self.pending.take() {
+            let sender = router
+                .fs_worker_commands
+                .as_ref()
+                .ok_or_else(|| app_detail("filesystem recovery", "native worker is unavailable"))?;
+            match sender.try_send(command) {
+                Ok(()) => {}
+                Err(TrySendError::Full(command)) => self.pending = Some(command),
+                Err(TrySendError::Disconnected(_)) => {
+                    return Err(app_detail("filesystem recovery", "native worker stopped"));
+                }
+            }
+        }
+        let Some(receiver) = self.completion.as_ref() else {
+            return Ok(());
+        };
+        let completion = match receiver.try_recv() {
+            Ok(completion) => completion,
+            Err(mpsc::TryRecvError::Empty) => return Ok(()),
+            Err(mpsc::TryRecvError::Disconnected) => {
+                return Err(app_detail(
+                    "filesystem recovery",
+                    "native completion owner stopped",
+                ));
+            }
+        };
+        match completion {
+            FsWorkerCompletion::Retired(attempt)
+                if attempt == self.retired && !self.ready && !self.preparing =>
+            {
+                self.preparing = true;
+                let (reply, completion) = mpsc::sync_channel(1);
+                self.pending = Some(FsWorkerCommand::Prepare {
+                    retired: self.retired,
+                    attempt: self.prepared,
+                    reply,
+                });
+                self.completion = Some(completion);
+            }
+            FsWorkerCompletion::Prepared {
+                retired,
+                attempt,
+                result,
+            } if retired == self.retired
+                && attempt == self.prepared
+                && !self.ready
+                && self.preparing =>
+            {
+                result?;
+                self.completion = None;
+                self.ready = true;
+            }
+            _ => {
+                return Err(app_detail(
+                    "filesystem recovery",
+                    "unexpected native completion attempt",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+#[derive(Clone, Copy)]
+enum RecoveryArm {
+    Initial(u32),
+    #[cfg(target_os = "macos")]
+    Retired {
+        retired: u32,
+        prepared: u32,
+    },
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+struct FsWorkerNativeState {
+    broker: Option<FsBroker>,
+    attempt: u32,
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+struct PendingFsWriteFailure {
+    attempt: u32,
+    session: Arc<FsDispatchSession>,
+    primary: HostAppError,
+    reply: Receiver<Result<Instant, String>>,
+    deadline: Instant,
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+impl PendingFsWriteFailure {
+    fn complete(
+        self,
+        observed: Result<Result<Instant, String>, RecvTimeoutError>,
+    ) -> Result<(), HostAppError> {
+        let acknowledged = match observed {
+            Ok(Ok(received)) if received <= self.deadline => {
+                self.session.clear_failed_write_attempt(self.attempt)
+            }
+            Ok(Ok(_)) | Err(RecvTimeoutError::Timeout) => Err(app_detail(
+                "filesystem reply recovery",
+                "guardian owner did not acknowledge retired generation",
+            )),
+            Ok(Err(detail)) => Err(app_detail("filesystem reply recovery", detail)),
+            Err(RecvTimeoutError::Disconnected) => Err(app_detail(
+                "filesystem reply recovery",
+                "guardian owner ended before acknowledging retired generation",
+            )),
+        };
+        acknowledged.map_err(|cleanup| append_app_cleanup(self.primary, [Err(cleanup)]))
+    }
+
+    fn poll(self) -> Result<Option<Self>, HostAppError> {
+        match self.reply.try_recv() {
+            Ok(reply) => self.complete(Ok(reply)).map(|()| None),
+            Err(mpsc::TryRecvError::Disconnected) => self
+                .complete(Err(RecvTimeoutError::Disconnected))
+                .map(|()| None),
+            Err(mpsc::TryRecvError::Empty) if Instant::now() >= self.deadline => {
+                self.complete(Err(RecvTimeoutError::Timeout)).map(|()| None)
+            }
+            Err(mpsc::TryRecvError::Empty) => Ok(Some(self)),
+        }
+    }
 }
 
 #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
@@ -1714,6 +2014,7 @@ impl SessionShutdownState {
     fn new() -> Self {
         Self {
             cause: Arc::new(AtomicU8::new(SESSION_RUNNING)),
+            reserved_cause: Arc::new(AtomicU8::new(SESSION_RUNNING)),
             transition: Arc::new(Mutex::new(())),
             reader_stop: Arc::new(AtomicBool::new(false)),
             generation_reader_stops: Arc::new(Mutex::new(Vec::new())),
@@ -1727,6 +2028,7 @@ impl SessionShutdownState {
 
     fn is_running(&self) -> bool {
         self.cause() == SESSION_RUNNING
+            && self.reserved_cause.load(Ordering::Acquire) == SESSION_RUNNING
     }
 
     #[cfg(all(test, target_os = "macos"))]
@@ -1734,26 +2036,45 @@ impl SessionShutdownState {
         self.claim(SESSION_LIFECYCLE_QUIT)
     }
 
-    #[cfg(any(unix, all(test, windows)))]
+    #[cfg(any(target_os = "linux", test))]
     fn claim_cli_lease_lost(&self) -> bool {
         self.claim(SESSION_CLI_LEASE_LOST)
     }
 
-    #[cfg(any(target_os = "macos", target_os = "linux", test))]
+    #[cfg(any(target_os = "linux", test))]
     fn claim(&self, cause: u8) -> bool {
         let _transition = self.transition_guard();
         self.claim_guarded(cause)
     }
 
+    #[cfg(any(target_os = "linux", windows, test))]
     fn claim_guarded(&self, cause: u8) -> bool {
+        self.reserve_guarded(cause) && self.accept_reserved_guarded(cause)
+    }
+
+    fn reserve_guarded(&self, cause: u8) -> bool {
         let claimed = self
-            .cause
+            .reserved_cause
             .compare_exchange(SESSION_RUNNING, cause, Ordering::AcqRel, Ordering::Acquire)
             .is_ok();
         if claimed {
             self.stop_reader();
         }
         claimed
+    }
+
+    fn accept_reserved_guarded(&self, cause: u8) -> bool {
+        self.reserved_cause.load(Ordering::Acquire) == cause
+            && self
+                .cause
+                .compare_exchange(SESSION_RUNNING, cause, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+    }
+
+    #[cfg(target_os = "macos")]
+    fn reserve_cli_lease_lost(&self) -> bool {
+        let _transition = self.transition_guard();
+        self.reserve_guarded(SESSION_CLI_LEASE_LOST)
     }
 
     fn transition_guard(&self) -> std::sync::MutexGuard<'_, ()> {
@@ -1861,7 +2182,7 @@ fn run_app(
         window_commands_tx.clone(),
         guardian_owner.handle(),
         shutdown,
-        guard_snapshot.map(GuardSnapshot::fs_weak),
+        guard_snapshot,
     )?;
     guardian_owner.attach_router(router.handle())?;
     let (window_events_tx, window_events_rx) = mpsc::channel();
@@ -2719,7 +3040,7 @@ fn run_app_direct(
         window_commands_tx.clone(),
         primary_owner.handle(),
         shutdown.clone(),
-        guard_snapshot.map(GuardSnapshot::fs_weak),
+        guard_snapshot,
     )?;
     primary_owner.attach_router(router.handle())?;
     let lease_errors = start_direct_dev_lease_tail(dev_lease, router.handle())?;
@@ -3588,10 +3909,10 @@ enum GuardianOwnerCommand {
         PrimaryRouterHandle,
         std::sync::mpsc::SyncSender<Result<(), String>>,
     ),
-    ArmRecovery(std::sync::mpsc::SyncSender<Result<(), String>>),
+    ArmRecovery(RecoveryArm, std::sync::mpsc::SyncSender<Result<(), String>>),
     DenyRecovery,
     FailGeneration(u32, std::sync::mpsc::SyncSender<Result<(), String>>),
-    FailRetiredGeneration(u32, std::sync::mpsc::SyncSender<Result<(), String>>),
+    FailRetiredGeneration(u32, std::sync::mpsc::SyncSender<Result<Instant, String>>),
     PrepareAcceptedShutdown(std::sync::mpsc::SyncSender<Result<(), String>>),
     Shutdown(std::sync::mpsc::SyncSender<Result<(), String>>),
 }
@@ -3628,6 +3949,8 @@ impl GuardianOwner {
             .name("keld-core-guardian-owner".to_owned())
             .spawn(move || {
                 let mut router = None;
+                let mut initial_arm = false;
+                let mut fs_recovery: Option<FsRecoveryAttempt> = None;
                 loop {
                     match command_rx.recv_timeout(Duration::from_millis(50)) {
                         Ok(GuardianOwnerCommand::AttachRouter(attached, reply)) => {
@@ -3640,6 +3963,7 @@ impl GuardianOwner {
                             let _ = reply.send(observed);
                         }
                         Ok(GuardianOwnerCommand::PrepareAcceptedShutdown(reply)) => {
+                            guardian.deny_recovery();
                             let result = match guardian.poll_fatal() {
                                 Err(source) => Err(app_guardian_fatal(
                                     "guardian unexpected primary exit before accepted shutdown",
@@ -3656,9 +3980,20 @@ impl GuardianOwner {
                             let _ = reply.send(observed);
                             result?;
                         }
-                        Ok(GuardianOwnerCommand::ArmRecovery(reply)) => {
-                            guardian.arm_recovery();
-                            let _ = reply.send(Ok(()));
+                        Ok(GuardianOwnerCommand::ArmRecovery(phase, reply)) => {
+                            let result = apply_guardian_recovery_arm(
+                                phase,
+                                &mut guardian,
+                                router.as_ref(),
+                                &mut initial_arm,
+                                fs_recovery.as_mut(),
+                            );
+                            let observed = result
+                                .as_ref()
+                                .copied()
+                                .map_err(std::string::ToString::to_string);
+                            let _ = reply.send(observed);
+                            result?;
                         }
                         Ok(GuardianOwnerCommand::DenyRecovery) => {
                             guardian.deny_recovery();
@@ -3684,7 +4019,7 @@ impl GuardianOwner {
                                 });
                             let observed = result
                                 .as_ref()
-                                .copied()
+                                .map(|()| Instant::now())
                                 .map_err(std::string::ToString::to_string);
                             let _ = reply.send(observed);
                             if let Err(error) = result {
@@ -3712,73 +4047,131 @@ impl GuardianOwner {
                             let _ = reply.send(observed);
                             return result;
                         }
-                        Err(RecvTimeoutError::Timeout) => {
-                            while let Some(update) = guardian.recv_update(Duration::ZERO) {
-                                let Some(router) = &router else {
-                                    if matches!(&update, GuardedPrimaryUpdate::Role(_))
-                                        && !matches!(
-                                            &update,
-                                            GuardedPrimaryUpdate::Role(
-                                                PrimaryRoleEvent::Revoked { .. }
-                                            )
-                                        )
-                                    {
-                                        continue;
-                                    }
-                                    let _ = window_commands.send(AppWindowCommand::Fatal);
-                                    return Err(app_detail(
-                                        "guardian generation update",
-                                        "generation changed before the primary router attached",
-                                    ));
-                                };
-                                if let Err(error) = router.apply_generation_update(update.into()) {
-                                    guardian.deny_recovery();
-                                    let _ = window_commands.send(AppWindowCommand::Fatal);
-                                    return Err(error.into());
-                                }
-                            }
-                            if let Some(lease) = dev_lease.as_mut() {
-                                match lease.poll_lost() {
-                                    Ok(true) => {
-                                        if shutdown.claim_cli_lease_lost() {
-                                            let Some(router) = &router else {
-                                                let _ =
-                                                    window_commands.send(AppWindowCommand::Fatal);
-                                                return Err(app_detail(
-                                                    "CLI lease loss",
-                                                    "primary router is not attached",
-                                                ));
-                                            };
-                                            lease_tx.send(router.clone()).map_err(|_| {
-                                                let _ =
-                                                    window_commands.send(AppWindowCommand::Fatal);
-                                                app_detail(
-                                                    "CLI lease-loss shutdown owner",
-                                                    "shutdown executor stopped",
-                                                )
-                                            })?;
-                                        }
-                                    }
-                                    Ok(false) => {}
-                                    Err(error) => {
-                                        let _ = window_commands.send(AppWindowCommand::Fatal);
-                                        return Err(error);
-                                    }
-                                }
-                            }
-                            if shutdown.cause() == SESSION_CLI_LEASE_LOST {
-                                continue;
-                            }
-                            if let Err(source) = guardian.poll_fatal() {
-                                let _ = window_commands.send(AppWindowCommand::Fatal);
-                                return Err(app_guardian_fatal("guardian watcher", &source));
-                            }
-                        }
+                        Err(RecvTimeoutError::Timeout) => {}
                         Err(RecvTimeoutError::Disconnected) => {
                             return guardian.shutdown().map_err(|source| {
                                 app_guardian_fatal("guardian owner disconnect", &source)
                             });
                         }
+                    }
+                    for _ in 0..64 {
+                        let Some(update) = guardian.recv_update(Duration::ZERO) else {
+                            break;
+                        };
+                        let Some(router) = &router else {
+                            if matches!(&update, GuardedPrimaryUpdate::Role(_))
+                                && !matches!(
+                                    &update,
+                                    GuardedPrimaryUpdate::Role(PrimaryRoleEvent::Revoked { .. })
+                                )
+                            {
+                                continue;
+                            }
+                            let _ = window_commands.send(AppWindowCommand::Fatal);
+                            return Err(app_detail(
+                                "guardian generation update",
+                                "generation changed before the primary router attached",
+                            ));
+                        };
+                        let retired = match &update {
+                            GuardedPrimaryUpdate::Role(PrimaryRoleEvent::Revoked {
+                                attempt,
+                                ..
+                            }) => Some(*attempt),
+                            _ => None,
+                        };
+                        let bound_attempt = match &update {
+                            GuardedPrimaryUpdate::Bound(bound) => Some(bound.attempt()),
+                            GuardedPrimaryUpdate::Role(_) => None,
+                        };
+                        let already_retired = router.last_revoked_attempt.load(Ordering::Acquire);
+                        if let Err(error) = router.apply_generation_update(update.into()) {
+                            guardian.deny_recovery();
+                            let _ = window_commands.send(AppWindowCommand::Fatal);
+                            return Err(error.into());
+                        }
+                        if let Some(attempt) = retired.filter(|attempt| *attempt > already_retired)
+                            && router.shutdown.is_running()
+                        {
+                            if fs_recovery
+                                .as_ref()
+                                .is_some_and(|recovery| !recovery.released)
+                            {
+                                return Err(app_detail(
+                                    "filesystem recovery",
+                                    "overlapping native retirement attempts",
+                                ));
+                            }
+                            fs_recovery = match FsRecoveryAttempt::retire(router, attempt) {
+                                Ok(recovery) => Some(recovery),
+                                Err(error) => {
+                                    guardian.deny_recovery();
+                                    let _ = window_commands.send(AppWindowCommand::Fatal);
+                                    return Err(error);
+                                }
+                            };
+                        }
+                        if bound_attempt.is_some_and(|attempt| {
+                            fs_recovery.as_ref().is_some_and(|recovery| {
+                                recovery.prepared == attempt && recovery.released
+                            })
+                        }) {
+                            fs_recovery = None;
+                        }
+                    }
+                    if let (Some(router), Some(recovery)) = (router.as_ref(), fs_recovery.as_mut())
+                    {
+                        if let Err(error) = recovery.poll(router) {
+                            guardian.deny_recovery();
+                            let _ = window_commands.send(AppWindowCommand::Fatal);
+                            return Err(error);
+                        }
+                        let phase = RecoveryArm::Retired {
+                            retired: recovery.retired,
+                            prepared: recovery.prepared,
+                        };
+                        if let Err(error) = apply_guardian_recovery_arm(
+                            phase,
+                            &mut guardian,
+                            Some(router),
+                            &mut initial_arm,
+                            Some(recovery),
+                        ) {
+                            guardian.deny_recovery();
+                            let _ = window_commands.send(AppWindowCommand::Fatal);
+                            return Err(error);
+                        }
+                    }
+                    if let Some(lease) = dev_lease.as_mut() {
+                        match lease.poll_lost() {
+                            Ok(true) => {
+                                if shutdown.reserve_cli_lease_lost() {
+                                    let Some(router) = &router else {
+                                        let _ = window_commands.send(AppWindowCommand::Fatal);
+                                        return Err(app_detail(
+                                            "CLI lease loss",
+                                            "primary router is not attached",
+                                        ));
+                                    };
+                                    lease_tx.send(router.clone()).map_err(|_| {
+                                        let _ = window_commands.send(AppWindowCommand::Fatal);
+                                        app_detail(
+                                            "CLI lease-loss shutdown owner",
+                                            "shutdown executor stopped",
+                                        )
+                                    })?;
+                                }
+                            }
+                            Ok(false) => {}
+                            Err(error) => {
+                                let _ = window_commands.send(AppWindowCommand::Fatal);
+                                return Err(error);
+                            }
+                        }
+                    }
+                    if let Err(source) = guardian.poll_fatal() {
+                        let _ = window_commands.send(AppWindowCommand::Fatal);
+                        return Err(app_guardian_fatal("guardian watcher", &source));
                     }
                 }
             })
@@ -3849,6 +4242,81 @@ impl Drop for GuardianOwner {
 }
 
 #[cfg(target_os = "macos")]
+fn apply_guardian_recovery_arm(
+    phase: RecoveryArm,
+    guardian: &mut GuardedPrimary,
+    router: Option<&PrimaryRouterHandle>,
+    initial_arm: &mut bool,
+    recovery: Option<&mut FsRecoveryAttempt>,
+) -> Result<(), HostAppError> {
+    let Some(router) = router else {
+        return Err(app_detail(
+            "primary recovery arm",
+            "primary router is not attached",
+        ));
+    };
+    let _transition = router.shutdown.transition_guard();
+    if !router.shutdown.is_running() {
+        guardian.deny_recovery();
+        return Ok(());
+    }
+    match phase {
+        RecoveryArm::Initial(attempt) => {
+            if attempt == 1 && !*initial_arm {
+                guardian.arm_recovery();
+                *initial_arm = true;
+            }
+        }
+        RecoveryArm::Retired { retired, prepared } => {
+            let Some(recovery) = recovery else {
+                return Ok(());
+            };
+            if recovery.retired != retired
+                || recovery.prepared != prepared
+                || !recovery.ready
+                || recovery.released
+                || !*initial_arm
+                || !router.recovery_armed.load(Ordering::Acquire)
+                || router.last_revoked_attempt.load(Ordering::Acquire) != retired
+                || guardian.group_pid().is_some()
+            {
+                return Ok(());
+            }
+            let current = router
+                .current
+                .lock()
+                .map_err(|_| app_detail("primary recovery arm", "generation lock poisoned"))?;
+            if current.is_some() {
+                return Ok(());
+            }
+            if let Some(session) = router.fs.as_ref().and_then(Weak::upgrade) {
+                let state = session.state.lock().map_err(|_| {
+                    app_detail("primary recovery arm", "native metadata lock poisoned")
+                })?;
+                if state.failed_write_attempt.is_some() {
+                    return Ok(());
+                }
+                if state.prepared_attempt != Some(prepared) || state.in_flight != 0 {
+                    return Err(app_detail(
+                        "primary recovery arm",
+                        "native completion did not prepare the expected attempt",
+                    ));
+                }
+            } else if router.fs.is_some() {
+                return Err(app_detail(
+                    "primary recovery arm",
+                    "native metadata disappeared",
+                ));
+            }
+            drop(current);
+            guardian.arm_recovery();
+            recovery.released = true;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
 impl GuardianOwnerHandle {
     fn deny_recovery(&self) {
         let _ = self.command_tx.send(GuardianOwnerCommand::DenyRecovery);
@@ -3857,7 +4325,10 @@ impl GuardianOwnerHandle {
     fn request_recovery_arm(&self) -> Result<Receiver<Result<(), String>>, HostAppError> {
         let (reply_tx, reply_rx) = mpsc::sync_channel(1);
         self.command_tx
-            .send(GuardianOwnerCommand::ArmRecovery(reply_tx))
+            .send(GuardianOwnerCommand::ArmRecovery(
+                RecoveryArm::Initial(1),
+                reply_tx,
+            ))
             .map_err(|_| app_detail("primary recovery arm", "guardian owner stopped"))?;
         Ok(reply_rx)
     }
@@ -3895,25 +4366,17 @@ impl GuardianOwnerHandle {
             )),
         }
     }
-    fn fail_retired_generation(&self, attempt: u32) -> Result<(), HostAppError> {
+    fn request_fail_retired_generation(
+        &self,
+        attempt: u32,
+    ) -> Result<Receiver<Result<Instant, String>>, HostAppError> {
         let (reply_tx, reply_rx) = mpsc::sync_channel(1);
         self.command_tx
             .send(GuardianOwnerCommand::FailRetiredGeneration(
                 attempt, reply_tx,
             ))
             .map_err(|_| app_detail("filesystem reply recovery", "guardian owner stopped"))?;
-        match reply_rx.recv_timeout(GUARDIAN_OWNER_REPLY_DEADLINE) {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(detail)) => Err(app_detail("filesystem reply recovery", detail)),
-            Err(RecvTimeoutError::Timeout) => Err(app_detail(
-                "filesystem reply recovery",
-                "guardian owner did not acknowledge retired generation",
-            )),
-            Err(RecvTimeoutError::Disconnected) => Err(app_detail(
-                "filesystem reply recovery",
-                "guardian owner ended before acknowledging retired generation",
-            )),
-        }
+        Ok(reply_rx)
     }
 
     fn prepare_accepted_shutdown(&self) -> Result<(), HostAppError> {
@@ -3982,7 +4445,7 @@ impl Clone for DirectPrimaryOwnerHandle {
 #[cfg(any(target_os = "linux", windows))]
 enum DirectPrimaryOwnerCommand {
     AttachRouter(PrimaryRouterHandle, mpsc::SyncSender<Result<(), String>>),
-    ArmRecovery(mpsc::SyncSender<Result<(), String>>),
+    ArmRecovery(RecoveryArm, mpsc::SyncSender<Result<(), String>>),
     DenyRecovery,
     FailGeneration(u32, mpsc::SyncSender<Result<(), String>>),
     FailRetiredGeneration(u32, mpsc::SyncSender<Result<(), String>>),
@@ -4102,7 +4565,7 @@ impl DirectPrimaryOwner {
                             };
                             let _ = reply.send(result);
                         }
-                        Ok(DirectPrimaryOwnerCommand::ArmRecovery(reply)) => {
+                        Ok(DirectPrimaryOwnerCommand::ArmRecovery(RecoveryArm::Initial(_attempt), reply)) => {
                             let result = recovery
                                 .arm()
                                 .then_some(())
@@ -4389,7 +4852,7 @@ impl DirectPrimaryOwnerHandle {
 
     fn request_recovery_arm(&self) -> Result<Receiver<Result<(), String>>, HostAppError> {
         self.enqueue_request(
-            DirectPrimaryOwnerCommand::ArmRecovery,
+            |reply| DirectPrimaryOwnerCommand::ArmRecovery(RecoveryArm::Initial(1), reply),
             "primary recovery arm",
         )
     }
@@ -5074,12 +5537,21 @@ impl PrimaryRouterHandle {
         fs.has_outstanding_call_for(attempt)
     }
 
+    #[cfg(test)]
     fn begin_fs_call(
         &self,
         attempt: u32,
         correlation: CorrelationId,
     ) -> Result<FsInFlight, HostAppError> {
         let _transition = self.shutdown.transition_guard();
+        self.begin_fs_call_guarded(attempt, correlation)
+    }
+
+    fn begin_fs_call_guarded(
+        &self,
+        attempt: u32,
+        correlation: CorrelationId,
+    ) -> Result<FsInFlight, HostAppError> {
         if !self.shutdown.is_running() {
             return Err(app_detail(
                 "filesystem admission",
@@ -5118,12 +5590,12 @@ impl PrimaryRouterHandle {
         })
     }
 
-    fn finish_fs_terminal_write(
+    fn submit_fs_terminal_write(
         &self,
         admitted: FsInFlight,
         attempt: u32,
         write: impl FnOnce(&mut BootstrapStream) -> Result<(), HostAppError>,
-    ) -> Result<(), HostAppError> {
+    ) -> Result<Option<PendingFsWriteFailure>, HostAppError> {
         let transition = self.shutdown.transition_guard();
         let mut current = self
             .current
@@ -5131,13 +5603,13 @@ impl PrimaryRouterHandle {
             .map_err(|_| app_detail("filesystem terminal reply", "generation lock poisoned"))?;
         admitted.retire_pending_call()?;
         if !self.shutdown.is_running() {
-            return Ok(());
+            return Ok(None);
         }
         let Some(active) = current.as_mut() else {
-            return Ok(());
+            return Ok(None);
         };
         if active.attempt != attempt {
-            return Ok(());
+            return Ok(None);
         }
         let Err(primary) = write(&mut active.writer) else {
             #[cfg(all(test, target_os = "macos"))]
@@ -5146,7 +5618,7 @@ impl PrimaryRouterHandle {
                 drop(transition);
                 admitted.session.hold_after_terminal_write();
             }
-            return Ok(());
+            return Ok(None);
         };
 
         let retirement = self.retire_current_generation_locked(
@@ -5183,13 +5655,31 @@ impl PrimaryRouterHandle {
         // may already be installing a successor which waits in fs.drain().
         drop(admitted);
 
-        if let Err(cleanup) = self.guardian.fail_retired_generation(attempt) {
-            return Err(append_app_cleanup(primary, [Err(cleanup)]));
+        #[cfg(target_os = "macos")]
+        {
+            let deadline = Instant::now() + GUARDIAN_OWNER_REPLY_DEADLINE;
+            let reply = match self.guardian.request_fail_retired_generation(attempt) {
+                Ok(reply) => reply,
+                Err(cleanup) => return Err(append_app_cleanup(primary, [Err(cleanup)])),
+            };
+            Ok(Some(PendingFsWriteFailure {
+                attempt,
+                session: fs,
+                primary,
+                reply,
+                deadline,
+            }))
         }
-        if let Err(cleanup) = fs.clear_failed_write_attempt(attempt) {
-            return Err(append_app_cleanup(primary, [Err(cleanup)]));
+        #[cfg(any(target_os = "linux", windows))]
+        {
+            if let Err(cleanup) = self.guardian.fail_retired_generation(attempt) {
+                return Err(append_app_cleanup(primary, [Err(cleanup)]));
+            }
+            if let Err(cleanup) = fs.clear_failed_write_attempt(attempt) {
+                return Err(append_app_cleanup(primary, [Err(cleanup)]));
+            }
+            Ok(None)
         }
-        Ok(())
     }
 
     fn quiesce_and_drain_fs(&self) -> Result<(), HostAppError> {
@@ -5292,7 +5782,7 @@ impl PrimaryRouterHandle {
         {
             return Ok(());
         }
-        if !self.shutdown.claim_guarded(SESSION_LIFECYCLE_QUIT) {
+        if !self.shutdown.reserve_guarded(SESSION_LIFECYCLE_QUIT) {
             drop(current_guard);
             drop(transition);
             return if self.shutdown.cause() == SESSION_CLI_LEASE_LOST {
@@ -5301,9 +5791,6 @@ impl PrimaryRouterHandle {
                 Ok(())
             };
         }
-        if !self.shutdown.begin_tail() {
-            return Ok(());
-        }
         drop(current_guard);
         drop(transition);
         self.fail_pending_echo_for_attempt(
@@ -5311,27 +5798,17 @@ impl PrimaryRouterHandle {
             "application call retired by accepted lifecycle Quit",
         )?;
         self.guardian.prepare_accepted_shutdown()?;
-        let mut current_guard = self
-            .current
-            .lock()
-            .map_err(|_| app_detail("primary session generation", "generation lock poisoned"))?;
-        let active = current_guard.as_mut().ok_or_else(|| {
-            app_detail(
-                "lifecycle Quit reply",
-                "current primary generation disappeared before the reply",
-            )
-        })?;
-        active.pending_quit = None;
-        write_frame(
-            &mut active.writer,
-            FrameKind::Reply,
-            0,
-            LIFECYCLE_CHANNEL,
-            correlation,
-            reply,
-        )
-        .map_err(|source| app_ipc("lifecycle Quit reply", &source))?;
-        drop(current_guard);
+        {
+            let _transition = self.shutdown.transition_guard();
+            if !self
+                .shutdown
+                .accept_reserved_guarded(SESSION_LIFECYCLE_QUIT)
+                || !self.shutdown.begin_tail()
+            {
+                return Ok(());
+            }
+        }
+        self.write_quit_reply(correlation, reply)?;
         self.quiesce_and_drain_fs()?;
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         self.answer_calls_after_quit(attempt, reader);
@@ -5358,11 +5835,52 @@ impl PrimaryRouterHandle {
         collapse_app_results([peer_close, link_close, self.finish_tail("lifecycle Quit")])
     }
 
+    fn write_quit_reply(
+        &self,
+        correlation: CorrelationId,
+        reply: &[u8],
+    ) -> Result<(), HostAppError> {
+        let mut current_guard = self
+            .current
+            .lock()
+            .map_err(|_| app_detail("primary session generation", "generation lock poisoned"))?;
+        let active = current_guard.as_mut().ok_or_else(|| {
+            app_detail(
+                "lifecycle Quit reply",
+                "current primary generation disappeared before the reply",
+            )
+        })?;
+        active.pending_quit = None;
+        write_frame(
+            &mut active.writer,
+            FrameKind::Reply,
+            0,
+            LIFECYCLE_CHANNEL,
+            correlation,
+            reply,
+        )
+        .map_err(|source| app_ipc("lifecycle Quit reply", &source))?;
+        drop(current_guard);
+        Ok(())
+    }
+
     fn cli_lease_lost(&self) -> Result<(), HostAppError> {
-        if self.shutdown.cause() != SESSION_CLI_LEASE_LOST || !self.shutdown.begin_tail() {
+        if self.shutdown.reserved_cause.load(Ordering::Acquire) != SESSION_CLI_LEASE_LOST
+            || self.shutdown.tail_started.load(Ordering::Acquire)
+        {
             return Ok(());
         }
         self.guardian.prepare_accepted_shutdown()?;
+        {
+            let _transition = self.shutdown.transition_guard();
+            if self.shutdown.cause() == SESSION_RUNNING {
+                self.shutdown
+                    .accept_reserved_guarded(SESSION_CLI_LEASE_LOST);
+            }
+            if !self.shutdown.begin_tail() {
+                return Ok(());
+            }
+        }
         self.quiesce_and_drain_fs()?;
         let mut current_guard = self
             .current
@@ -5405,12 +5923,121 @@ impl PrimaryRouterHandle {
                     let _ = stream.shutdown_app_link();
                     return Ok(());
                 }
-                self.install_generation(attempt, bound.into_stream())
+                #[cfg(target_os = "macos")]
+                {
+                    self.install_prepared_generation(attempt, bound.into_stream())
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    self.install_generation(attempt, bound.into_stream())
+                }
             }
         }
     }
 
+    // Paired-stream regressions and historical non-macOS composition wait on
+    // their calling thread. The macOS guardian actor never uses this adapter.
+    #[cfg(any(test, not(target_os = "macos")))]
     fn install_generation(
+        &self,
+        attempt: u32,
+        stream: BootstrapStream,
+    ) -> Result<(), PrimaryGenerationFailure> {
+        if let Some(session) = self.fs.as_ref().and_then(Weak::upgrade) {
+            {
+                let _transition = self.shutdown.transition_guard();
+                if !self.shutdown.is_running() || self.shutdown.reader_stop.load(Ordering::Acquire)
+                {
+                    let _ = stream.shutdown_app_link();
+                    return Ok(());
+                }
+                if self
+                    .current
+                    .lock()
+                    .map_err(|_| {
+                        app_detail("primary session generation", "generation lock poisoned")
+                    })?
+                    .is_some()
+                {
+                    return Err(app_detail(
+                        "primary session generation",
+                        "successor bound before the retired generation was revoked",
+                    )
+                    .into());
+                }
+            }
+            session.drain()?;
+            if !self.shutdown.is_running() {
+                let _ = stream.shutdown_app_link();
+                return Ok(());
+            }
+            #[cfg(target_os = "macos")]
+            if session
+                .state
+                .lock()
+                .map_err(|_| app_detail("filesystem recovery", "native metadata lock poisoned"))?
+                .prepared_attempt
+                != Some(attempt)
+            {
+                let retired = attempt.checked_sub(1).ok_or_else(|| {
+                    app_detail("filesystem recovery", "invalid successor attempt")
+                })?;
+                let commands = self.fs_worker_commands.as_ref().ok_or_else(|| {
+                    app_detail("filesystem recovery", "native worker is unavailable")
+                })?;
+                session.close_admission()?;
+                let (reply, completion) = mpsc::sync_channel(1);
+                commands
+                    .send(FsWorkerCommand::Retire(retired, reply))
+                    .map_err(|_| app_detail("filesystem recovery", "native worker stopped"))?;
+                if !matches!(completion.recv_timeout(GUARDIAN_OWNER_REPLY_DEADLINE), Ok(FsWorkerCompletion::Retired(observed)) if observed == retired)
+                {
+                    return Err(app_detail(
+                        "filesystem recovery",
+                        "native retirement was not acknowledged",
+                    )
+                    .into());
+                }
+                if !self.shutdown.is_running() {
+                    let _ = stream.shutdown_app_link();
+                    return Ok(());
+                }
+                let (reply, completion) = mpsc::sync_channel(1);
+                commands
+                    .send(FsWorkerCommand::Prepare {
+                        retired,
+                        attempt,
+                        reply,
+                    })
+                    .map_err(|_| app_detail("filesystem recovery", "native worker stopped"))?;
+                match completion.recv_timeout(GUARDIAN_OWNER_REPLY_DEADLINE) {
+                    Ok(FsWorkerCompletion::Prepared {
+                        retired: old,
+                        attempt: fresh,
+                        result,
+                    }) if old == retired && fresh == attempt => result?,
+                    _ => {
+                        return Err(app_detail(
+                            "filesystem recovery",
+                            "fresh native preparation was not acknowledged",
+                        )
+                        .into());
+                    }
+                }
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                session
+                    .state
+                    .lock()
+                    .map_err(|_| app_detail("filesystem generation", "in-flight lock poisoned"))?
+                    .prepared_attempt = Some(attempt);
+            }
+        }
+        self.install_prepared_generation(attempt, stream)
+    }
+
+    fn install_prepared_generation(
         &self,
         attempt: u32,
         mut stream: BootstrapStream,
@@ -5424,34 +6051,6 @@ impl PrimaryRouterHandle {
         writer_stream
             .set_app_link_write_deadline(Some(APP_LINK_IO_DEADLINE))
             .map_err(|source| app_io("primary session writer deadline", &source))?;
-
-        // Recovery must not publish a successor while filesystem authority from
-        // its retired predecessor is still alive. Check retirement under the
-        // shared transition, release every generation/shutdown lock, then wait
-        // for the old native call to reach its terminal outcome. A genuinely
-        // wedged synchronous syscall may therefore stall recovery, as KEL-130
-        // permits, without overlapping old/new privileged authority.
-        if let Some(fs) = self.fs.as_ref().and_then(Weak::upgrade) {
-            {
-                let _transition = self.shutdown.transition_guard();
-                if !self.shutdown.is_running() || self.shutdown.reader_stop.load(Ordering::Acquire)
-                {
-                    let _ = writer_stream.shutdown_app_link();
-                    return Ok(());
-                }
-                let current = self.current.lock().map_err(|_| {
-                    app_detail("primary session generation", "generation lock poisoned")
-                })?;
-                if current.is_some() {
-                    return Err(app_detail(
-                        "primary session generation",
-                        "successor bound before the retired generation was revoked",
-                    )
-                    .into());
-                }
-            }
-            fs.drain()?;
-        }
 
         let reader_stop;
         {
@@ -5467,6 +6066,15 @@ impl PrimaryRouterHandle {
                 return Err(app_detail(
                     "primary session generation",
                     "successor bound before the retired generation was revoked",
+                )
+                .into());
+            }
+            if let Some(session) = self.fs.as_ref().and_then(Weak::upgrade) {
+                session.install_prepared_attempt(attempt)?;
+            } else if self.fs.is_some() {
+                return Err(app_detail(
+                    "primary session generation",
+                    "native preparation metadata disappeared",
                 )
                 .into());
             }
@@ -5583,6 +6191,8 @@ struct FsWorker {
 impl FsWorker {
     fn start(
         handle: &mut PrimaryRouterHandle,
+        broker: FsBroker,
+        attempt: u32,
         #[cfg(all(test, any(target_os = "macos", target_os = "linux")))] test_gate: Option<
             Arc<FsWorkerTestGate>,
         >,
@@ -5596,6 +6206,8 @@ impl FsWorker {
                 let result = run_fs_worker(
                     &receiver,
                     &worker_handle,
+                    broker,
+                    attempt,
                     #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
                     test_gate.as_deref(),
                 );
@@ -5613,18 +6225,14 @@ impl FsWorker {
     }
 
     fn stop_and_join(&mut self) -> Result<(), HostAppError> {
-        let stop = match self.commands.try_send(FsWorkerCommand::Stop) {
-            Ok(()) | Err(TrySendError::Disconnected(_)) => Ok(()),
-            Err(TrySendError::Full(_)) => Err(app_detail(
-                "filesystem worker shutdown",
-                "worker queue remained full after filesystem drain",
-            )),
-        };
-        let join = self.join.take().map_or(Ok(()), |join| {
+        // This terminal owner has already drained native calls. A queued
+        // retirement/preflight must finish before Stop, not lose the stop and
+        // leave join waiting on a worker which can never receive it.
+        let _ = self.commands.send(FsWorkerCommand::Stop);
+        self.join.take().map_or(Ok(()), |join| {
             join.join()
                 .map_err(|_| app_detail("filesystem worker", "thread panicked"))?
-        });
-        collapse_app_results([stop, join])
+        })
     }
 }
 
@@ -5646,7 +6254,7 @@ impl PrimaryRouter {
         window_commands: Sender<AppWindowCommand>,
         guardian: PlatformPrimaryOwnerHandle,
         shutdown: SessionShutdownState,
-        fs: Option<Weak<FsDispatchSession>>,
+        fs: Option<&GuardSnapshot>,
     ) -> Result<Self, HostAppError> {
         Self::start_with_fs_test_gate(stream, window_commands, guardian, shutdown, fs, None)
     }
@@ -5657,7 +6265,7 @@ impl PrimaryRouter {
         window_commands: Sender<AppWindowCommand>,
         guardian: PlatformPrimaryOwnerHandle,
         shutdown: SessionShutdownState,
-        fs: Option<Weak<FsDispatchSession>>,
+        fs: Option<&GuardSnapshot>,
         fs_worker_test_gate: Option<Arc<FsWorkerTestGate>>,
     ) -> Result<Self, HostAppError> {
         let handle = PrimaryRouterHandle {
@@ -5676,7 +6284,7 @@ impl PrimaryRouter {
             recovery_armed: Arc::new(AtomicBool::new(true)),
             last_revoked_attempt: Arc::new(AtomicU32::new(0)),
             shutdown,
-            fs,
+            fs: fs.map(GuardSnapshot::fs_weak),
             fs_worker_commands: None,
             guardian,
             window_commands,
@@ -5685,10 +6293,12 @@ impl PrimaryRouter {
         };
         let router = Self::finish_start(
             handle,
+            fs.map(GuardSnapshot::take_initial_broker).transpose()?,
+            1,
             #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
             fs_worker_test_gate,
         )?;
-        router.handle.install_generation(1, stream)?;
+        router.handle.install_prepared_generation(1, stream)?;
         Ok(router)
     }
 
@@ -5697,7 +6307,7 @@ impl PrimaryRouter {
         window_commands: Sender<AppWindowCommand>,
         guardian: PlatformPrimaryOwnerHandle,
         shutdown: SessionShutdownState,
-        fs: Option<Weak<FsDispatchSession>>,
+        fs: Option<&GuardSnapshot>,
     ) -> Result<Self, HostAppError> {
         let attempt = bound.attempt();
         let stream = bound.into_stream();
@@ -5717,7 +6327,7 @@ impl PrimaryRouter {
             recovery_armed: Arc::new(AtomicBool::new(false)),
             last_revoked_attempt: Arc::new(AtomicU32::new(0)),
             shutdown,
-            fs,
+            fs: fs.map(GuardSnapshot::fs_weak),
             fs_worker_commands: None,
             guardian,
             window_commands,
@@ -5726,22 +6336,28 @@ impl PrimaryRouter {
         };
         let router = Self::finish_start(
             handle,
+            fs.map(GuardSnapshot::take_initial_broker).transpose()?,
+            attempt,
             #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
             None,
         )?;
-        router.handle.install_generation(attempt, stream)?;
+        router.handle.install_prepared_generation(attempt, stream)?;
         Ok(router)
     }
 
     fn finish_start(
         mut handle: PrimaryRouterHandle,
+        broker: Option<FsBroker>,
+        attempt: u32,
         #[cfg(all(test, any(target_os = "macos", target_os = "linux")))] test_gate: Option<
             Arc<FsWorkerTestGate>,
         >,
     ) -> Result<Self, HostAppError> {
-        let fs_worker = if handle.fs.is_some() {
+        let fs_worker = if let Some(broker) = broker {
             Some(FsWorker::start(
                 &mut handle,
+                broker,
+                attempt,
                 #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
                 test_gate,
             )?)
@@ -5810,7 +6426,7 @@ impl PrimaryRouter {
     }
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+#[cfg(all(test, any(target_os = "macos", target_os = "linux", windows)))]
 fn prepare_fs_work(
     handle: &PrimaryRouterHandle,
     attempt: u32,
@@ -5818,7 +6434,19 @@ fn prepare_fs_work(
     payload: &[u8],
     cancellation: &Arc<AtomicBool>,
 ) -> Result<FsWorkItem, HostAppError> {
-    let admitted = handle.begin_fs_call(attempt, correlation)?;
+    let _transition = handle.shutdown.transition_guard();
+    prepare_fs_work_guarded(handle, attempt, correlation, payload, cancellation)
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+fn prepare_fs_work_guarded(
+    handle: &PrimaryRouterHandle,
+    attempt: u32,
+    correlation: CorrelationId,
+    payload: &[u8],
+    cancellation: &Arc<AtomicBool>,
+) -> Result<FsWorkItem, HostAppError> {
+    let admitted = handle.begin_fs_call_guarded(attempt, correlation)?;
     let request = decode(payload).map_err(|source| app_ipc("filesystem request", &source))?;
     Ok(FsWorkItem {
         admitted,
@@ -5833,10 +6461,26 @@ fn prepare_fs_work(
 fn run_fs_worker(
     receiver: &Receiver<FsWorkerCommand>,
     handle: &PrimaryRouterHandle,
+    initial_broker: FsBroker,
+    initial_attempt: u32,
     #[cfg(all(test, any(target_os = "macos", target_os = "linux")))] test_gate: Option<
         &FsWorkerTestGate,
     >,
 ) -> Result<(), HostAppError> {
+    let session = handle.fs.as_ref().and_then(Weak::upgrade).ok_or_else(|| {
+        app_detail(
+            "filesystem worker startup",
+            "dispatch metadata is unavailable",
+        )
+    })?;
+    let mut native = FsWorkerNativeState {
+        broker: Some(initial_broker),
+        attempt: initial_attempt,
+    };
+    let mut pending_failure: Option<PendingFsWriteFailure> = None;
+    let mut stop_requested = false;
+    #[cfg(target_os = "macos")]
+    let mut retiring: Option<(u32, SyncSender<FsWorkerCompletion>)> = None;
     // Retain this exact worker's scope through its final call and loop exit.
     // A thread-affine erased value is never transferred back to the fixture.
     #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
@@ -5844,55 +6488,146 @@ fn run_fs_worker(
         .map(FsWorkerTestGate::initialize_worker)
         .transpose()?
         .flatten();
-    while let Ok(command) = receiver.recv() {
-        let FsWorkerCommand::Work(work) = command else {
-            return Ok(());
-        };
-        let FsWorkItem {
-            admitted,
-            request,
-            attempt,
-            correlation,
-            cancellation,
-        } = work;
-        #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
-        if let Some(fence) = test_gate.and_then(|gate| gate.before_entry.as_deref()) {
-            fence.wait_after_take()?;
+    loop {
+        if let Some(pending) = pending_failure.take() {
+            pending_failure = pending.poll()?;
         }
-        let outcome = admitted.handle_with(|| {
-            #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
-            if let Some(gate) = test_gate {
-                gate.wait_after_take()?;
+        if stop_requested && pending_failure.is_none() {
+            drop(native.broker.take());
+            return Ok(());
+        }
+        #[cfg(target_os = "macos")]
+        if retiring.is_some() {
+            let state = session
+                .state
+                .lock()
+                .map_err(|_| app_detail("filesystem retirement", "in-flight lock poisoned"))?;
+            if state.in_flight == 0 {
+                // The operation and its FsInFlight are gone. Destroy the actual
+                // sole broker before emitting the root-free retirement receipt.
+                drop(state);
+                drop(native.broker.take());
+                let mut state = session
+                    .state
+                    .lock()
+                    .map_err(|_| app_detail("filesystem retirement", "in-flight lock poisoned"))?;
+                state.prepared_attempt = None;
+                drop(state);
+                if let Some((attempt, reply)) = retiring.take() {
+                    let _ = reply.send(FsWorkerCompletion::Retired(attempt));
+                }
             }
-            Ok::<_, HostAppError>(admitted.session.broker.handle_request(
-                &admitted.session.verified,
-                Principal::AppProcess,
-                request,
-                &cancellation,
-            ))
-        })?;
-        let Some(outcome) = outcome else {
+        }
+        #[cfg(target_os = "macos")]
+        let native_pending = retiring.is_some();
+        #[cfg(not(target_os = "macos"))]
+        let native_pending = false;
+        let incoming_command = if native_pending || pending_failure.is_some() {
+            receiver.recv_timeout(Duration::from_millis(50))
+        } else {
+            receiver.recv().map_err(|_| RecvTimeoutError::Disconnected)
+        };
+        let command = match incoming_command {
+            Ok(command) => command,
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => return Ok(()),
+        };
+        let Some(work) = native.take_work(
+            #[cfg(target_os = "macos")]
+            &session,
+            command,
+            #[cfg(target_os = "macos")]
+            &mut retiring,
+            &mut stop_requested,
+        )?
+        else {
             continue;
         };
-        match outcome? {
-            Ok(response) => {
-                let reply =
-                    encode(&response).map_err(|source| app_ipc("filesystem response", &source))?;
-                handle.finish_fs_terminal_write(admitted, attempt, |writer| {
-                    write_frame(writer, FrameKind::Reply, 0, FS_CHANNEL, correlation, &reply)
-                        .map_err(|source| app_ipc("primary session reply", &source))
-                })?;
+        let next_failure = run_fs_work_item(
+            &native,
+            &session,
+            handle,
+            work,
+            #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+            test_gate,
+        )?;
+        if let Some(next) = next_failure {
+            if let Some(previous) = pending_failure.take() {
+                pending_failure = previous.poll()?;
             }
-            Err(error) => {
-                let call_error = CallError::from(&error);
-                handle.finish_fs_terminal_write(admitted, attempt, |writer| {
-                    keld_ipc::write_call_error(writer, FS_CHANNEL, correlation, &call_error)
-                        .map_err(|source| app_ipc("primary session call error", &source))
-                })?;
+            if pending_failure.is_some() {
+                return Err(app_detail(
+                    "filesystem reply recovery",
+                    "another owner receipt is still pending",
+                ));
             }
+            pending_failure = Some(next);
         }
     }
-    Ok(())
+}
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+fn run_fs_work_item(
+    native: &FsWorkerNativeState,
+    session: &FsDispatchSession,
+    handle: &PrimaryRouterHandle,
+    work: FsWorkItem,
+    #[cfg(all(test, any(target_os = "macos", target_os = "linux")))] test_gate: Option<
+        &FsWorkerTestGate,
+    >,
+) -> Result<Option<PendingFsWriteFailure>, HostAppError> {
+    let FsWorkItem {
+        admitted,
+        request,
+        attempt,
+        correlation,
+        cancellation,
+    } = work;
+    #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+    if let Some(fence) = test_gate.and_then(|gate| gate.before_entry.as_deref()) {
+        fence.wait_after_take()?;
+    }
+    let outcome = admitted.handle_with(|| {
+        #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+        if let Some(gate) = test_gate {
+            gate.wait_after_take()?;
+        }
+        let broker = native
+            .broker
+            .as_ref()
+            .filter(|_| cfg!(not(target_os = "macos")) || native.attempt == attempt)
+            .ok_or_else(|| {
+                app_detail(
+                    "filesystem worker",
+                    "request belongs to an unprepared generation",
+                )
+            })?;
+        Ok::<_, HostAppError>(broker.handle_request(
+            &session.verified,
+            Principal::AppProcess,
+            request,
+            &cancellation,
+        ))
+    })?;
+    let Some(outcome) = outcome else {
+        return Ok(None);
+    };
+    match outcome? {
+        Ok(response) => {
+            let reply =
+                encode(&response).map_err(|source| app_ipc("filesystem response", &source))?;
+            handle.submit_fs_terminal_write(admitted, attempt, |writer| {
+                write_frame(writer, FrameKind::Reply, 0, FS_CHANNEL, correlation, &reply)
+                    .map_err(|source| app_ipc("primary session reply", &source))
+            })
+        }
+        Err(error) => {
+            let call_error = CallError::from(&error);
+            handle.submit_fs_terminal_write(admitted, attempt, |writer| {
+                keld_ipc::write_call_error(writer, FS_CHANNEL, correlation, &call_error)
+                    .map_err(|source| app_ipc("primary session call error", &source))
+            })
+        }
+    }
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
@@ -6002,7 +6737,11 @@ fn read_primary_frames(
                 )?;
             }
             (FrameKind::Call, FS_CHANNEL) if handle.shutdown.is_running() => {
-                let work = prepare_fs_work(handle, attempt, header.corr(), &payload, reader_stop)?;
+                // Admission and enqueue share retirement's transition: an admitted
+                // work item cannot be overtaken by its native retirement command.
+                let _transition = handle.shutdown.transition_guard();
+                let work =
+                    prepare_fs_work_guarded(handle, attempt, header.corr(), &payload, reader_stop)?;
                 let commands = handle.fs_worker_commands.as_ref().ok_or_else(|| {
                     app_detail(
                         "filesystem worker submission",
@@ -7301,7 +8040,7 @@ mod tests {
                 command_tx: guardian_tx,
             },
             SessionShutdownState::new(),
-            Some(snapshot.fs_weak()),
+            Some(&snapshot),
         )
         .expect("guarded primary router");
 
@@ -7473,12 +8212,20 @@ mod tests {
             };
             assert_eq!(attempt, 1);
             reply
-                .send(Ok(()))
+                .send(Ok(Instant::now()))
                 .expect("acknowledge retired FS generation recovery");
         });
 
-        run_fs_worker(&receiver, &handle, None)
-            .expect("reply write failure must retire the generation without killing the worker");
+        run_fs_worker(
+            &receiver,
+            &handle,
+            snapshot
+                .take_initial_broker()
+                .expect("transfer worker broker"),
+            1,
+            None,
+        )
+        .expect("reply write failure must retire the generation without killing the worker");
         owner.join().expect("retired-generation owner joins");
 
         assert!(
@@ -7540,6 +8287,7 @@ mod tests {
         })));
         let (guardian_tx, guardian_rx) = mpsc::channel();
         let (window_tx, window_rx) = mpsc::channel();
+        let (commands, receiver) = mpsc::sync_channel(1);
         let handle = PrimaryRouterHandle {
             current: Arc::clone(&current),
             readers: Arc::new(Mutex::new(HashMap::new())),
@@ -7553,7 +8301,7 @@ mod tests {
             last_revoked_attempt: Arc::new(AtomicU32::new(0)),
             shutdown: SessionShutdownState::new(),
             fs: Some(snapshot.fs_weak()),
-            fs_worker_commands: None,
+            fs_worker_commands: Some(commands.clone()),
             guardian: GuardianOwnerHandle {
                 command_tx: guardian_tx,
             },
@@ -7583,16 +8331,16 @@ mod tests {
             correlation: CorrelationId(120),
             cancellation: Arc::new(AtomicBool::new(false)),
         };
-        let (commands, receiver) = mpsc::channel();
         commands
             .send(FsWorkerCommand::Work(work))
             .expect("queue recovery-ordering FS work");
-        commands
-            .send(FsWorkerCommand::Stop)
-            .expect("queue recovery-ordering worker stop");
 
         let worker_handle = handle.clone();
-        let worker = thread::spawn(move || run_fs_worker(&receiver, &worker_handle, None));
+        let worker_broker = snapshot
+            .take_initial_broker()
+            .expect("transfer worker broker");
+        let worker =
+            thread::spawn(move || run_fs_worker(&receiver, &worker_handle, worker_broker, 1, None));
         let command = guardian_rx
             .recv_timeout(Duration::from_secs(5))
             .expect("failed terminal write must request retired-generation recovery");
@@ -7628,7 +8376,8 @@ mod tests {
 
         let install_report = installed_rx.recv_timeout(Duration::from_secs(2));
         if install_report.is_err() {
-            let _ = recovery_reply.send(Ok(()));
+            let _ = commands.send(FsWorkerCommand::Stop);
+            let _ = recovery_reply.send(Ok(Instant::now()));
             let _ = worker.join();
             let _ = install.join();
             panic!("G2 installation waited for the retired-generation recovery acknowledgment");
@@ -7641,8 +8390,11 @@ mod tests {
             "recovery ordering sent an unexpected fatal window command"
         );
 
+        commands
+            .send(FsWorkerCommand::Stop)
+            .expect("queue recovery-ordering worker stop");
         recovery_reply
-            .send(Ok(()))
+            .send(Ok(Instant::now()))
             .expect("acknowledge retired-generation recovery after G2 installation");
         worker
             .join()
@@ -7652,6 +8404,72 @@ mod tests {
         router
             .shutdown()
             .expect("recovery-ordering router shutdown");
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn fs_owner_receipt_poll_keeps_submission_deadline_and_original_error() {
+        let (fixture, client) = guarded_test_router();
+        let deadline = Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .expect("past real monotonic deadline");
+        let (reply, received) = mpsc::sync_channel(1);
+        reply
+            .send(Ok(Instant::now()))
+            .expect("late actual owner receipt");
+        let pending = PendingFsWriteFailure {
+            attempt: 1,
+            session: Arc::clone(&fixture.snapshot.fs),
+            primary: app_detail(
+                "filesystem terminal reply",
+                "original terminal write failure",
+            ),
+            reply: received,
+            deadline,
+        };
+        let Err(error) = pending.poll() else {
+            panic!("a late owner receipt renewed the submission deadline");
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("original terminal write failure"),
+            "{error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("did not acknowledge retired generation"),
+            "{error}"
+        );
+
+        // A receipt observed by the owner within the same absolute budget stays
+        // valid if native destruction delays the worker's next poll.
+        let (reply, received) = mpsc::sync_channel(1);
+        let completed = Instant::now();
+        let deadline = completed;
+        reply
+            .send(Ok(completed))
+            .expect("already completed owner receipt");
+        let pending = PendingFsWriteFailure {
+            attempt: 1,
+            session: Arc::clone(&fixture.snapshot.fs),
+            primary: app_detail(
+                "filesystem terminal reply",
+                "original terminal write failure",
+            ),
+            reply: received,
+            deadline,
+        };
+        assert!(
+            matches!(pending.poll(), Ok(None)),
+            "on-time owner receipt became a false timeout"
+        );
+        drop(client);
+        fixture
+            .router
+            .shutdown()
+            .expect("receipt deadline fixture cleanup");
     }
 
     /// One guarded primary router over a socket pair, with the FS worker held
@@ -7734,7 +8552,7 @@ mod tests {
                 command_tx: guardian_tx,
             },
             SessionShutdownState::new(),
-            Some(snapshot.fs_weak()),
+            Some(&snapshot),
             Some(gate),
         )
         .expect("guarded test router");
@@ -8372,7 +9190,7 @@ mod tests {
                     command_tx: guardian_tx,
                 },
                 SessionShutdownState::new(),
-                Some(snapshot.fs_weak()),
+                Some(&snapshot),
                 Some(gate),
             )
             .expect("gated FS worker router");
@@ -8673,8 +9491,17 @@ mod tests {
             #[cfg(target_os = "macos")]
             quit_drain_hooks: Arc::default(),
         };
-        let router =
-            PrimaryRouter::finish_start(handle, None).expect("successor drain router worker");
+        let router = PrimaryRouter::finish_start(
+            handle,
+            Some(
+                snapshot
+                    .take_initial_broker()
+                    .expect("transfer successor drain broker"),
+            ),
+            1,
+            None,
+        )
+        .expect("successor drain router worker");
         (router, window_rx)
     }
 
@@ -9042,7 +9869,7 @@ mod tests {
                 command_tx: guardian_tx,
             },
             SessionShutdownState::new(),
-            Some(snapshot.fs_weak()),
+            Some(&snapshot),
             Some(gate),
         )
         .expect("second FS Call router");
@@ -9145,7 +9972,7 @@ mod tests {
                 command_tx: guardian_tx,
             },
             SessionShutdownState::new(),
-            Some(snapshot.fs_weak()),
+            Some(&snapshot),
         )
         .expect("stale FS router");
 
@@ -9272,7 +10099,7 @@ mod tests {
                 command_tx: guardian_tx,
             },
             SessionShutdownState::new(),
-            Some(snapshot.fs_weak()),
+            Some(&snapshot),
         )
         .expect("authenticated primary router");
 
@@ -9597,7 +10424,7 @@ mod tests {
                 | TestPrimaryOwnerCommand::FailRetiredGeneration(_, _) => {
                     panic!("unexpected link failure")
                 }
-                TestPrimaryOwnerCommand::ArmRecovery(_) => panic!("unexpected recovery arm"),
+                TestPrimaryOwnerCommand::ArmRecovery(_, _) => panic!("unexpected recovery arm"),
                 TestPrimaryOwnerCommand::DenyRecovery => panic!("unexpected recovery denial"),
             };
             guardian_prepared_in_thread.store(true, Ordering::Release);
@@ -9617,7 +10444,7 @@ mod tests {
                 | TestPrimaryOwnerCommand::FailRetiredGeneration(_, _) => {
                     panic!("unexpected link failure")
                 }
-                TestPrimaryOwnerCommand::ArmRecovery(_) => panic!("unexpected recovery arm"),
+                TestPrimaryOwnerCommand::ArmRecovery(_, _) => panic!("unexpected recovery arm"),
                 TestPrimaryOwnerCommand::DenyRecovery => panic!("unexpected recovery denial"),
             };
             eof_rx
@@ -10683,7 +11510,7 @@ mod tests {
         let shutdown = handle.shutdown.clone();
         let ready = Arc::clone(&handle.window_ready);
         let owner = thread::spawn(move || {
-            let TestPrimaryOwnerCommand::ArmRecovery(reply) =
+            let TestPrimaryOwnerCommand::ArmRecovery(_, reply) =
                 command_rx.recv().expect("arm request")
             else {
                 panic!("first owner command must arm recovery");
@@ -10723,7 +11550,7 @@ mod tests {
         for reject in [true, false] {
             let (handle, _client, command_rx) = initial_ready_router();
             let owner = thread::spawn(move || {
-                let TestPrimaryOwnerCommand::ArmRecovery(reply) =
+                let TestPrimaryOwnerCommand::ArmRecovery(_, reply) =
                     command_rx.recv().expect("arm request")
                 else {
                     panic!("first owner command must arm recovery");
@@ -11096,7 +11923,7 @@ mod tests {
                 | GuardianOwnerCommand::FailRetiredGeneration(_, _) => {
                     panic!("unexpected link failure")
                 }
-                GuardianOwnerCommand::ArmRecovery(_) => panic!("unexpected recovery arm"),
+                GuardianOwnerCommand::ArmRecovery(_, _) => panic!("unexpected recovery arm"),
                 GuardianOwnerCommand::DenyRecovery => panic!("unexpected recovery denial"),
             };
             prepare_reply

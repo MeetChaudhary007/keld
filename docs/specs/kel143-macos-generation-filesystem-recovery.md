@@ -8,7 +8,7 @@ Approval: active human continuation on 2026-10-11, exact original SHA-256 `b1c14
 
 {"schema":"keld.kel143-approval/v1","decision":"approved","approved_original_sha256":"b1c1411a26f9435c47e0976ca8744b795cb839b2c8332100f22fe47fc3ee7122","source":"active-user-text-continuation","user_text":"proceed","thread_id":"01a1258d-1e82-7841-8b47-e7d61b69e1b6","turn_id":"01a12865-cb06-7fb0-bad4-2ee7074cb54b","message_id":"01a12865-cd66-7f03-87b3-b27d08b39ae7","linear_comment_id":"3961f183-3e14-412f-a849-0525b6762727"}
 
-Implementation status: target design only. Exact predecessor/ownership admission remains open; current production lifecycle bytes are unchanged. The scoped preparation branch records failure-first regressions, not completed recovery acceptance.
+Implementation status: in progress. Exact predecessor and exclusive source-owner admission are verified in KEL-143 comment `0a9ecffb-45ec-43f1-ba24-b03f81a3fd66`; KEL-140's passed/landed artifact is comment `abe23278-4c8e-4460-8433-60c5e7d6ab56`, landed main `d214c7fa7adfcb8f16de32f17c7d0caee51faa78`. Core and runtime implementation has begun after observed failure-first regressions. Final recovery acceptance remains unproved.
 
 ## 1. Goal and non goals
 

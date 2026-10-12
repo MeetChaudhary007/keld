@@ -11,7 +11,7 @@ use std::io::{self, Read, Write};
 use std::os::fd::AsFd;
 use std::os::unix::process::CommandExt;
 use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -60,9 +60,85 @@ const CONTROL_REVOKE: u8 = 5;
 const CONTROL_REVOKED: u8 = 6;
 const CONTROL_CLEAR: u8 = 7;
 const CONTROL_CLEARED: u8 = 8;
-const RECOVERY_PENDING: u8 = 0;
-const RECOVERY_ARMED: u8 = 1;
-const RECOVERY_DENIED: u8 = 2;
+
+#[derive(Debug)]
+struct RecoveryState {
+    initial_ready: bool,
+    denied: bool,
+    retired_attempt: Option<u32>,
+    cleared_attempt: Option<u32>,
+    release_attempt: Option<u32>,
+    expected_attempt: u32,
+    shutdown_acknowledged: bool,
+}
+
+impl RecoveryState {
+    const fn new() -> Self {
+        Self {
+            initial_ready: false,
+            denied: false,
+            retired_attempt: None,
+            cleared_attempt: None,
+            release_attempt: None,
+            expected_attempt: 1,
+            shutdown_acknowledged: false,
+        }
+    }
+
+    fn arm(&mut self) {
+        if self.denied {
+            return;
+        }
+        if !self.initial_ready {
+            self.initial_ready = true;
+            return;
+        }
+        self.release_attempt = self
+            .retired_attempt
+            .and_then(|attempt| attempt.checked_add(1));
+    }
+
+    fn deny(&mut self) {
+        self.denied = true;
+        self.release_attempt = None;
+    }
+
+    fn retire(&mut self, attempt: u32) {
+        self.retired_attempt = Some(attempt);
+        self.cleared_attempt = None;
+        self.release_attempt = None;
+    }
+
+    fn cleared(&mut self, attempt: u32) -> Result<(), RuntimeError> {
+        self.expected_attempt = attempt.checked_add(1).ok_or_else(|| {
+            lifecycle_error(
+                "macOS guardian generation host transition",
+                io::Error::other("supervisor attempt counter exhausted"),
+            )
+        })?;
+        self.cleared_attempt = Some(attempt);
+        Ok(())
+    }
+
+    fn permits(&self, attempt: u32) -> bool {
+        !self.denied
+            && self.expected_attempt == attempt
+            && (attempt == 1
+                || (self.initial_ready
+                    && self.release_attempt == Some(attempt)
+                    && self.cleared_attempt == self.retired_attempt
+                    && self
+                        .retired_attempt
+                        .and_then(|retired| retired.checked_add(1))
+                        == Some(attempt)))
+    }
+}
+
+fn lock_recovery(state: &Mutex<RecoveryState>) -> std::sync::MutexGuard<'_, RecoveryState> {
+    state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 #[derive(Debug)]
 struct GenerationControlRecord {
@@ -540,7 +616,7 @@ pub struct GuardedPrimary {
     liveness_writer: Option<ChildStdin>,
     quit_ack_reader: ChildStdout,
     current_generation: Arc<Mutex<Option<RegisteredPrimaryGeneration>>>,
-    recovery_decision: Arc<AtomicU8>,
+    recovery_decision: Arc<Mutex<RecoveryState>>,
     updates_rx: Receiver<GuardedPrimaryUpdate>,
     worker: Option<JoinHandle<Result<(), RuntimeError>>>,
     shutdown_attributed: bool,
@@ -578,7 +654,7 @@ impl GuardedPrimary {
             }
         }
         let current_generation = Arc::new(Mutex::new(None));
-        let recovery_decision = Arc::new(AtomicU8::new(RECOVERY_PENDING));
+        let recovery_decision = Arc::new(Mutex::new(RecoveryState::new()));
         let (updates_tx, updates_rx) = mpsc::channel();
         let generation_for_worker = Arc::clone(&current_generation);
         let recovery_for_worker = Arc::clone(&recovery_decision);
@@ -626,16 +702,14 @@ impl GuardedPrimary {
         lock_generation(&self.current_generation).map(|generation| generation.group_pid)
     }
 
-    /// Arms restart only after the initial generation has reached host Ready.
+    /// Arms initial Ready, then releases the current retired successor.
     pub fn arm_recovery(&self) {
-        self.recovery_decision
-            .store(RECOVERY_ARMED, Ordering::Release);
+        lock_recovery(&self.recovery_decision).arm();
     }
 
     /// Permanently rejects successor preparation for a failed startup.
     pub fn deny_recovery(&self) {
-        self.recovery_decision
-            .store(RECOVERY_DENIED, Ordering::Release);
+        lock_recovery(&self.recovery_decision).deny();
     }
 
     /// Reports app-link failure for the named current generation.
@@ -672,6 +746,9 @@ impl GuardedPrimary {
     /// Returns a typed lifecycle error when the guardian cannot acknowledge
     /// attribution while the host still owns the session.
     pub fn accept_shutdown(&mut self) -> Result<(), RuntimeError> {
+        // The same guard covers the actual locator/token mint. Release it
+        // before Q I/O so the generation owner can finish cleanup concurrently.
+        self.deny_recovery();
         let ack_reader = &mut self.quit_ack_reader;
         let writer = self.liveness_writer.as_mut().ok_or_else(|| {
             lifecycle_error(
@@ -686,6 +763,7 @@ impl GuardedPrimary {
             .map_err(|source| lifecycle_error("macOS guardian supervised-Quit control", source))?;
         read_supervised_quit_ack(ack_reader)?;
         self.shutdown_attributed = true;
+        lock_recovery(&self.recovery_decision).shutdown_acknowledged = true;
         Ok(())
     }
 
@@ -825,6 +903,7 @@ impl GuardedPrimary {
     }
 
     fn prepare_orderly_shutdown(&mut self) -> Result<(), RuntimeError> {
+        self.deny_recovery();
         if self.shutdown_attributed {
             return Ok(());
         }
@@ -842,6 +921,7 @@ impl GuardedPrimary {
             .map_err(|source| lifecycle_error("macOS guardian orderly-shutdown control", source))?;
         read_supervised_orderly_ack(ack_reader)?;
         self.shutdown_attributed = true;
+        lock_recovery(&self.recovery_decision).shutdown_acknowledged = true;
         Ok(())
     }
 
@@ -1296,6 +1376,7 @@ struct GuardedPrimaryPreparer<C> {
     command_factory: C,
     control: Arc<Mutex<GenerationControlPeer>>,
     host_unavailable: Arc<AtomicBool>,
+    preparation_cancelled: Arc<AtomicBool>,
 }
 
 impl<C> ChildPreparer for GuardedPrimaryPreparer<C>
@@ -1305,11 +1386,12 @@ where
     type Lease = GuardedPrimaryLease;
 
     fn prepare(&mut self, attempt: u32) -> Result<PreparedChild<Self::Lease>, RuntimeError> {
-        let response = control_exchange(
+        let response = control_exchange_with_cancellation(
             &self.control,
             &GenerationControlRecord::new(CONTROL_PREPARE, attempt),
             CONTROL_PREPARED,
             attempt,
+            Some((&self.preparation_cancelled, &self.host_unavailable)),
         )?;
         let app_link = match String::from_utf8(response.payload) {
             Ok(app_link) if !app_link.is_empty() => app_link,
@@ -1488,6 +1570,7 @@ where
         .map_err(|source| lifecycle_error("macOS guardian generation control deadline", source))?;
     validate_liveness_bootstrap(&mut liveness)?;
     let host_unavailable = Arc::new(AtomicBool::new(false));
+    let preparation_cancelled = Arc::new(AtomicBool::new(false));
     let supervisor = Supervisor::start_prepared(
         RestartPolicy::default(),
         GuardedPrimaryPreparer {
@@ -1497,47 +1580,18 @@ where
                 reader: GenerationControlReader::new(),
             })),
             host_unavailable: Arc::clone(&host_unavailable),
+            preparation_cancelled: Arc::clone(&preparation_cancelled),
         },
     )?;
 
     set_liveness_nonblocking(&liveness)?;
-    let mut liveness_result = Ok(());
-    let mut quit_accepted = false;
-    let mut orderly_requested = false;
-    loop {
-        match observe_guarded_liveness(
-            &mut liveness,
-            &supervisor,
-            &mut quit_accepted,
-            &mut orderly_requested,
-            &mut quit_ack,
-        ) {
-            Ok(true) => {
-                if !quit_accepted && !orderly_requested {
-                    host_unavailable.store(true, Ordering::Release);
-                }
-                supervisor.shutdown();
-                break;
-            }
-            Ok(false) => {}
-            Err(error) => {
-                liveness_result = Err(error);
-                supervisor.shutdown();
-                break;
-            }
-        }
-        if let Some(event) = supervisor.recv_event(GENERATION_CONTROL_POLL)
-            && matches!(
-                event,
-                crate::SupervisorEvent::RespawnFailed
-                    | crate::SupervisorEvent::Failed { .. }
-                    | crate::SupervisorEvent::CrashLoopTripped
-                    | crate::SupervisorEvent::Stopped
-            )
-        {
-            break;
-        }
-    }
+    let (liveness_result, quit_accepted, host_dead) = await_guarded_primary_liveness(
+        &mut liveness,
+        &supervisor,
+        &mut quit_ack,
+        &host_unavailable,
+        &preparation_cancelled,
+    );
 
     let outcome = supervisor.wait_for_outcome();
     let crash_ledger = supervisor.crash_ledger();
@@ -1550,13 +1604,18 @@ where
         SupervisorOutcome::CrashLoop(error) | SupervisorOutcome::Failed(error) => {
             failures.push(error);
         }
-        SupervisorOutcome::Stopped if !quit_accepted => {
+        SupervisorOutcome::Stopped if !quit_accepted && !host_dead => {
             if let Some(termination) = crash_ledger.last_self_termination {
                 failures.push(RuntimeError::ChildCrashed {
                     pid: termination.pid,
                     exit_code: termination.exit_code,
                     stderr_tail: output.stderr_tail(2_000),
                 });
+            } else {
+                failures.push(lifecycle_error(
+                    "macOS guardian generation supervisor stop",
+                    io::Error::other("supervisor stopped without owned shutdown attribution"),
+                ));
             }
         }
         SupervisorOutcome::Stopped => {}
@@ -1566,6 +1625,63 @@ where
     } else {
         Err(collapse_failures(failures))
     }
+}
+
+fn await_guarded_primary_liveness(
+    liveness: &mut impl Read,
+    supervisor: &Supervisor,
+    quit_ack: &mut impl Write,
+    host_unavailable: &AtomicBool,
+    preparation_cancelled: &AtomicBool,
+) -> (Result<(), RuntimeError>, bool, bool) {
+    let mut liveness_result = Ok(());
+    let mut quit_accepted = false;
+    let mut orderly_requested = false;
+    let mut host_dead = false;
+    loop {
+        match observe_guarded_liveness(
+            liveness,
+            supervisor,
+            &mut quit_accepted,
+            &mut orderly_requested,
+            quit_ack,
+            preparation_cancelled,
+        ) {
+            Ok(true) => {
+                host_dead = true;
+                if !quit_accepted && !orderly_requested {
+                    host_unavailable.store(true, Ordering::Release);
+                }
+                supervisor.shutdown();
+                break;
+            }
+            Ok(false) => {}
+            Err(error) => {
+                liveness_result = Err(error);
+                // A liveness fault interrupts a pending read as a fatal error,
+                // never as the privately attributed stop marker.
+                host_unavailable.store(true, Ordering::Release);
+                supervisor.shutdown();
+                break;
+            }
+        }
+        match supervisor.recv_event(GENERATION_CONTROL_POLL) {
+            Some(crate::SupervisorEvent::Stopped) if quit_accepted => {
+                // Supervisor stop does not terminate this persistent guardian.
+                // Core may still own real native retirement before host EOF.
+            }
+            Some(
+                crate::SupervisorEvent::RespawnFailed
+                | crate::SupervisorEvent::Failed { .. }
+                | crate::SupervisorEvent::CrashLoopTripped
+                | crate::SupervisorEvent::Stopped,
+            ) => break,
+            None => thread::yield_now(),
+            Some(_) => {}
+        }
+    }
+
+    (liveness_result, quit_accepted, host_dead)
 }
 
 fn run_supervised_with_registration<R, W, C, A, S, F>(
@@ -1831,12 +1947,21 @@ fn write_group_registration(writer: &mut impl Write, group_pid: u32) -> Result<(
     })
 }
 
+#[derive(Default)]
+struct HostGenerationState {
+    lease: Option<RoleGenerationLease>,
+    current_attempt: Option<u32>,
+    revoked_attempt: Option<u32>,
+    pending_prepare: Option<GenerationControlRecord>,
+    initial_decision_deadline: Option<Instant>,
+}
+
 #[allow(clippy::too_many_lines)] // one owner keeps every private protocol transition contiguous
 fn run_generation_host(
     mut control: std::os::unix::net::UnixStream,
     updates_tx: &Sender<GuardedPrimaryUpdate>,
     current_generation: &Mutex<Option<RegisteredPrimaryGeneration>>,
-    recovery_decision: &AtomicU8,
+    recovery_decision: &Mutex<RecoveryState>,
 ) -> Result<(), RuntimeError> {
     control
         .set_read_timeout(Some(GENERATION_CONTROL_POLL))
@@ -1855,182 +1980,272 @@ fn run_generation_host(
         #[cfg(unix)]
         None,
     );
-    let mut lease: Option<RoleGenerationLease> = None;
-    let mut current_attempt = None;
-    let mut revoked_attempt = None;
-    let mut expected_attempt = 1_u32;
+    let mut state = HostGenerationState::default();
     let mut control_reader = GenerationControlReader::new();
     loop {
-        if let Some(lease) = lease.as_mut() {
+        if let Some(lease) = state.lease.as_mut() {
             lease.poll()?;
         }
         forward_generation_updates(updates_tx, &bound_rx, &events_rx)?;
         let record = match control_reader.poll(&mut control) {
-            Ok(Some(record)) => record,
-            Ok(None) => continue,
-            Err(error)
-                if runtime_io_kind(&error) == Some(io::ErrorKind::UnexpectedEof)
-                    && lease.is_none()
-                    && lock_generation(current_generation).is_none() =>
-            {
-                return Ok(());
+            Ok(record) => record,
+            Err(error) if runtime_io_kind(&error) == Some(io::ErrorKind::UnexpectedEof) => {
+                let result = finish_generation_control_eof(
+                    error,
+                    control_reader.filled,
+                    &mut state,
+                    current_generation,
+                    recovery_decision,
+                );
+                forward_generation_updates(updates_tx, &bound_rx, &events_rx)?;
+                return result;
             }
             Err(error) => return Err(error),
         };
-        match record.kind {
-            CONTROL_PREPARE => {
-                if record.attempt > 1 {
-                    await_recovery_decision(recovery_decision)?;
-                }
-                if record.attempt != expected_attempt
-                    || current_attempt.is_some()
-                    || lease.is_some()
-                    || revoked_attempt.is_some()
-                    || lock_generation(current_generation).is_some()
-                    || record.pid != 0
-                    || record.cause != 0
-                    || !record.payload.is_empty()
-                {
-                    return Err(invalid_control_transition(
-                        "prepare",
-                        record.attempt,
-                        expected_attempt,
-                    ));
-                }
-                let provisioned = owner.provision(record.attempt)?;
-                let response = GenerationControlRecord::new(CONTROL_PREPARED, record.attempt)
-                    .with_payload(provisioned.app_link.as_bytes().to_vec());
-                lease = Some(provisioned.lease);
-                current_attempt = Some(record.attempt);
-                forward_generation_updates(updates_tx, &bound_rx, &events_rx)?;
-                write_generation_control(&mut control, &response)?;
-            }
-            CONTROL_SPAWNED => {
-                if current_attempt != Some(record.attempt)
-                    || record.pid == 0
-                    || record.cause != 0
-                    || !record.payload.is_empty()
-                    || lock_generation(current_generation).is_some()
-                {
-                    return Err(invalid_control_transition(
-                        "spawned",
-                        record.attempt,
-                        expected_attempt,
-                    ));
-                }
-                let current = lease.as_mut().ok_or_else(|| {
-                    invalid_control_transition("spawned", record.attempt, expected_attempt)
-                })?;
-                current.child_spawned(record.pid, record.attempt)?;
-                *lock_generation(current_generation) = Some(RegisteredPrimaryGeneration {
-                    attempt: record.attempt,
-                    group_pid: record.pid,
-                });
-                forward_generation_updates(updates_tx, &bound_rx, &events_rx)?;
-                write_generation_control(
-                    &mut control,
-                    &GenerationControlRecord::new(CONTROL_REGISTERED, record.attempt)
-                        .with_pid(record.pid),
-                )?;
-            }
-            CONTROL_REVOKE => {
-                if current_attempt != Some(record.attempt)
-                    || revoked_attempt.is_some()
-                    || record.pid != 0
-                    || !record.payload.is_empty()
-                {
-                    return Err(invalid_control_transition(
-                        "revoke",
-                        record.attempt,
-                        expected_attempt,
-                    ));
-                }
-                let cause = decode_revocation_cause(record.cause)?;
-                let current = lease.take().ok_or_else(|| {
-                    invalid_control_transition("revoke", record.attempt, expected_attempt)
-                })?;
-                current.revoke(cause)?;
-                revoked_attempt = Some(record.attempt);
-                forward_generation_updates(updates_tx, &bound_rx, &events_rx)?;
-                write_generation_control(
-                    &mut control,
-                    &GenerationControlRecord::new(CONTROL_REVOKED, record.attempt),
-                )?;
-            }
-            CONTROL_CLEAR => {
-                let registered = lock_generation(current_generation)
-                    .map_or(0, |generation| generation.group_pid);
-                if current_attempt != Some(record.attempt)
-                    || revoked_attempt != Some(record.attempt)
-                    || record.cause != 0
-                    || !record.payload.is_empty()
-                    || record.pid != registered
-                {
-                    return Err(invalid_control_transition(
-                        "clear",
-                        record.attempt,
-                        expected_attempt,
-                    ));
-                }
-                take_generation(current_generation);
-                write_generation_control(
-                    &mut control,
-                    &GenerationControlRecord::new(CONTROL_CLEARED, record.attempt)
-                        .with_pid(record.pid),
-                )?;
-                current_attempt = None;
-                revoked_attempt = None;
-                expected_attempt = expected_attempt.checked_add(1).ok_or_else(|| {
-                    lifecycle_error(
-                        "macOS guardian generation host transition",
-                        io::Error::other("supervisor attempt counter exhausted"),
-                    )
-                })?;
-            }
-            _ => {
-                return Err(lifecycle_error(
-                    "macOS guardian generation host transition",
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("unexpected control kind {}", record.kind),
-                    ),
+        let expected_attempt = lock_recovery(recovery_decision).expected_attempt;
+        if let Some(record) = record {
+            if state.pending_prepare.is_some() {
+                return Err(invalid_control_transition(
+                    "pending prepare",
+                    record.attempt,
+                    expected_attempt,
                 ));
             }
+            match record.kind {
+                CONTROL_PREPARE => {
+                    if record.attempt != expected_attempt
+                        || state.current_attempt.is_some()
+                        || state.lease.is_some()
+                        || state.revoked_attempt.is_some()
+                        || lock_generation(current_generation).is_some()
+                        || record.pid != 0
+                        || record.cause != 0
+                        || !record.payload.is_empty()
+                    {
+                        return Err(invalid_control_transition(
+                            "prepare",
+                            record.attempt,
+                            expected_attempt,
+                        ));
+                    }
+                    if record.attempt > 1 && !lock_recovery(recovery_decision).initial_ready {
+                        state.initial_decision_deadline =
+                            Some(Instant::now() + GUARDIAN_SHUTDOWN_DEADLINE);
+                    }
+                    state.pending_prepare = Some(record);
+                }
+                CONTROL_SPAWNED => {
+                    if state.current_attempt != Some(record.attempt)
+                        || record.pid == 0
+                        || record.cause != 0
+                        || !record.payload.is_empty()
+                        || lock_generation(current_generation).is_some()
+                    {
+                        return Err(invalid_control_transition(
+                            "spawned",
+                            record.attempt,
+                            expected_attempt,
+                        ));
+                    }
+                    let current = state.lease.as_mut().ok_or_else(|| {
+                        invalid_control_transition("spawned", record.attempt, expected_attempt)
+                    })?;
+                    current.child_spawned(record.pid, record.attempt)?;
+                    *lock_generation(current_generation) = Some(RegisteredPrimaryGeneration {
+                        attempt: record.attempt,
+                        group_pid: record.pid,
+                    });
+                    forward_generation_updates(updates_tx, &bound_rx, &events_rx)?;
+                    write_generation_control(
+                        &mut control,
+                        &GenerationControlRecord::new(CONTROL_REGISTERED, record.attempt)
+                            .with_pid(record.pid),
+                    )?;
+                }
+                CONTROL_REVOKE => {
+                    if state.current_attempt != Some(record.attempt)
+                        || state.revoked_attempt.is_some()
+                        || record.pid != 0
+                        || !record.payload.is_empty()
+                    {
+                        return Err(invalid_control_transition(
+                            "revoke",
+                            record.attempt,
+                            expected_attempt,
+                        ));
+                    }
+                    let cause = decode_revocation_cause(record.cause)?;
+                    let current = state.lease.take().ok_or_else(|| {
+                        invalid_control_transition("revoke", record.attempt, expected_attempt)
+                    })?;
+                    // Close native release before the lease emits Revoked.
+                    lock_recovery(recovery_decision).retire(record.attempt);
+                    current.revoke(cause)?;
+                    state.revoked_attempt = Some(record.attempt);
+                    forward_generation_updates(updates_tx, &bound_rx, &events_rx)?;
+                    write_generation_control(
+                        &mut control,
+                        &GenerationControlRecord::new(CONTROL_REVOKED, record.attempt),
+                    )?;
+                }
+                CONTROL_CLEAR => {
+                    let registered = lock_generation(current_generation)
+                        .map_or(0, |generation| generation.group_pid);
+                    if state.current_attempt != Some(record.attempt)
+                        || state.revoked_attempt != Some(record.attempt)
+                        || record.cause != 0
+                        || !record.payload.is_empty()
+                        || record.pid != registered
+                    {
+                        return Err(invalid_control_transition(
+                            "clear",
+                            record.attempt,
+                            expected_attempt,
+                        ));
+                    }
+                    take_generation(current_generation);
+                    write_generation_control(
+                        &mut control,
+                        &GenerationControlRecord::new(CONTROL_CLEARED, record.attempt)
+                            .with_pid(record.pid),
+                    )?;
+                    state.current_attempt = None;
+                    state.revoked_attempt = None;
+                    // None alone is not Clear: only the completed acknowledgment
+                    // advances the attempt and permits a pending release request.
+                    lock_recovery(recovery_decision).cleared(record.attempt)?;
+                }
+                _ => {
+                    return Err(lifecycle_error(
+                        "macOS guardian generation host transition",
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("unexpected control kind {}", record.kind),
+                        ),
+                    ));
+                }
+            }
+        }
+        if control_reader.filled != 0 {
+            continue;
+        }
+        let Some(pending) = state.pending_prepare.as_ref() else {
+            continue;
+        };
+        let provisioned = {
+            let mut recovery = lock_recovery(recovery_decision);
+            check_initial_recovery_decision(&recovery, state.initial_decision_deadline)?;
+            if pending.attempt == 1 && recovery.denied {
+                return Err(rejected_recovery());
+            }
+            if !recovery.permits(pending.attempt) {
+                continue;
+            }
+            recovery.release_attempt = None;
+            // This actual bind/token mint is ordered against permanent denial.
+            // Do not release the recovery guard between the check and provision.
+            owner.provision(pending.attempt)?
+        };
+        let response = GenerationControlRecord::new(CONTROL_PREPARED, pending.attempt)
+            .with_payload(provisioned.app_link.as_bytes().to_vec());
+        state.current_attempt = Some(pending.attempt);
+        state.lease = Some(provisioned.lease);
+        state.pending_prepare = None;
+        state.initial_decision_deadline = None;
+        forward_generation_updates(updates_tx, &bound_rx, &events_rx)?;
+        if let Err(error) = write_generation_control(&mut control, &response) {
+            if matches!(
+                runtime_io_kind(&error),
+                Some(io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset)
+            ) {
+                let result = finish_generation_control_eof(
+                    error,
+                    control_reader.filled,
+                    &mut state,
+                    current_generation,
+                    recovery_decision,
+                );
+                forward_generation_updates(updates_tx, &bound_rx, &events_rx)?;
+                return result;
+            }
+            return Err(error);
         }
     }
 }
 
-fn await_recovery_decision(decision: &AtomicU8) -> Result<(), RuntimeError> {
-    let deadline = Instant::now() + GUARDIAN_SHUTDOWN_DEADLINE;
-    loop {
-        match decision.load(Ordering::Acquire) {
-            RECOVERY_ARMED => return Ok(()),
-            RECOVERY_DENIED => {
-                return Err(lifecycle_error(
-                    "macOS guardian generation host transition",
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "successor preparation was rejected before initial Ready",
-                    ),
-                ));
-            }
-            RECOVERY_PENDING if Instant::now() < deadline => thread::yield_now(),
-            RECOVERY_PENDING => {
-                return Err(lifecycle_error(
-                    "macOS guardian generation host transition",
-                    io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "initial Ready did not decide recovery before the deadline",
-                    ),
-                ));
-            }
-            _ => {
-                return Err(lifecycle_error(
-                    "macOS guardian generation host transition",
-                    io::Error::new(io::ErrorKind::InvalidData, "invalid recovery decision"),
-                ));
-            }
+fn rejected_recovery() -> RuntimeError {
+    lifecycle_error(
+        "macOS guardian generation host transition",
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "successor preparation was rejected before initial Ready",
+        ),
+    )
+}
+
+fn check_initial_recovery_decision(
+    recovery: &RecoveryState,
+    deadline: Option<Instant>,
+) -> Result<(), RuntimeError> {
+    if recovery.initial_ready || deadline.is_none() {
+        return Ok(());
+    }
+    if recovery.denied {
+        return Err(rejected_recovery());
+    }
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        return Err(lifecycle_error(
+            "macOS guardian generation host transition",
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                "initial Ready did not decide recovery before the deadline",
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn finish_generation_control_eof(
+    primary: RuntimeError,
+    partial_bytes: usize,
+    state: &mut HostGenerationState,
+    current_generation: &Mutex<Option<RegisteredPrimaryGeneration>>,
+    recovery: &Mutex<RecoveryState>,
+) -> Result<(), RuntimeError> {
+    if partial_bytes != 0 || lock_generation(current_generation).is_some() {
+        return Err(primary);
+    }
+    if let Some(lease) = state.lease.take() {
+        let Some(attempt) = state.current_attempt.take() else {
+            return Err(primary);
+        };
+        if state.revoked_attempt.is_some() {
+            return Err(primary);
         }
+        lock_recovery(recovery).retire(attempt);
+        if let Err(cleanup) = lease.revoke(RevocationCause::Shutdown) {
+            return Err(collapse_failures(vec![primary, cleanup]));
+        }
+    }
+    if state.current_attempt.is_some() || state.revoked_attempt.is_some() {
+        return Err(primary);
+    }
+    // EOF can precede the host's Q/S ACK read by one scheduling turn. Retain
+    // the EOF fact and its one existing attribution budget; never reread EOF.
+    let deadline = Instant::now() + SUPERVISED_QUIT_ACK_DEADLINE;
+    loop {
+        let recovery = lock_recovery(recovery);
+        if !recovery.denied {
+            return Err(primary);
+        }
+        if recovery.shutdown_acknowledged {
+            return Ok(());
+        }
+        drop(recovery);
+        if Instant::now() >= deadline {
+            return Err(primary);
+        }
+        thread::yield_now();
     }
 }
 
@@ -2309,18 +2524,46 @@ fn control_exchange(
     expected_kind: u8,
     expected_attempt: u32,
 ) -> Result<GenerationControlRecord, RuntimeError> {
+    control_exchange_with_cancellation(control, request, expected_kind, expected_attempt, None)
+}
+
+fn control_exchange_with_cancellation(
+    control: &Arc<Mutex<GenerationControlPeer>>,
+    request: &GenerationControlRecord,
+    expected_kind: u8,
+    expected_attempt: u32,
+    cancellation: Option<(&AtomicBool, &AtomicBool)>,
+) -> Result<GenerationControlRecord, RuntimeError> {
     let mut control = match control.lock() {
         Ok(control) => control,
         Err(poisoned) => poisoned.into_inner(),
     };
     let GenerationControlPeer { stream, reader } = &mut *control;
     write_generation_control(stream, request)?;
-    let deadline = Instant::now() + GUARDIAN_SHUTDOWN_DEADLINE;
+    let native_wait = request.kind == CONTROL_PREPARE && request.attempt > 1;
+    let deadline = (!native_wait).then(|| Instant::now() + GUARDIAN_SHUTDOWN_DEADLINE);
     let response = loop {
+        if native_wait
+            && reader.filled == 0
+            && let Some((cancelled, host_unavailable)) = cancellation
+        {
+            if cancelled.load(Ordering::Acquire) {
+                return Err(interrupted_successor_preparation(expected_attempt));
+            }
+            if host_unavailable.load(Ordering::Acquire) {
+                return Err(lifecycle_error(
+                    "macOS guardian generation control transition",
+                    io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "host-liveness observation failed",
+                    ),
+                ));
+            }
+        }
         if let Some(response) = reader.poll(stream)? {
             break response;
         }
-        if Instant::now() >= deadline {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             return Err(lifecycle_error(
                 "macOS guardian generation control transition",
                 io::Error::new(
@@ -2344,6 +2587,41 @@ fn control_exchange(
     }
     validate_control_response(request, &response)?;
     Ok(response)
+}
+
+#[derive(Debug)]
+struct OwnedPreparationInterruption {
+    attempt: u32,
+}
+
+impl std::fmt::Display for OwnedPreparationInterruption {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "owned shutdown interrupted successor attempt {}",
+            self.attempt
+        )
+    }
+}
+
+impl std::error::Error for OwnedPreparationInterruption {}
+
+fn interrupted_successor_preparation(attempt: u32) -> RuntimeError {
+    lifecycle_error(
+        "macOS guardian generation control transition",
+        io::Error::new(
+            io::ErrorKind::Interrupted,
+            OwnedPreparationInterruption { attempt },
+        ),
+    )
+}
+
+/// Recognizes only this preparer's private interruption for the exact attempt.
+pub(crate) fn is_owned_preparation_interruption(error: &RuntimeError, attempt: u32) -> bool {
+    matches!(error, RuntimeError::Lifecycle { source, .. }
+        if source.get_ref()
+            .and_then(|source| source.downcast_ref::<OwnedPreparationInterruption>())
+            .is_some_and(|marker| marker.attempt == attempt && attempt > 1))
 }
 
 fn validate_control_response(
@@ -2627,11 +2905,13 @@ fn observe_guarded_liveness(
     quit_accepted: &mut bool,
     orderly_requested: &mut bool,
     acknowledgment: &mut impl Write,
+    preparation_cancelled: &AtomicBool,
 ) -> Result<bool, RuntimeError> {
     match poll_host_liveness(reader)? {
         HostLiveness::Live => Ok(false),
         HostLiveness::Dead => {
             supervisor.shutdown();
+            preparation_cancelled.store(true, Ordering::Release);
             Ok(true)
         }
         HostLiveness::QuitAccepted if *quit_accepted || *orderly_requested => Err(lifecycle_error(
@@ -2644,6 +2924,7 @@ fn observe_guarded_liveness(
         HostLiveness::QuitAccepted => {
             *quit_accepted = true;
             supervisor.accept_shutdown();
+            preparation_cancelled.store(true, Ordering::Release);
             acknowledgment
                 .write_all(&SUPERVISED_QUIT_ACK)
                 .and_then(|()| acknowledgment.flush())
@@ -3037,6 +3318,178 @@ mod tests {
     }
 
     #[test]
+    fn recovery_release_requires_retired_clear_and_initial_arm_is_not_release() {
+        let mut recovery = RecoveryState::new();
+        assert!(recovery.permits(1));
+        recovery.retire(1);
+        recovery.arm();
+        assert!(recovery.initial_ready);
+        assert!(
+            !recovery.permits(2),
+            "late initial Ready released retirement"
+        );
+        recovery.arm();
+        assert_eq!(recovery.release_attempt, Some(2));
+        assert!(!recovery.permits(2), "None before Cleared released G2");
+        recovery.cleared(1).expect("record completed G1 Clear");
+        assert!(recovery.permits(2));
+        assert!(
+            !recovery.permits(3),
+            "G1 release authorized a wrong attempt"
+        );
+        recovery.retire(2);
+        assert!(!recovery.permits(3), "revocation retained native release");
+        recovery.cleared(2).expect("record completed G2 Clear");
+        assert!(!recovery.permits(3), "new Clear reused old release");
+        recovery.arm();
+        assert!(recovery.permits(3));
+        recovery.deny();
+        recovery.arm();
+        assert!(!recovery.permits(3));
+        assert!(recovery.release_attempt.is_none());
+    }
+
+    #[test]
+    fn unresolved_initial_ready_retains_its_deadline_after_native_wait_is_excluded() {
+        let mut recovery = RecoveryState::new();
+        let expired = Some(
+            Instant::now()
+                .checked_sub(GUARDIAN_SHUTDOWN_DEADLINE)
+                .expect("test clock can represent one expired initial decision budget"),
+        );
+        let error = check_initial_recovery_decision(&recovery, expired)
+            .expect_err("unresolved initial Ready remains bounded");
+        assert_eq!(runtime_io_kind(&error), Some(io::ErrorKind::TimedOut));
+        recovery.arm();
+        check_initial_recovery_decision(&recovery, expired)
+            .expect("decided eligibility does not time out legal native waiting");
+        assert!(
+            !recovery.permits(2),
+            "eligibility alone released native waiting"
+        );
+    }
+
+    #[test]
+    fn unclaimed_control_eof_explicitly_revokes_exact_lease_and_requires_attribution() {
+        for acknowledged in [false, true] {
+            let (events_tx, events_rx) = mpsc::channel();
+            let mut owner = RoleGenerationOwner::new(
+                RoleOwner::Primary,
+                DEFAULT_ADMISSION_TIMEOUT,
+                events_tx,
+                None,
+                None,
+            );
+            let provisioned = owner.provision(7).expect("own one unclaimed attempt");
+            let (endpoint, _) = parse_app_link(&provisioned.app_link).expect("actual locator");
+            let mut state = HostGenerationState {
+                lease: Some(provisioned.lease),
+                current_attempt: Some(7),
+                ..HostGenerationState::default()
+            };
+            let recovery = Mutex::new(RecoveryState::new());
+            if acknowledged {
+                let mut recovery = lock_recovery(&recovery);
+                recovery.deny();
+                recovery.shutdown_acknowledged = true;
+            }
+            let result = finish_generation_control_eof(
+                lifecycle_error("test EOF", io::Error::from(io::ErrorKind::UnexpectedEof)),
+                0,
+                &mut state,
+                &Mutex::new(None),
+                &recovery,
+            );
+            let events: Vec<_> = events_rx.try_iter().collect();
+            let endpoint_closed = std::os::unix::net::UnixStream::connect(endpoint).is_err();
+            assert!(state.lease.is_none() && state.current_attempt.is_none());
+            assert!(
+                endpoint_closed,
+                "unclaimed listener survived explicit revoke"
+            );
+            assert!(
+                events.iter().any(|event| matches!(
+                    event,
+                    RoleEvent::Revoked {
+                        attempt: 7,
+                        cause: crate::role::RoleRevocationCause::Shutdown,
+                        ..
+                    }
+                )),
+                "exact owner emitted no Shutdown revocation: {events:?}"
+            );
+            assert_eq!(
+                result.is_ok(),
+                acknowledged,
+                "denial/EOF fabricated attribution"
+            );
+        }
+    }
+
+    #[test]
+    fn attributed_control_eof_keeps_partial_and_registered_failures_fatal() {
+        for (partial, registered) in [
+            (1, None),
+            (
+                0,
+                Some(RegisteredPrimaryGeneration {
+                    attempt: 2,
+                    group_pid: 42,
+                }),
+            ),
+        ] {
+            let recovery = Mutex::new(RecoveryState::new());
+            {
+                let mut recovery = lock_recovery(&recovery);
+                recovery.deny();
+                recovery.shutdown_acknowledged = true;
+            }
+            let mut state = HostGenerationState::default();
+            let result = finish_generation_control_eof(
+                lifecycle_error("test EOF", io::Error::from(io::ErrorKind::UnexpectedEof)),
+                partial,
+                &mut state,
+                &Mutex::new(registered),
+                &recovery,
+            );
+            assert_eq!(
+                runtime_io_kind(&result.expect_err("partial/active EOF stays fatal")),
+                Some(io::ErrorKind::UnexpectedEof)
+            );
+        }
+    }
+
+    #[test]
+    fn denied_recovery_cannot_be_rearmed_by_late_ready() {
+        let mut child = Command::new("/bin/cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("owned liveness peer");
+        let liveness_writer = child.stdin.take().expect("liveness writer");
+        let quit_ack_reader = child.stdout.take().expect("ack reader");
+        let (_updates_tx, updates_rx) = mpsc::channel();
+        let mut primary = GuardedPrimary {
+            child,
+            liveness_writer: Some(liveness_writer),
+            quit_ack_reader,
+            current_generation: Arc::new(Mutex::new(None)),
+            recovery_decision: Arc::new(Mutex::new(RecoveryState::new())),
+            updates_rx,
+            worker: None,
+            shutdown_attributed: false,
+        };
+        primary.deny_recovery();
+        primary.arm_recovery();
+        primary.arm_recovery();
+        let finally_denied = lock_recovery(&primary.recovery_decision).denied;
+        primary.liveness_writer.take();
+        primary.child.wait().expect("wait owned liveness peer");
+        assert!(finally_denied, "late Ready reopened denial");
+    }
+
+    #[test]
     fn generation_host_rejects_out_of_order_revoke_before_prepare() {
         let (host, mut guardian) = std::os::unix::net::UnixStream::pair().expect("KGC1 pair");
         let (updates_tx, _updates_rx) = mpsc::channel();
@@ -3047,9 +3500,13 @@ mod tests {
                 .with_cause(RevocationCause::ChildExited),
         )
         .expect("write out-of-order revoke");
-        let error =
-            run_generation_host(host, &updates_tx, &current, &AtomicU8::new(RECOVERY_ARMED))
-                .expect_err("revoke before prepare must fail");
+        let error = run_generation_host(
+            host,
+            &updates_tx,
+            &current,
+            &Mutex::new(RecoveryState::new()),
+        )
+        .expect_err("revoke before prepare must fail");
         assert!(
             error.to_string().contains("invalid revoke transition"),
             "{error}"
@@ -3066,7 +3523,8 @@ mod tests {
             .expect("guardian control deadline");
         let (updates_tx, updates_rx) = mpsc::channel();
         let current = Arc::new(Mutex::new(None));
-        let recovery_armed = Arc::new(AtomicU8::new(RECOVERY_ARMED));
+        let recovery_armed = Arc::new(Mutex::new(RecoveryState::new()));
+        lock_recovery(&recovery_armed).arm();
         let current_for_host = Arc::clone(&current);
         let recovery_for_host = Arc::clone(&recovery_armed);
         let host_thread = std::thread::spawn(move || {
@@ -3114,6 +3572,7 @@ mod tests {
             &GenerationControlRecord::new(CONTROL_CLEAR, 1).with_pid(child_pid),
             CONTROL_CLEARED,
         );
+        lock_recovery(&recovery_armed).arm();
         guardian_exchange(
             &mut guardian,
             &GenerationControlRecord::new(CONTROL_PREPARE, 2),
@@ -3131,6 +3590,11 @@ mod tests {
             &GenerationControlRecord::new(CONTROL_CLEAR, 2),
             CONTROL_CLEARED,
         );
+        {
+            let mut recovery = lock_recovery(&recovery_armed);
+            recovery.deny();
+            recovery.shutdown_acknowledged = true;
+        }
         drop(guardian);
         host_thread
             .join()
@@ -3187,6 +3651,7 @@ mod tests {
                         release_rx,
                         phase,
                         kind,
+                        owned: false,
                     },
                 )
                 .expect("initial real child must spawn");
@@ -3262,6 +3727,79 @@ mod tests {
         }
     }
 
+    #[test]
+    fn owned_successor_interruption_requires_supervisor_stop_and_exact_attempt() {
+        use crate::SupervisorEvent;
+        for attribution in [
+            PreparationAttribution::Accepted,
+            PreparationAttribution::Requested,
+            PreparationAttribution::Unattributed,
+        ] {
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            let mut command = Command::new("/bin/sh");
+            command.args(["-c", "exit 1"]);
+            let supervisor = Supervisor::start_prepared(
+                RestartPolicy::default(),
+                GatedUnmarkedFailurePreparer {
+                    initial: Some(command),
+                    entered_tx,
+                    release_rx,
+                    phase: "unused marked phase",
+                    kind: io::ErrorKind::Interrupted,
+                    owned: true,
+                },
+            )
+            .expect("initial real child");
+            let entered = entered_rx.recv_timeout(Duration::from_secs(5));
+            match attribution {
+                PreparationAttribution::Accepted => supervisor.accept_shutdown(),
+                PreparationAttribution::Requested => supervisor.shutdown(),
+                PreparationAttribution::Unattributed => {}
+            }
+            if entered.is_err() {
+                supervisor.shutdown();
+            }
+            let released = release_tx.send(());
+            drop(release_tx);
+            entered.expect("actual successor preparation fence");
+            released.expect("release owned interruption");
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let terminal = loop {
+                let remaining = deadline
+                    .checked_duration_since(Instant::now())
+                    .expect("terminal event bound");
+                match supervisor.recv_event(remaining) {
+                    Some(event @ (SupervisorEvent::Stopped | SupervisorEvent::Failed { .. })) => {
+                        break event;
+                    }
+                    Some(SupervisorEvent::Started { attempt: 2, .. }) => {
+                        panic!("cancelled G2 spawned")
+                    }
+                    Some(_) => {}
+                    None => panic!("missing owned preparation terminal"),
+                }
+            };
+            let outcome = supervisor.wait_for_outcome();
+            assert!(supervisor.current_pid().is_none());
+            assert_eq!(supervisor.crash_ledger().self_termination_count, 1);
+            match attribution {
+                PreparationAttribution::Accepted | PreparationAttribution::Requested => {
+                    assert!(matches!(terminal, SupervisorEvent::Stopped));
+                    assert!(matches!(outcome, SupervisorOutcome::Stopped));
+                }
+                PreparationAttribution::Unattributed => {
+                    assert!(matches!(terminal, SupervisorEvent::Failed { attempt: 2 }));
+                    assert!(matches!(outcome, SupervisorOutcome::Failed(_)));
+                }
+            }
+        }
+        let marker = interrupted_successor_preparation(2);
+        assert!(is_owned_preparation_interruption(&marker, 2));
+        assert!(!is_owned_preparation_interruption(&marker, 1));
+        assert!(!is_owned_preparation_interruption(&marker, 3));
+    }
+
     #[derive(Debug, Clone, Copy)]
     enum PreparationAttribution {
         Accepted,
@@ -3275,6 +3813,7 @@ mod tests {
         release_rx: mpsc::Receiver<()>,
         phase: &'static str,
         kind: io::ErrorKind,
+        owned: bool,
     }
 
     impl ChildPreparer for GatedUnmarkedFailurePreparer {
@@ -3292,6 +3831,9 @@ mod tests {
             self.release_rx
                 .recv()
                 .expect("controlled preparation release");
+            if self.owned {
+                return Err(interrupted_successor_preparation(attempt));
+            }
             Err(RuntimeError::Lifecycle {
                 phase: self.phase,
                 source: io::Error::new(self.kind, "controlled successor preparation failure"),

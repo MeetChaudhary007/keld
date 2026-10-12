@@ -112,6 +112,28 @@ fn renderer_public_fs_recovers_same_document_after_real_bun_loss() {
     }
 }
 
+/// KEL143 AC4/continuity: the HTTP barrier holds only an application handler.
+/// Native-held/no-early-provision and old broker handle census are separate rows.
+#[test]
+fn renderer_pending_public_fs_call_rejects_once_and_rebinds_replaced_root() {
+    let fixture = PublicFsProject::new(Policy::Narrow);
+    let recovered = run_launch(&fixture, 0, Exercise::RendererPendingRecovery);
+    let relaunched = run_launch(&fixture, 1, Exercise::PublicAppComponent);
+    let document = |evidence: &LaunchEvidence| {
+        evidence
+            .reports
+            .iter()
+            .find(|report| report["phase"] == "page-ready")
+            .expect("actual document")["documentNonce"]
+            .clone()
+    };
+    assert_ne!(
+        document(&recovered),
+        document(&relaunched),
+        "healthy relaunch creates a new document"
+    );
+}
+
 fn run_recovery_launch(fixture: &PublicFsProject, launch: usize) -> LaunchEvidence {
     run_launch(fixture, launch, Exercise::RendererRecovery)
 }
@@ -133,7 +155,10 @@ fn run_launch_with_descendant_quit(
     exercise: Exercise,
     mut descendant: Option<&mut descendant_quit::DescendantQuit>,
 ) -> LaunchEvidence {
-    let observer = if exercise == Exercise::RendererRecovery {
+    let observer = if matches!(
+        exercise,
+        Exercise::RendererRecovery | Exercise::RendererPendingRecovery
+    ) {
         Observation::bind_recovery()
     } else {
         Observation::bind()
@@ -141,6 +166,9 @@ fn run_launch_with_descendant_quit(
     let prepared = match exercise {
         Exercise::RendererPointer => fixture.prepare(launch, observer.port),
         Exercise::RendererRecovery => fixture.prepare_recovery(launch, observer.port),
+        Exercise::RendererPendingRecovery => {
+            fixture.prepare_pending_recovery(launch, observer.port)
+        }
         Exercise::PublicAppComponent => fixture.prepare_component(launch, observer.port),
         Exercise::PublicAppNaturalCases => fixture.prepare_natural(launch, observer.port),
         Exercise::PublicAppRetirement => fixture.prepare_retirement(launch, observer.port),
@@ -239,7 +267,10 @@ fn observe_launch(
     prepared: &PreparedLaunch,
     host_pid: u32,
 ) {
-    if prepared.exercise == Exercise::RendererRecovery {
+    if matches!(
+        prepared.exercise,
+        Exercise::RendererRecovery | Exercise::RendererPendingRecovery
+    ) {
         let boot = await_recovery_boot(observer, &mut evidence.reports);
         observer.send_recovery_command(RecoveryCommand::Admit(boot.pid));
         evidence.recovery_boot = Some(boot);
@@ -260,7 +291,7 @@ fn observe_launch(
         Exercise::RendererPointer => {
             observe_pointer_actions(observer, evidence, fixture, prepared, host_pid);
         }
-        Exercise::RendererRecovery => {
+        Exercise::RendererRecovery | Exercise::RendererPendingRecovery => {
             observe_recovery_actions(observer, cleanup, evidence, fixture, prepared, host_pid);
         }
         Exercise::PublicAppComponent
@@ -272,10 +303,14 @@ fn observe_launch(
 }
 
 fn await_recovery_boot(observer: &Observation, journal: &mut Vec<Value>) -> RecoveryBoot {
-    let mut report = observer
+    let report = observer
         .reports
         .recv_timeout(EVENT_DEADLINE)
         .expect("real recovery app boot before its public whenReady");
+    record_recovery_boot(report, journal)
+}
+
+fn record_recovery_boot(mut report: Value, journal: &mut Vec<Value>) -> RecoveryBoot {
     let app_link = report["appLink"]
         .as_str()
         .expect("fixture-owned bootstrap data")
@@ -302,6 +337,115 @@ fn await_recovery_boot(observer: &Observation, journal: &mut Vec<Value>) -> Reco
     boot
 }
 
+/// Observe completed G1 work and optional handler hold before the visible crash.
+fn observe_recovery_before_loss(
+    observer: &Observation,
+    evidence: &mut LaunchEvidence,
+    fixture: &PublicFsProject,
+    prepared: &PreparedLaunch,
+    first_bun: u32,
+    initial_document: &Value,
+) -> Option<std::path::PathBuf> {
+    let recovery = prepared.recovery.as_ref().expect("owned recovery targets");
+    // Consume the existing completed G1 bridge/public-FS proof before any
+    // pending call or crash; Ready publication alone is not the arm receipt.
+    observer.send_recovery_command(RecoveryCommand::Invoke(RecoveryPhase::Before));
+    let before = await_recovery_page(observer, evidence, RecoveryPhase::Before);
+    assert_recovery_phase(
+        &before,
+        initial_document,
+        RecoveryPhase::Before,
+        fixture,
+        prepared,
+    );
+    assert_completed_recovery_files(prepared, RecoveryPhase::Before);
+    if recovery.pending_handler {
+        observer.send_recovery_command(RecoveryCommand::Invoke(RecoveryPhase::Pending));
+        let started = observer
+            .reports
+            .recv_timeout(EVENT_DEADLINE)
+            .expect("actual pending renderer request");
+        assert_eq!(started["phase"], "recovery-pending-start", "{started}");
+        assert_eq!(
+            started["requests"]
+                .as_array()
+                .expect("completed G1 plus pending request")
+                .len(),
+            3
+        );
+        assert_eq!(
+            started["outcomes"], before["outcomes"],
+            "no pending settlement before loss"
+        );
+        let admitted = observer
+            .reports
+            .recv_timeout(EVENT_DEADLINE)
+            .expect("actual application handler HTTP barrier");
+        assert_eq!(admitted["phase"], "recovery-handler-pending", "{admitted}");
+        assert_eq!(admitted["barrier"], "application-handler-only");
+        assert_eq!(pid(&admitted, "pid"), first_bun);
+        assert_eq!(admitted["nonce"], started["requests"][2]["nonce"]);
+        assert_completed_recovery_files(prepared, RecoveryPhase::Pending);
+        evidence.reports.extend([started, admitted]);
+        Some(fixture.replace_recovery_anchor(prepared))
+    } else {
+        None
+    }
+}
+
+/// Collect the independent old settlement and successor boot in either order.
+fn await_recovery_after_loss(
+    observer: &Observation,
+    evidence: &mut LaunchEvidence,
+    pending_handler: bool,
+    first_bun: u32,
+) -> (RecoveryBoot, Vec<usize>, usize) {
+    if pending_handler {
+        // Page settlement and G2 startup are independent observations; either
+        // may arrive first. Neither ordinary HTTP record grants process custody.
+        let deadline = Instant::now() + EVENT_DEADLINE;
+        let mut settled_reports = Vec::new();
+        let mut boot = None;
+        let mut boot_count = 0;
+        while settled_reports.is_empty() || boot.is_none() {
+            let report = observer
+                .reports
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .expect("old rejection and actual successor boot");
+            match report["phase"].as_str() {
+                Some("recovery-pending-settled") => {
+                    // Preserve the actual report before any terminal synthesis.
+                    let index = evidence.reports.len();
+                    evidence.reports.push(report);
+                    if settled_reports.is_empty() {
+                        observer.send_recovery_command(RecoveryCommand::RetirePending(first_bun));
+                    }
+                    settled_reports.push(index);
+                }
+                Some("recovery-app-boot") => {
+                    let generation_boot = record_recovery_boot(report, &mut evidence.reports);
+                    boot_count += 1;
+                    if boot.is_none() {
+                        boot = Some(generation_boot);
+                    }
+                }
+                _ => panic!("unexpected pending recovery observation: {report}"),
+            }
+        }
+        (
+            boot.expect("observed actual successor"),
+            settled_reports,
+            boot_count,
+        )
+    } else {
+        (
+            await_recovery_boot(observer, &mut evidence.reports),
+            Vec::new(),
+            1,
+        )
+    }
+}
+
 fn observe_recovery_actions(
     observer: &Observation,
     cleanup: &mut ShippingLaunchCleanup,
@@ -324,24 +468,32 @@ fn observe_recovery_actions(
         if error.kind() == std::io::ErrorKind::NotFound));
     assert_eq!(fs::read(&recovery.witness).expect("empty witness"), b"");
 
-    observer.send_recovery_command(RecoveryCommand::Invoke(RecoveryPhase::Before));
-    let before = await_recovery_page(observer, evidence, RecoveryPhase::Before);
-    assert_recovery_phase(
-        &before,
-        &initial_document,
-        RecoveryPhase::Before,
+    let retired_root = observe_recovery_before_loss(
+        observer,
+        evidence,
         fixture,
         prepared,
+        first.bun,
+        &initial_document,
     );
-    assert_completed_recovery_files(prepared, RecoveryPhase::Before);
     assert!(evidence.click.is_none(), "recovery has no input action");
     let expected_bun_image = fs::canonicalize(process_image_path(first.bun))
         .expect("independently attributed G1 Bun image");
 
     // Only this independently attributed admitted Bun PID is killed. The
     // persistent guardian remains the process-family and restart owner.
+    if recovery.pending_handler {
+        assert!(
+            matches!(
+                observer.reports.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ),
+            "pending renderer settled before owned G1 loss"
+        );
+    }
     kill_pid(first.bun);
-    let successor_boot = await_recovery_boot(observer, &mut evidence.reports);
+    let (successor_boot, settled_reports, boot_count) =
+        await_recovery_after_loss(observer, evidence, recovery.pending_handler, first.bun);
     assert_ne!(first.bun, successor_boot.pid);
     assert_bun_cleanup_custody(
         successor_boot.pid,
@@ -380,6 +532,8 @@ fn observe_recovery_actions(
         "actual Bun loss replaced the original native window"
     );
 
+    assert_collected_recovery_terminals(evidence, &initial_document, &settled_reports, boot_count);
+
     observer.send_recovery_command(RecoveryCommand::Invoke(RecoveryPhase::After));
     let after = await_recovery_page(observer, evidence, RecoveryPhase::After);
     assert_recovery_phase(
@@ -389,7 +543,7 @@ fn observe_recovery_actions(
         fixture,
         prepared,
     );
-    assert_completed_recovery_files(prepared, RecoveryPhase::After);
+    assert_recovery_replacement_files(prepared, retired_root.as_deref());
     assert_eq!(
         await_same_native_windows(host_pid, TITLE, &evidence.window),
         evidence.window
@@ -410,15 +564,41 @@ fn observe_recovery_actions(
     );
 }
 
+/// Independent old/new-root effects remain separate from reported G2 success.
+fn assert_recovery_replacement_files(prepared: &PreparedLaunch, retired_root: Option<&Path>) {
+    let recovery = prepared.recovery.as_ref().expect("owned recovery targets");
+    if let Some(retired) = retired_root {
+        assert_eq!(
+            fs::read(retired.join(recovery.witness.file_name().expect("old witness leaf")))
+                .expect("old-root independent replay witness"),
+            [1],
+            "G2 reused or replayed the old root"
+        );
+        assert_eq!(
+            fs::read(retired.join(prepared.target.file_name().expect("old target leaf")))
+                .expect("old-root target after G2"),
+            CONTENT
+        );
+        assert!(
+            matches!(fs::symlink_metadata(&prepared.target), Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound),
+            "G2 replayed the original target"
+        );
+    }
+    assert_completed_recovery_files(prepared, RecoveryPhase::After);
+}
+
 fn assert_completed_recovery_files(prepared: &PreparedLaunch, phase: RecoveryPhase) {
     let recovery = prepared.recovery.as_ref().expect("owned recovery targets");
     let target_message = match phase {
-        RecoveryPhase::Before => "completed G1 bytes",
+        RecoveryPhase::Before | RecoveryPhase::Pending => "completed G1 bytes",
         RecoveryPhase::After => "retained G1 bytes",
     };
-    assert_eq!(fs::read(&prepared.target).expect(target_message), CONTENT);
+    if !recovery.pending_handler || !matches!(phase, RecoveryPhase::After) {
+        assert_eq!(fs::read(&prepared.target).expect(target_message), CONTENT);
+    }
     match phase {
-        RecoveryPhase::Before => {
+        RecoveryPhase::Before | RecoveryPhase::Pending => {
             assert_eq!(fs::read(&recovery.witness).expect("G1 witness"), [1]);
             assert!(matches!(fs::symlink_metadata(&recovery.after), Err(error)
                 if error.kind() == std::io::ErrorKind::NotFound));
@@ -542,6 +722,58 @@ fn await_recovery_page(
     report
 }
 
+/// Synthesize only after actual reports and fresh live-owner observations exist.
+fn assert_collected_recovery_terminals(
+    evidence: &LaunchEvidence,
+    initial_document: &Value,
+    settled_reports: &[usize],
+    boot_count: usize,
+) {
+    assert_eq!(boot_count, 1, "one actual successor boot");
+    if !settled_reports.is_empty() {
+        assert_eq!(settled_reports.len(), 1, "one pending settlement report");
+        assert_pending_recovery_rejection(&evidence.reports[settled_reports[0]], initial_document);
+    }
+}
+
+fn assert_pending_recovery_rejection(report: &Value, initial_document: &Value) {
+    for key in ["documentNonce", "javascriptToken", "initial"] {
+        assert_eq!(
+            report[key], initial_document[key],
+            "same pending renderer {key}"
+        );
+    }
+    let request = &report["requests"][2];
+    assert_eq!(request["action"], "recovery-pending");
+    assert_eq!(
+        report["outcomes"][2],
+        json!({"action":"recovery-pending","name":"Error",
+        "error":"KELD-WV-011: application link ended before the renderer reply","code":null})
+    );
+    let terminals = report["terminals"]
+        .as_array()
+        .expect("passive real bridge terminals");
+    let old: Vec<_> = terminals
+        .iter()
+        .filter(|terminal| terminal["nonce"] == request["nonce"])
+        .collect();
+    assert_eq!(
+        old,
+        [
+            &json!({"nonce":request["nonce"],"ok":false,"code":"KELD-WV-011",
+        "detail":"application link ended before the renderer reply"})
+        ]
+    );
+    assert_eq!(
+        terminals.len(),
+        report["outcomes"]
+            .as_array()
+            .expect("actual settlements")
+            .len(),
+        "one bridge terminal for each actual Promise settlement"
+    );
+}
+
 fn assert_recovery_phase(
     report: &Value,
     initial_document: &Value,
@@ -558,9 +790,16 @@ fn assert_recovery_phase(
         assert!(value.bytes().all(|byte| byte.is_ascii_hexdigit()));
     }
     assert_eq!(report["automaticRecovery"], true);
+    let pending = prepared
+        .recovery
+        .as_ref()
+        .expect("recovery inputs")
+        .pending_handler;
     let count = match phase {
         RecoveryPhase::Before => 2,
+        RecoveryPhase::After if pending => 5,
         RecoveryPhase::After => 4,
+        RecoveryPhase::Pending => panic!("pending admission uses its separate observation"),
     };
     let requests = report["requests"]
         .as_array()
@@ -571,13 +810,30 @@ fn assert_recovery_phase(
     assert_eq!(requests.len(), count);
     assert_eq!(outcomes.len(), count);
     let mut nonces = std::collections::BTreeSet::new();
-    for (index, action) in ["recovery-before", "deny", "recovery-after", "deny"]
-        .iter()
-        .take(count)
-        .enumerate()
-    {
+    if pending && matches!(phase, RecoveryPhase::After) {
+        assert_pending_recovery_rejection(report, initial_document);
+    }
+    let actions: &[&str] = if pending {
+        &[
+            "recovery-before",
+            "deny",
+            "recovery-pending",
+            "recovery-after",
+            "deny",
+        ]
+    } else {
+        &["recovery-before", "deny", "recovery-after", "deny"]
+    };
+    for (index, action) in actions.iter().take(count).enumerate() {
         assert_eq!(requests[index]["action"], *action);
-        assert_eq!(requests[index]["count"], index % 2 + 1);
+        assert_eq!(
+            requests[index]["count"],
+            if pending {
+                if index < 3 { index + 1 } else { index - 2 }
+            } else {
+                index % 2 + 1
+            }
+        );
         let nonce = requests[index]["nonce"]
             .as_str()
             .expect("renderer-created request nonce");
@@ -585,7 +841,15 @@ fn assert_recovery_phase(
         assert!(nonce.bytes().all(|byte| byte.is_ascii_hexdigit()));
         assert!(nonces.insert(nonce), "each completed call is distinct");
         assert_eq!(outcomes[index]["action"], *action);
-        let expected = if index % 2 == 0 {
+        if pending && index == 2 {
+            continue;
+        }
+        let allowed = if pending {
+            index == 0 || index == 3
+        } else {
+            index % 2 == 0
+        };
+        let expected = if allowed {
             json!({"ok":true,"bytes":if index == 0 { CONTENT } else { RECOVERY_AFTER_CONTENT }})
         } else {
             json!({"ok":false,"code":"KELD-GUARD002","message":format!(
@@ -797,6 +1061,7 @@ fn assert_product_quit(
     let expected_calls = match exercise {
         Exercise::RendererPointer => 3,
         Exercise::RendererRecovery => 4,
+        Exercise::RendererPendingRecovery => 5,
         Exercise::PublicAppComponent
         | Exercise::PublicAppNaturalCases
         | Exercise::PublicAppRetirement => 0,
@@ -809,7 +1074,10 @@ fn assert_product_quit(
         assert_eq!(stderr.matches(marker).count(), expected_calls, "{stderr}");
     }
     assert!(stderr.contains("KELD_KEL142_BIND webview="), "{stderr}");
-    let quit_calls = if exercise == Exercise::RendererRecovery {
+    let quit_calls = if matches!(
+        exercise,
+        Exercise::RendererRecovery | Exercise::RendererPendingRecovery
+    ) {
         2
     } else {
         expected_calls
@@ -831,7 +1099,9 @@ fn assert_product_quit(
             evidence.reports.last().expect("final page report"),
             bun,
         ),
-        Exercise::RendererRecovery => assert_recovery_trace(stderr, evidence),
+        Exercise::RendererRecovery | Exercise::RendererPendingRecovery => {
+            assert_recovery_trace(stderr, evidence);
+        }
         Exercise::PublicAppComponent
         | Exercise::PublicAppNaturalCases
         | Exercise::PublicAppRetirement => {
@@ -871,25 +1141,38 @@ fn assert_recovery_trace(stderr: &str, evidence: &LaunchEvidence) {
         .filter_map(|line| line.strip_prefix("KELD_KEL140_PUBLIC_OUTCOME "))
         .map(|line| serde_json::from_str(line).expect("actual recovery public FS trace"))
         .collect();
+    let pending = result["requests"][2]["action"] == "recovery-pending";
     assert_eq!(
         handlers.len(),
-        4,
-        "one invocation per distinct completed call"
+        if pending { 5 } else { 4 },
+        "one invocation per request"
     );
-    assert_eq!(outcomes.len(), 4, "no replayed completed call");
+    assert_eq!(
+        outcomes.len(),
+        4,
+        "no returned old pending handler or replay"
+    );
     for (index, handler) in handlers.iter().enumerate() {
+        let first_generation = if pending { index < 3 } else { index < 2 };
         assert_eq!(
             handler,
-            &json!({"call":index % 2 + 1,
-            "pid":if index < 2 { first.bun } else { successor.bun },
+            &json!({"call":result["requests"][index]["count"],
+            "pid":if first_generation { first.bun } else { successor.bun },
             "action":result["requests"][index]["action"],
             "nonce":result["requests"][index]["nonce"]})
         );
+    }
+    for (index, outcome) in outcomes.iter().enumerate() {
+        let request = if pending && index >= 2 {
+            index + 1
+        } else {
+            index
+        };
         assert_eq!(
-            outcomes[index],
-            json!({"call":index % 2 + 1,
-            "nonce":result["requests"][index]["nonce"],
-            "outcome":result["outcomes"][index]["outcome"]})
+            outcome,
+            &json!({"call":result["requests"][request]["count"],
+            "nonce":result["requests"][request]["nonce"],
+            "outcome":result["outcomes"][request]["outcome"]})
         );
     }
 }

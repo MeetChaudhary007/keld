@@ -26,7 +26,7 @@ type NaturalInputs = {
   linksDeny: string;
 };
 const naturalInputs: NaturalInputs | null = __NATURAL_INPUTS__;
-type RecoveryInputs = { after: string; witness: string; afterContent: number[] };
+type RecoveryInputs = { after: string; witness: string; afterContent: number[]; pendingHandler: boolean };
 const recoveryInputs: RecoveryInputs | null = __RECOVERY_INPUTS__;
 const sampleControlBudget = 4096;
 let handlerCalls = 0;
@@ -57,7 +57,7 @@ async function performFsOperation(action: "roundtrip" | "deny"): Promise<FsSampl
 async function performRecoveryOperation(action: "recovery-before" | "recovery-after"): Promise<FsSampleOutcome> {
   if (!recoveryInputs) throw new Error("recovery fixture inputs absent");
   try {
-    const marker = action === "recovery-before" ? 1 : 2;
+    const marker = action === "recovery-after" ? 2 : 1;
     const destination = marker === 1 ? target : recoveryInputs.after;
     const bytes = marker === 1 ? content : new Uint8Array(recoveryInputs.afterContent);
     const completed = await fs.read(recoveryInputs.witness);
@@ -137,6 +137,17 @@ channels.handle(echoChannel, async request => {
   if (recoveryInputs && request.count === 1 &&
       (control.action === "recovery-before" || control.action === "recovery-after")) {
     outcome = await performRecoveryOperation(control.action);
+  } else if (recoveryInputs?.pendingHandler && request.count === 3 &&
+      control.action === "recovery-pending") {
+    const bytes = await fs.read(target);
+    if (bytes.byteLength !== content.byteLength ||
+        !bytes.every((byte, index) => byte === content[index])) {
+      throw new Error("pending fixture lost its completed G1 public roundtrip");
+    }
+    // Handler-only hold after the independently completed G1 renderer calls.
+    // The read above is genuine public FS; this is never a native-work hold.
+    await fetch(base + "/recovery-pending/" + process.pid + "/" + control.nonce);
+    throw new Error("old pending application handler was unexpectedly released");
   } else if (control.action === "roundtrip" && request.count === 1) {
     outcome = await performFsOperation("roundtrip");
   } else if (control.action === "deny" && request.count === 2) {
