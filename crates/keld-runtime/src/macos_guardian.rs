@@ -666,6 +666,8 @@ impl GuardedPrimary {
                     &updates_tx,
                     &generation_for_worker,
                     &recovery_for_worker,
+                    #[cfg(test)]
+                    None,
                 )
             }) {
             Ok(worker) => worker,
@@ -1951,6 +1953,13 @@ fn write_group_registration(writer: &mut impl Write, group_pid: u32) -> Result<(
     })
 }
 
+#[cfg(test)]
+struct GenerationProvisionFence {
+    attempt: u32,
+    entered: mpsc::SyncSender<()>,
+    release: Receiver<()>,
+}
+
 #[derive(Default)]
 struct HostGenerationState {
     lease: Option<RoleGenerationLease>,
@@ -1966,6 +1975,7 @@ fn run_generation_host(
     updates_tx: &Sender<GuardedPrimaryUpdate>,
     current_generation: &Mutex<Option<RegisteredPrimaryGeneration>>,
     recovery_decision: &Mutex<RecoveryState>,
+    #[cfg(test)] provision_fence: Option<&GenerationProvisionFence>,
 ) -> Result<(), RuntimeError> {
     control
         .set_read_timeout(Some(GENERATION_CONTROL_POLL))
@@ -2148,6 +2158,27 @@ fn run_generation_host(
             recovery.release_attempt = None;
             // This actual bind/token mint is ordered against permanent denial.
             // Do not release the recovery guard between the check and provision.
+            #[cfg(test)]
+            if let Some(fence) = provision_fence.filter(|fence| fence.attempt == pending.attempt) {
+                // Scoped unit-test custody only: shipping code has no fence,
+                // callback, global, extra owner, or branch here. The real host
+                // owner retains its recovery guard through the actual mint.
+                fence.entered.send(()).map_err(|_| {
+                    lifecycle_error(
+                        "test generation pre-mint receipt",
+                        io::Error::other("test custodian ended"),
+                    )
+                })?;
+                fence
+                    .release
+                    .recv_timeout(GUARDIAN_SHUTDOWN_DEADLINE)
+                    .map_err(|source| {
+                        lifecycle_error(
+                            "test generation pre-mint release",
+                            io::Error::other(source),
+                        )
+                    })?;
+            }
             owner.provision(pending.attempt)?
         };
         let response = GenerationControlRecord::new(CONTROL_PREPARED, pending.attempt)
@@ -3507,6 +3538,7 @@ mod tests {
             &updates_tx,
             &current,
             &Mutex::new(RecoveryState::new()),
+            None,
         )
         .expect_err("revoke before prepare must fail");
         assert!(
@@ -3527,10 +3559,10 @@ mod tests {
         let current = Arc::new(Mutex::new(None));
         let recovery_armed = Arc::new(Mutex::new(RecoveryState::new()));
         lock_recovery(&recovery_armed).arm();
-        let current_for_host = Arc::clone(&current);
-        let recovery_for_host = Arc::clone(&recovery_armed);
+        let host_current = Arc::clone(&current);
+        let host_recovery = Arc::clone(&recovery_armed);
         let host_thread = std::thread::spawn(move || {
-            run_generation_host(host, &updates_tx, &current_for_host, &recovery_for_host)
+            run_generation_host(host, &updates_tx, &host_current, &host_recovery, None)
         });
 
         let prepared_one = guardian_exchange(
@@ -5282,6 +5314,1063 @@ while (!(await input.read()).done) {}
             terminal_reads < 64,
             "terminal disconnected-event loop repeated reads"
         );
+    }
+
+    // Existing approved KEL-143 §7 schedules. This test relay copies exact
+    // private records; run_generation_host remains the actual mint/lease owner.
+    mod runtime_race_validation {
+        use super::*;
+        use std::net::Shutdown;
+        use std::os::unix::net::UnixStream;
+        use std::sync::TryLockError;
+
+        const COLLECTION: Duration = Duration::from_secs(7);
+
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        enum DeliveryCut {
+            Zero,
+            Partial,
+            FullBeforeLease,
+            LeaseBeforeSpawn,
+        }
+
+        enum RelayCommand {
+            Full,
+            Prefix,
+            AwaitClosure,
+        }
+
+        #[derive(Debug, PartialEq, Eq)]
+        struct ControlFields {
+            kind: u8,
+            cause: u8,
+            attempt: u32,
+            pid: u32,
+            payload_len: usize,
+        }
+
+        impl ControlFields {
+            fn capture(record: &GenerationControlRecord) -> Self {
+                Self {
+                    kind: record.kind,
+                    cause: record.cause,
+                    attempt: record.attempt,
+                    pid: record.pid,
+                    payload_len: record.payload.len(),
+                }
+            }
+        }
+
+        enum RelayReceipt {
+            ClearedOne,
+            PreparedTwo(GenerationControlRecord),
+            PrefixSent(Instant),
+            NormalRevokeTwo {
+                request: ControlFields,
+                response: ControlFields,
+            },
+            NormalClearTwo {
+                request: ControlFields,
+                response: ControlFields,
+            },
+            GuardianControlEof,
+        }
+
+        struct PhaseGate {
+            entered: Sender<()>,
+            release: Receiver<()>,
+        }
+
+        impl PhaseGate {
+            fn wait(&self) -> Result<(), RuntimeError> {
+                self.entered.send(()).map_err(|_| {
+                    lifecycle_error(
+                        "test Runtime phase receipt",
+                        io::Error::other("custodian ended"),
+                    )
+                })?;
+                self.release.recv_timeout(COLLECTION).map_err(|source| {
+                    lifecycle_error("test Runtime phase release", io::Error::other(source))
+                })
+            }
+        }
+
+        struct ReturnedLeasePreparer<C> {
+            inner: GuardedPrimaryPreparer<C>,
+            gate: Option<PhaseGate>,
+        }
+
+        impl<C> ChildPreparer for ReturnedLeasePreparer<C>
+        where
+            C: FnMut(&str) -> Result<Command, RuntimeError> + Send + 'static,
+        {
+            type Lease = GuardedPrimaryLease;
+
+            fn prepare(
+                &mut self,
+                attempt: u32,
+            ) -> Result<PreparedChild<Self::Lease>, RuntimeError> {
+                let prepared = self.inner.prepare(attempt)?;
+                // This receipt follows actual GuardedPrimaryLease construction.
+                // It does not replace that lease or call another spawn owner.
+                if attempt == 2
+                    && let Some(gate) = &self.gate
+                {
+                    gate.wait()?;
+                }
+                Ok(prepared)
+            }
+        }
+
+        fn timed_pair() -> (UnixStream, UnixStream) {
+            let (one, two) = UnixStream::pair().expect("existing private Unix pair");
+            for stream in [&one, &two] {
+                stream
+                    .set_read_timeout(Some(GENERATION_CONTROL_POLL))
+                    .expect("read poll");
+                stream
+                    .set_write_timeout(Some(GENERATION_CONTROL_POLL))
+                    .expect("write poll");
+            }
+            (one, two)
+        }
+
+        fn receive_record(
+            stream: &mut UnixStream,
+        ) -> Result<GenerationControlRecord, RuntimeError> {
+            let mut reader = GenerationControlReader::new();
+            let deadline = Instant::now() + COLLECTION;
+            loop {
+                if let Some(record) = reader.poll(stream)? {
+                    return Ok(record);
+                }
+                if Instant::now() >= deadline {
+                    return Err(lifecycle_error(
+                        "test Runtime record collection",
+                        io::Error::from(io::ErrorKind::TimedOut),
+                    ));
+                }
+            }
+        }
+
+        fn private_record_relay(
+            mut host: UnixStream,
+            mut guardian: UnixStream,
+            commands: &Receiver<RelayCommand>,
+            receipts: &Sender<RelayReceipt>,
+        ) -> Result<(), RuntimeError> {
+            loop {
+                let request = match receive_record(&mut guardian) {
+                    Ok(record) => record,
+                    Err(error) if runtime_io_kind(&error) == Some(io::ErrorKind::UnexpectedEof) => {
+                        // Actual preparer/Supervisor control closure drives the
+                        // real host owner EOF; the relay fabricates no record.
+                        receipts
+                            .send(RelayReceipt::GuardianControlEof)
+                            .map_err(|_| {
+                                lifecycle_error(
+                                    "test relay actual EOF receipt",
+                                    io::Error::other("custodian ended"),
+                                )
+                            })?;
+                        return host.shutdown(Shutdown::Both).map_err(|source| {
+                            lifecycle_error("test relay observed control closure", source)
+                        });
+                    }
+                    Err(error) => return Err(error),
+                };
+                write_generation_control(&mut host, &request)?;
+                let response = receive_record(&mut host)?;
+                if response.kind == CONTROL_PREPARED && response.attempt == 2 {
+                    let mut encoded = Vec::new();
+                    write_generation_control(&mut encoded, &response)?;
+                    receipts
+                        .send(RelayReceipt::PreparedTwo(response))
+                        .map_err(|_| {
+                            lifecycle_error(
+                                "test relay Prepared receipt",
+                                io::Error::other("custodian ended"),
+                            )
+                        })?;
+                    match commands.recv_timeout(COLLECTION).map_err(|source| {
+                        lifecycle_error("test relay delivery release", io::Error::other(source))
+                    })? {
+                        RelayCommand::Full => guardian.write_all(&encoded).map_err(|source| {
+                            lifecycle_error("test relay complete Prepared write", source)
+                        })?,
+                        RelayCommand::Prefix => {
+                            // One canonical byte is a valid prefix, not a
+                            // malformed substitute response or model timeout.
+                            let began = Instant::now();
+                            guardian.write_all(&encoded[..1]).map_err(|source| {
+                                lifecycle_error("test relay Prepared prefix write", source)
+                            })?;
+                            receipts
+                                .send(RelayReceipt::PrefixSent(began))
+                                .map_err(|_| {
+                                    lifecycle_error(
+                                        "test relay prefix receipt",
+                                        io::Error::other("custodian ended"),
+                                    )
+                                })?;
+                            match commands.recv_timeout(COLLECTION).map_err(|source| {
+                                lifecycle_error(
+                                    "test relay partial outcome collection",
+                                    io::Error::other(source),
+                                )
+                            })? {
+                                RelayCommand::AwaitClosure => {}
+                                RelayCommand::Full | RelayCommand::Prefix => {
+                                    return Err(lifecycle_error(
+                                        "test relay prefix command",
+                                        io::Error::other("unexpected duplicate delivery"),
+                                    ));
+                                }
+                            }
+                        }
+                        RelayCommand::AwaitClosure => {}
+                    }
+                } else {
+                    write_generation_control(&mut guardian, &response)?;
+                    // These facts come from the actual requests and actual
+                    // host replies, not the shared Revoked event that EOF can
+                    // also emit. Normal lease cleanup must earn its own oracle.
+                    let receipt = match (request.kind, request.attempt) {
+                        (CONTROL_REVOKE, 2) => Some(RelayReceipt::NormalRevokeTwo {
+                            request: ControlFields::capture(&request),
+                            response: ControlFields::capture(&response),
+                        }),
+                        (CONTROL_CLEAR, 2) => Some(RelayReceipt::NormalClearTwo {
+                            request: ControlFields::capture(&request),
+                            response: ControlFields::capture(&response),
+                        }),
+                        _ => None,
+                    };
+                    if let Some(receipt) = receipt {
+                        receipts.send(receipt).map_err(|_| {
+                            lifecycle_error(
+                                "test relay normal cleanup receipt",
+                                io::Error::other("custodian ended"),
+                            )
+                        })?;
+                    }
+                    if response.kind == CONTROL_CLEARED && response.attempt == 1 {
+                        receipts.send(RelayReceipt::ClearedOne).map_err(|_| {
+                            lifecycle_error(
+                                "test relay Clear receipt",
+                                io::Error::other("custodian ended"),
+                            )
+                        })?;
+                    }
+                }
+            }
+        }
+
+        // Test control custody only. The actual production host owner remains
+        // run_generation_host; the relay never mints or chooses authority.
+        struct ControlPlane {
+            host: Option<JoinHandle<Result<(), RuntimeError>>>,
+            relay: Option<JoinHandle<Result<(), RuntimeError>>>,
+            commands: Sender<RelayCommand>,
+            receipts: Receiver<RelayReceipt>,
+            recovery: Arc<Mutex<RecoveryState>>,
+            updates: Receiver<GuardedPrimaryUpdate>,
+            consumption_probe: Option<UnixStream>,
+            current: Arc<Mutex<Option<RegisteredPrimaryGeneration>>>,
+            guardian_control: Option<UnixStream>,
+        }
+
+        impl ControlPlane {
+            fn start(cut: DeliveryCut) -> Self {
+                let (host_control, relay_host) = timed_pair();
+                let (guardian_control, relay_guardian) = timed_pair();
+                // This clone observes FIONREAD only, never consumes bytes.
+                // It is dropped before cancellation/EOF to preserve custody.
+                let consumption_probe = (cut == DeliveryCut::Partial).then(|| {
+                    guardian_control
+                        .try_clone()
+                        .expect("sole-consumer observation alias")
+                });
+                let (updates_tx, updates) = mpsc::channel();
+                let current = Arc::new(Mutex::new(None));
+                let recovery = Arc::new(Mutex::new(RecoveryState::new()));
+                lock_recovery(&recovery).arm();
+                let host_current = Arc::clone(&current);
+                let host_recovery = Arc::clone(&recovery);
+                let host = thread::spawn(move || {
+                    run_generation_host(
+                        host_control,
+                        &updates_tx,
+                        &host_current,
+                        &host_recovery,
+                        None,
+                    )
+                });
+                let (commands, commands_rx) = mpsc::channel();
+                let (receipts_tx, receipts) = mpsc::channel();
+                let relay = thread::spawn(move || {
+                    private_record_relay(relay_host, relay_guardian, &commands_rx, &receipts_tx)
+                });
+                Self {
+                    host: Some(host),
+                    relay: Some(relay),
+                    commands,
+                    receipts,
+                    recovery,
+                    updates,
+                    consumption_probe,
+                    current,
+                    guardian_control: Some(guardian_control),
+                }
+            }
+        }
+
+        impl Drop for ControlPlane {
+            fn drop(&mut self) {
+                lock_recovery(&self.recovery).deny();
+                self.consumption_probe.take();
+                if let Some(stream) = self.guardian_control.take() {
+                    let _ = stream.shutdown(Shutdown::Both);
+                }
+                for worker in [self.relay.take(), self.host.take()].into_iter().flatten() {
+                    match worker.join() {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => eprintln!("KEL143_RACE_RESCUE owner error: {error}"),
+                        Err(error) => eprintln!("KEL143_RACE_RESCUE thread panic: {error:?}"),
+                    }
+                }
+            }
+        }
+
+        fn await_initial_registration(
+            supervisor: &Supervisor,
+            current: &Mutex<Option<RegisteredPrimaryGeneration>>,
+        ) -> u32 {
+            let pid = match supervisor.recv_event(COLLECTION) {
+                Some(crate::SupervisorEvent::Started { pid, attempt: 1 }) => pid,
+                Some(event) => panic!("unexpected initial enrollment event: {event:?}"),
+                None => panic!("actual initial group registration absent"),
+            };
+            assert_eq!(
+                lock_generation(current).map(|generation| generation.group_pid),
+                Some(pid)
+            );
+            pid
+        }
+
+        struct CutFixture {
+            supervisor: Option<Supervisor>,
+            plane: ControlPlane,
+            phase_entered: Receiver<()>,
+            phase_release: Sender<()>,
+            cancelled: Arc<AtomicBool>,
+            no_effect: tempfile::TempDir,
+            initial_pid: u32,
+        }
+
+        impl CutFixture {
+            fn start(cut: DeliveryCut) -> Self {
+                let mut plane = ControlPlane::start(cut);
+                let guardian_control = plane
+                    .guardian_control
+                    .take()
+                    .expect("one guardian private stream");
+                let (phase_tx, phase_entered) = mpsc::channel();
+                let (phase_release, phase_rx) = mpsc::channel();
+                let mut factory_gate = None;
+                let mut lease_gate = None;
+                match cut {
+                    DeliveryCut::FullBeforeLease => {
+                        factory_gate = Some(PhaseGate {
+                            entered: phase_tx,
+                            release: phase_rx,
+                        });
+                    }
+                    DeliveryCut::LeaseBeforeSpawn => {
+                        lease_gate = Some(PhaseGate {
+                            entered: phase_tx,
+                            release: phase_rx,
+                        });
+                    }
+                    DeliveryCut::Zero | DeliveryCut::Partial => {}
+                }
+                let no_effect = tempfile::tempdir().expect("owned successor no-effect sentinel");
+                let successor_effect = no_effect.path().join("unexpected-g2-effect");
+                let initial_release = no_effect.path().join("g1-release");
+                let initial_release_for_child = initial_release.clone();
+                let mut calls = 0;
+                let command_factory = move |_app_link: &str| {
+                    calls += 1;
+                    let mut command = Command::new("/bin/sh");
+                    if calls == 1 {
+                        command.args([
+                            "-c",
+                            "printf KEL143_RACE_G1; while [ ! -e \"$1\" ]; do :; done; exit 1",
+                            "keld-race",
+                        ]);
+                        command.arg(&initial_release_for_child);
+                    } else {
+                        if let Some(gate) = &factory_gate {
+                            gate.wait()?;
+                        }
+                        command.args([
+                            "-c",
+                            "printf KEL143_RACE_BAD_G2; printf bad > \"$1\"; exit 0",
+                            "keld-race",
+                        ]);
+                        command.arg(&successor_effect);
+                    }
+                    Ok(command)
+                };
+                let cancelled = Arc::new(AtomicBool::new(false));
+                let supervisor = Supervisor::start_prepared(
+                    RestartPolicy::default(),
+                    ReturnedLeasePreparer {
+                        inner: GuardedPrimaryPreparer {
+                            command_factory,
+                            control: Arc::new(Mutex::new(GenerationControlPeer {
+                                stream: guardian_control,
+                                reader: GenerationControlReader::new(),
+                            })),
+                            host_unavailable: Arc::new(AtomicBool::new(false)),
+                            preparation_cancelled: Arc::clone(&cancelled),
+                        },
+                        gate: lease_gate,
+                    },
+                )
+                .expect("real initial Supervisor child with actual guarded preparation");
+                // Startup spawn precedes group enrollment. The production
+                // Started receipt follows actual child_spawned/host enrollment.
+                let initial_pid = await_initial_registration(&supervisor, &plane.current);
+                std::fs::write(initial_release, b"release-g1")
+                    .expect("release actual registered G1");
+                Self {
+                    supervisor: Some(supervisor),
+                    plane,
+                    phase_entered,
+                    phase_release,
+                    cancelled,
+                    no_effect,
+                    initial_pid,
+                }
+            }
+
+            fn release_after_clear(&self) -> GenerationControlRecord {
+                assert!(matches!(
+                    self.plane
+                        .receipts
+                        .recv_timeout(COLLECTION)
+                        .expect("actual Clear1"),
+                    RelayReceipt::ClearedOne
+                ));
+                assert!(lock_generation(&self.plane.current).is_none());
+                lock_recovery(&self.plane.recovery).arm();
+                match self
+                    .plane
+                    .receipts
+                    .recv_timeout(COLLECTION)
+                    .expect("actual host Prepared2 emission")
+                {
+                    RelayReceipt::PreparedTwo(record) => record,
+                    _ => panic!("unexpected protocol receipt before Prepared2"),
+                }
+            }
+
+            fn accept_actual_q(&self) {
+                lock_recovery(&self.plane.recovery).deny();
+                let (mut reader, mut writer) = liveness_pipe();
+                validate_liveness_bootstrap(&mut reader).expect("owned validated liveness pipe");
+                set_liveness_nonblocking(&reader, true).expect("active liveness poll");
+                let (mut ack_writer, mut ack_reader) = timed_pair();
+                writer
+                    .write_all(&[SUPERVISED_QUIT_ACCEPTED])
+                    .expect("actual Q byte");
+                let mut quit = false;
+                let mut orderly = false;
+                assert!(
+                    !observe_guarded_liveness(
+                        &mut reader,
+                        self.supervisor.as_ref().expect("Supervisor owner"),
+                        &mut quit,
+                        &mut orderly,
+                        &mut ack_writer,
+                        &self.cancelled
+                    )
+                    .expect("existing guardian Q handling")
+                );
+                let mut bytes = [0; 3];
+                ack_reader
+                    .read_exact(&mut bytes)
+                    .expect("actual KQA receipt");
+                assert_eq!(bytes, *b"KQA");
+                assert!(quit && !orderly);
+                lock_recovery(&self.plane.recovery).shutdown_acknowledged = true;
+            }
+
+            fn collect(
+                mut self,
+                cut: DeliveryCut,
+                response: &GenerationControlRecord,
+                began: Option<Instant>,
+            ) {
+                // All releases/joins precede assertions. The fixture Drop also
+                // releases every fence on failed collection or an unwind.
+                let supervisor = self.supervisor.as_ref().expect("Supervisor owner");
+                let (terminal, started_two) = collect_terminal_event(supervisor);
+                let outcome = supervisor.wait_for_outcome();
+                let current_pid = supervisor.current_pid();
+                let ledger = supervisor.crash_ledger();
+                let output = supervisor.output();
+                // wait_for_outcome observes completion; dropping this sole
+                // Supervisor joins its actual direct child/capture owner.
+                drop(self.supervisor.take());
+                let relay = self
+                    .plane
+                    .relay
+                    .take()
+                    .expect("one relay")
+                    .join()
+                    .expect("relay thread joins");
+                let host = self
+                    .plane
+                    .host
+                    .take()
+                    .expect("one actual host owner")
+                    .join()
+                    .expect("host thread joins");
+                let updates: Vec<_> = self.plane.updates.try_iter().collect();
+                let cleanup_receipts: Vec<_> = self.plane.receipts.try_iter().collect();
+                let (endpoint, _) = parse_app_link(
+                    std::str::from_utf8(&response.payload).expect("actual app link UTF8"),
+                )
+                .expect("actual minted locator");
+                let endpoint_gone = UnixStream::connect(endpoint).is_err();
+                let no_effect = !self.no_effect.path().join("unexpected-g2-effect").exists();
+                relay.expect("real control EOF forwarded after guardian-side owner drop");
+                host.expect("actual exact host lease cleanup completed before EOF success");
+                assert!(!started_two && current_pid.is_none());
+                assert!(lock_generation(&self.plane.current).is_none());
+                assert_eq!(ledger.self_termination_count, 1);
+                assert_eq!(
+                    ledger.last_self_termination.map(|entry| entry.pid),
+                    Some(self.initial_pid)
+                );
+                assert_gone(Some(self.initial_pid));
+                assert!(
+                    ledger
+                        .last_self_termination
+                        .is_some_and(|entry| entry.exit_code == Some(1))
+                );
+                assert!(output.stdout.contains("KEL143_RACE_G1"));
+                assert!(!output.stdout.contains("KEL143_RACE_BAD_G2") && no_effect);
+                assert!(updates.iter().any(|update| matches!(
+                    update,
+                    GuardedPrimaryUpdate::Role(RoleEvent::Provisioned { attempt: 2, .. })
+                )));
+                assert!(updates.iter().any(|update| matches!(
+                    update,
+                    GuardedPrimaryUpdate::Role(RoleEvent::Revoked {
+                        attempt: 2,
+                        cause: crate::role::RoleRevocationCause::Shutdown,
+                        ..
+                    })
+                )));
+                assert!(!updates.iter().any(|update| matches!(update, GuardedPrimaryUpdate::Bound(bound) if bound.attempt() == 2)));
+                assert!(!updates.iter().any(|update| matches!(
+                    update,
+                    GuardedPrimaryUpdate::Role(
+                        RoleEvent::Spawned { attempt: 2, .. }
+                            | RoleEvent::LinkBound { attempt: 2, .. }
+                    )
+                )));
+                assert!(endpoint_gone, "exact minted successor listener survived");
+                assert_cleanup_route(cut, &cleanup_receipts);
+                assert_cut_outcome(cut, &terminal, &outcome, began);
+                println!(
+                    "KEL143_PREPARED_CUT cut={cut:?} actual_mint=true q_ack=true exact_revoked=2 listener_absent={endpoint_gone} g2_effect_absent={no_effect} direct_child_reaped=true"
+                );
+            }
+        }
+
+        fn assert_cleanup_route(cut: DeliveryCut, receipts: &[RelayReceipt]) {
+            let revokes: Vec<_> = receipts
+                .iter()
+                .enumerate()
+                .filter_map(|(index, receipt)| match receipt {
+                    RelayReceipt::NormalRevokeTwo { request, response } => {
+                        Some((index, request, response))
+                    }
+                    _ => None,
+                })
+                .collect();
+            let clears: Vec<_> = receipts
+                .iter()
+                .enumerate()
+                .filter_map(|(index, receipt)| match receipt {
+                    RelayReceipt::NormalClearTwo { request, response } => {
+                        Some((index, request, response))
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                receipts
+                    .iter()
+                    .filter(|receipt| matches!(receipt, RelayReceipt::GuardianControlEof))
+                    .count(),
+                1,
+                "actual guardian control EOF absent/duplicated"
+            );
+            if matches!(
+                cut,
+                DeliveryCut::FullBeforeLease | DeliveryCut::LeaseBeforeSpawn
+            ) {
+                assert_eq!(
+                    revokes.len(),
+                    1,
+                    "normal lease Revoke2 request/ack missing or duplicated"
+                );
+                assert_eq!(
+                    clears.len(),
+                    1,
+                    "normal lease Clear2 request/ack missing or duplicated"
+                );
+                // Literal approved private wire fields are an independent
+                // oracle; changing production constants cannot change these.
+                let expected = [
+                    ControlFields {
+                        kind: 5,
+                        cause: 2,
+                        attempt: 2,
+                        pid: 0,
+                        payload_len: 0,
+                    },
+                    ControlFields {
+                        kind: 6,
+                        cause: 0,
+                        attempt: 2,
+                        pid: 0,
+                        payload_len: 0,
+                    },
+                    ControlFields {
+                        kind: 7,
+                        cause: 0,
+                        attempt: 2,
+                        pid: 0,
+                        payload_len: 0,
+                    },
+                    ControlFields {
+                        kind: 8,
+                        cause: 0,
+                        attempt: 2,
+                        pid: 0,
+                        payload_len: 0,
+                    },
+                ];
+                let actual = [revokes[0].1, revokes[0].2, clears[0].1, clears[0].2];
+                assert_eq!(
+                    actual,
+                    [&expected[0], &expected[1], &expected[2], &expected[3]]
+                );
+                assert!(
+                    revokes[0].0 < clears[0].0,
+                    "normal Clear2 acknowledgment preceded Revoke2 acknowledgment"
+                );
+            } else {
+                assert!(
+                    revokes.is_empty(),
+                    "unclaimed zero/partial cut acquired normal Revoke2 path"
+                );
+                assert!(
+                    clears.is_empty(),
+                    "unclaimed zero/partial cut acquired normal Clear2 path"
+                );
+                // Together with the separately asserted exact host-owned
+                // Revoked2/Shutdown and successful host join, actual EOF plus
+                // absent normal exchanges identifies the host EOF cleanup.
+            }
+        }
+
+        fn collect_terminal_event(supervisor: &Supervisor) -> (crate::SupervisorEvent, bool) {
+            let deadline = Instant::now() + COLLECTION;
+            let mut started_two = false;
+            let terminal = loop {
+                let remaining = deadline
+                    .checked_duration_since(Instant::now())
+                    .expect("bounded terminal event collection");
+                match supervisor.recv_event(remaining) {
+                    Some(crate::SupervisorEvent::Started { attempt: 2, .. }) => started_two = true,
+                    Some(
+                        event @ (crate::SupervisorEvent::Stopped
+                        | crate::SupervisorEvent::Failed { .. }),
+                    ) => break event,
+                    Some(_) => {}
+                    None => panic!("actual Supervisor terminal event absent"),
+                }
+            };
+            (terminal, started_two)
+        }
+
+        fn assert_cut_outcome(
+            cut: DeliveryCut,
+            terminal: &crate::SupervisorEvent,
+            outcome: &SupervisorOutcome,
+            began: Option<Instant>,
+        ) {
+            if cut == DeliveryCut::Partial {
+                assert!(
+                    began.expect("actual prefix write clock").elapsed()
+                        >= GUARDIAN_SHUTDOWN_DEADLINE
+                );
+                assert!(matches!(
+                    terminal,
+                    crate::SupervisorEvent::Failed { attempt: 2 }
+                ));
+                match outcome {
+                    SupervisorOutcome::Failed(error) => {
+                        assert_eq!(runtime_io_kind(error), Some(io::ErrorKind::TimedOut));
+                        assert!(!is_owned_preparation_interruption(error, 2));
+                        assert!(error.to_string().contains("read deadline"));
+                    }
+                    other => panic!("partial Prepared timeout was hidden: {other:?}"),
+                }
+            } else {
+                assert!(matches!(terminal, crate::SupervisorEvent::Stopped));
+                assert!(matches!(outcome, SupervisorOutcome::Stopped));
+            }
+        }
+
+        impl Drop for CutFixture {
+            fn drop(&mut self) {
+                lock_recovery(&self.plane.recovery).deny();
+                self.plane.consumption_probe.take();
+                if let Some(supervisor) = &self.supervisor {
+                    supervisor.shutdown();
+                }
+                self.cancelled.store(true, Ordering::Release);
+                let _ = self.phase_release.send(());
+                let _ = self.plane.commands.send(RelayCommand::AwaitClosure);
+                drop(self.supervisor.take());
+            }
+        }
+
+        fn run_delivery_cut(cut: DeliveryCut) {
+            let mut fixture = CutFixture::start(cut);
+            let response = fixture.release_after_clear();
+            let mut began = None;
+            match cut {
+                DeliveryCut::Zero => {
+                    fixture.accept_actual_q();
+                    fixture
+                        .plane
+                        .commands
+                        .send(RelayCommand::AwaitClosure)
+                        .expect("zero-byte closure collection");
+                }
+                DeliveryCut::Partial => {
+                    fixture
+                        .plane
+                        .commands
+                        .send(RelayCommand::Prefix)
+                        .expect("one canonical prefix");
+                    began = match fixture
+                        .plane
+                        .receipts
+                        .recv_timeout(COLLECTION)
+                        .expect("actual prefix write receipt")
+                    {
+                        RelayReceipt::PrefixSent(time) => Some(time),
+                        _ => panic!("unexpected prefix receipt"),
+                    };
+                    let deadline = Instant::now() + COLLECTION;
+                    loop {
+                        if rustix::io::ioctl_fionread(
+                            fixture
+                                .plane
+                                .consumption_probe
+                                .as_ref()
+                                .expect("observation alias"),
+                        )
+                        .expect("existing safe available-byte primitive")
+                            == 0
+                        {
+                            break;
+                        }
+                        assert!(
+                            Instant::now() < deadline,
+                            "valid prefix not consumed by sole control reader"
+                        );
+                        thread::yield_now();
+                    }
+                    drop(fixture.plane.consumption_probe.take());
+                    fixture.accept_actual_q();
+                    fixture
+                        .plane
+                        .commands
+                        .send(RelayCommand::AwaitClosure)
+                        .expect("partial suffix remains withheld until actual failure/EOF");
+                }
+                DeliveryCut::FullBeforeLease | DeliveryCut::LeaseBeforeSpawn => {
+                    fixture
+                        .plane
+                        .commands
+                        .send(RelayCommand::Full)
+                        .expect("full canonical Prepared2 release");
+                    fixture
+                        .phase_entered
+                        .recv_timeout(COLLECTION)
+                        .expect("exact factory/returned-lease boundary");
+                    fixture.accept_actual_q();
+                    fixture
+                        .phase_release
+                        .send(())
+                        .expect("release only after actual Q ACK");
+                }
+            }
+            fixture.collect(cut, &response, began);
+        }
+
+        #[test]
+        fn prepared_delivery_zero_bytes_retires_exact_unclaimed_host_lease() {
+            run_delivery_cut(DeliveryCut::Zero);
+        }
+
+        #[test]
+        fn prepared_delivery_partial_prefix_keeps_framing_clock_and_typed_timeout() {
+            run_delivery_cut(DeliveryCut::Partial);
+        }
+
+        #[test]
+        fn prepared_delivery_full_before_lease_uses_normal_supervisor_revoke() {
+            run_delivery_cut(DeliveryCut::FullBeforeLease);
+        }
+
+        #[test]
+        fn prepared_delivery_post_lease_pre_spawn_uses_normal_supervisor_revoke() {
+            run_delivery_cut(DeliveryCut::LeaseBeforeSpawn);
+        }
+
+        struct RetiredOwner {
+            guardian: Option<UnixStream>,
+            recovery: Arc<Mutex<RecoveryState>>,
+            updates: Receiver<GuardedPrimaryUpdate>,
+            worker: Option<JoinHandle<Result<(), RuntimeError>>>,
+        }
+
+        impl RetiredOwner {
+            fn stream(&mut self) -> &mut UnixStream {
+                self.guardian.as_mut().expect("retained private peer")
+            }
+
+            fn join(&mut self) -> Result<Vec<GuardedPrimaryUpdate>, RuntimeError> {
+                self.worker
+                    .take()
+                    .expect("one actual host owner")
+                    .join()
+                    .map_err(|_| {
+                        lifecycle_error(
+                            "test actual mint owner join",
+                            io::Error::other("owner panicked"),
+                        )
+                    })??;
+                Ok(self.updates.try_iter().collect())
+            }
+        }
+
+        impl Drop for RetiredOwner {
+            fn drop(&mut self) {
+                lock_recovery(&self.recovery).deny();
+                self.guardian.take();
+                if let Some(worker) = self.worker.take() {
+                    match worker.join() {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => eprintln!("KEL143_MINT_RESCUE owner error: {error}"),
+                        Err(error) => eprintln!("KEL143_MINT_RESCUE panic: {error:?}"),
+                    }
+                }
+            }
+        }
+
+        fn prepare_retired_owner(fence: Option<GenerationProvisionFence>) -> RetiredOwner {
+            let (host, guardian) = timed_pair();
+            let (updates_tx, updates_rx) = mpsc::channel();
+            let current = Arc::new(Mutex::new(None));
+            let recovery = Arc::new(Mutex::new(RecoveryState::new()));
+            lock_recovery(&recovery).arm();
+            let state = Arc::clone(&recovery);
+            let worker = thread::spawn(move || {
+                run_generation_host(host, &updates_tx, &current, &state, fence.as_ref())
+            });
+            let mut owner = RetiredOwner {
+                guardian: Some(guardian),
+                recovery,
+                updates: updates_rx,
+                worker: Some(worker),
+            };
+            write_generation_control(
+                owner.stream(),
+                &GenerationControlRecord::new(CONTROL_PREPARE, 1),
+            )
+            .expect("actual Prepare1");
+            assert_eq!(
+                receive_record(owner.stream())
+                    .expect("actual Prepared1")
+                    .kind,
+                CONTROL_PREPARED
+            );
+            for (kind, expected) in [
+                (CONTROL_REVOKE, CONTROL_REVOKED),
+                (CONTROL_CLEAR, CONTROL_CLEARED),
+            ] {
+                let record = if kind == CONTROL_REVOKE {
+                    GenerationControlRecord::new(kind, 1)
+                        .with_cause(RevocationCause::AdmissionFailed)
+                } else {
+                    GenerationControlRecord::new(kind, 1)
+                };
+                write_generation_control(owner.stream(), &record)
+                    .expect("actual retired predecessor transition");
+                assert_eq!(
+                    receive_record(owner.stream())
+                        .expect("actual predecessor acknowledgment")
+                        .kind,
+                    expected
+                );
+            }
+            owner
+        }
+
+        #[test]
+        fn generation_host_provision_mutex_orders_actual_mint_and_denial() {
+            let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+            let (release_tx, release_rx) = mpsc::channel();
+            let mut owner = prepare_retired_owner(Some(GenerationProvisionFence {
+                attempt: 2,
+                entered: entered_tx,
+                release: release_rx,
+            }));
+            let recovery = Arc::clone(&owner.recovery);
+            lock_recovery(&recovery).arm();
+            write_generation_control(
+                owner.stream(),
+                &GenerationControlRecord::new(CONTROL_PREPARE, 2),
+            )
+            .expect("actual Prepare2");
+            let entered = entered_rx.recv_timeout(COLLECTION);
+            // This is an independent lock observable while actual host mint is
+            // fenced. The fault releases the guard before this same fence.
+            let denial_won_before_mint = match recovery.try_lock() {
+                Ok(mut state) => {
+                    state.deny();
+                    true
+                }
+                Err(TryLockError::WouldBlock) => false,
+                Err(TryLockError::Poisoned(error)) => {
+                    error.into_inner().deny();
+                    true
+                }
+            };
+            let released = release_tx.send(());
+            let response = receive_record(owner.stream());
+            let events_at_mint: Vec<_> = owner.updates.try_iter().collect();
+            lock_recovery(&recovery).deny();
+            let mut listener_was_live = false;
+            let mut listener_gone = false;
+            if let Ok(response) = &response {
+                let (endpoint, _) = parse_app_link(
+                    std::str::from_utf8(&response.payload).expect("actual app link UTF8"),
+                )
+                .expect("actual minted locator");
+                listener_was_live = UnixStream::connect(endpoint).is_ok();
+                for (kind, expected) in [
+                    (CONTROL_REVOKE, CONTROL_REVOKED),
+                    (CONTROL_CLEAR, CONTROL_CLEARED),
+                ] {
+                    let record = if kind == CONTROL_REVOKE {
+                        GenerationControlRecord::new(kind, 2).with_cause(RevocationCause::Shutdown)
+                    } else {
+                        GenerationControlRecord::new(kind, 2)
+                    };
+                    write_generation_control(owner.stream(), &record)
+                        .expect("actual successor cleanup transition");
+                    assert_eq!(
+                        receive_record(owner.stream())
+                            .expect("actual successor cleanup acknowledgment")
+                            .kind,
+                        expected
+                    );
+                }
+                listener_gone = UnixStream::connect(endpoint).is_err();
+            }
+            lock_recovery(&recovery).shutdown_acknowledged = true;
+            owner.guardian.take();
+            let joined = owner.join();
+            entered.expect("actual pre-mint owner fence reached");
+            released.expect("release actual mint fence before assertions");
+            let response = response.expect("actual owner minted matching Prepared2");
+            assert_eq!((response.kind, response.attempt), (CONTROL_PREPARED, 2));
+            let after_cleanup =
+                joined.expect("actual host owner joins after exact cleanup and attributed EOF");
+            assert!(after_cleanup.iter().any(|update| matches!(
+                update,
+                GuardedPrimaryUpdate::Role(RoleEvent::Revoked {
+                    attempt: 2,
+                    cause: crate::role::RoleRevocationCause::Shutdown,
+                    ..
+                })
+            )));
+            assert!(events_at_mint.iter().any(|update| matches!(
+                update,
+                GuardedPrimaryUpdate::Role(RoleEvent::Provisioned { attempt: 2, .. })
+            )));
+            assert!(listener_was_live && listener_gone);
+            println!(
+                "KEL143_MINT_FENCE denied_before_actual_mint={denial_won_before_mint} actual_provisioned=2 listener_was_live={listener_was_live} listener_absent={listener_gone}"
+            );
+            assert!(
+                !denial_won_before_mint,
+                "actual mint followed observed denial at the shared pre-mint fence"
+            );
+        }
+
+        #[test]
+        fn generation_host_denial_winner_has_no_successor_locator() {
+            let mut owner = prepare_retired_owner(None);
+            let recovery = Arc::clone(&owner.recovery);
+            {
+                let mut state = lock_recovery(&recovery);
+                state.deny();
+                state.arm();
+                state.shutdown_acknowledged = true;
+            }
+            write_generation_control(
+                owner.stream(),
+                &GenerationControlRecord::new(CONTROL_PREPARE, 2),
+            )
+            .expect("actual denied Prepare2");
+            // Draining EOF is the actual owner's final processing witness;
+            // absence during a guessed timed interval would not establish it.
+            owner
+                .stream()
+                .shutdown(Shutdown::Write)
+                .expect("real private request EOF after complete Prepare2");
+            let updates = owner
+                .join()
+                .expect("actual denied host owner joins after resource-free attributed completion");
+            assert!(!updates.iter().any(|update| matches!(
+                update,
+                GuardedPrimaryUpdate::Role(RoleEvent::Provisioned { attempt: 2, .. })
+            )));
+            let closure =
+                receive_record(owner.stream()).expect_err("denial fabricated Prepared2 locator");
+            assert_eq!(
+                runtime_io_kind(&closure),
+                Some(io::ErrorKind::UnexpectedEof)
+            );
+            println!(
+                "KEL143_MINT_FENCE denial_winner=true successor_locator=false actual_owner_eof=true"
+            );
+        }
     }
 
     fn long_running_command() -> Command {
