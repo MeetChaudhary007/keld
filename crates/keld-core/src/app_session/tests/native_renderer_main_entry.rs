@@ -28,30 +28,6 @@ use observation::{JointInputs, PageReports, assert_document};
 use crate::NATIVE_RENDERER_CASE as CASE;
 
 pub(super) fn run_main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.iter().any(|arg| arg == "--list") {
-        assert_eq!(args, ["--list"], "exact joint discovery");
-        println!("{CASE}: test\n\n1 test, 0 benchmarks");
-        return;
-    }
-    if args.is_empty() {
-        println!(
-            "{CASE} ... ignored, explicit physical joint lane\ntest result: ok. 0 passed; 0 failed; 1 ignored;"
-        );
-        return;
-    }
-    assert!(args.iter().any(|arg| arg == CASE), "unknown joint selector");
-    assert!(
-        args.iter().any(|arg| arg == "--ignored") && args.iter().any(|arg| arg == "--exact"),
-        "physical joint execution requires exact ignored selection"
-    );
-    assert!(
-        args.iter().all(|arg| matches!(
-            arg.as_str(),
-            CASE | "--exact" | "--ignored" | "--nocapture" | "--test-threads=1"
-        )),
-        "unknown joint argument"
-    );
     run_joint();
     println!("test {CASE} ... ok\ntest result: ok. 1 passed; 0 failed;");
 }
