@@ -25,7 +25,7 @@ use std::time::Instant;
 mod observation;
 use observation::{JointInputs, PageReports, assert_document};
 
-const CASE: &str = "actual_renderer_native_held_same_document_recovers_g2";
+use crate::NATIVE_RENDERER_CASE as CASE;
 
 pub(super) fn run_main() {
     let args: Vec<String> = std::env::args().skip(1).collect();

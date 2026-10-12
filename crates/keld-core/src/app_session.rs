@@ -573,18 +573,15 @@ enum FsWorkerCompletion {
     },
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+#[cfg(target_os = "macos")]
 impl FsWorkerNativeState {
-    fn take_work(
+    fn handle_generation_command(
         &mut self,
-        #[cfg(target_os = "macos")] session: &FsDispatchSession,
+        session: &FsDispatchSession,
         command: FsWorkerCommand,
-        #[cfg(target_os = "macos")] retiring: &mut Option<(u32, SyncSender<FsWorkerCompletion>)>,
-        stop_requested: &mut bool,
-    ) -> Result<Option<FsWorkItem>, HostAppError> {
+        retiring: &mut Option<(u32, SyncSender<FsWorkerCompletion>)>,
+    ) -> Result<(), HostAppError> {
         match command {
-            FsWorkerCommand::Work(work) => Ok(Some(work)),
-            #[cfg(target_os = "macos")]
             FsWorkerCommand::Retire(attempt, reply) => {
                 if self.attempt != attempt || retiring.is_some() {
                     return Err(app_detail(
@@ -594,9 +591,8 @@ impl FsWorkerNativeState {
                 }
                 session.close_admission()?;
                 *retiring = Some((attempt, reply));
-                Ok(None)
+                Ok(())
             }
-            #[cfg(target_os = "macos")]
             FsWorkerCommand::Prepare {
                 retired,
                 attempt,
@@ -615,16 +611,15 @@ impl FsWorkerNativeState {
                     attempt,
                     result,
                 });
-                Ok(None)
+                Ok(())
             }
-            FsWorkerCommand::Stop => {
-                *stop_requested = true;
-                Ok(None)
-            }
+            FsWorkerCommand::Work(_) | FsWorkerCommand::Stop => Err(app_detail(
+                "filesystem generation command",
+                "work and stop commands belong to the worker loop",
+            )),
         }
     }
 
-    #[cfg(target_os = "macos")]
     fn prepare_generation(
         &mut self,
         session: &FsDispatchSession,
@@ -4105,6 +4100,8 @@ impl GuardianOwner {
                                 .as_ref()
                                 .is_some_and(|recovery| !recovery.released)
                             {
+                                guardian.deny_recovery();
+                                let _ = window_commands.send(AppWindowCommand::Fatal);
                                 return Err(app_detail(
                                     "filesystem recovery",
                                     "overlapping native retirement attempts",
@@ -6571,16 +6568,17 @@ fn run_fs_worker(
             Err(RecvTimeoutError::Timeout) => continue,
             Err(RecvTimeoutError::Disconnected) => return Ok(()),
         };
-        let Some(work) = native.take_work(
+        let work = match command {
+            FsWorkerCommand::Work(work) => work,
+            FsWorkerCommand::Stop => {
+                stop_requested = true;
+                continue;
+            }
             #[cfg(target_os = "macos")]
-            &session,
-            command,
-            #[cfg(target_os = "macos")]
-            &mut retiring,
-            &mut stop_requested,
-        )?
-        else {
-            continue;
+            generation_command => {
+                native.handle_generation_command(&session, generation_command, &mut retiring)?;
+                continue;
+            }
         };
         let next_failure = run_fs_work_item(
             &native,
