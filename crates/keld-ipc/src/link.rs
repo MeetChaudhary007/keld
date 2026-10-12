@@ -210,6 +210,8 @@ fn ensure_payload_len(len: usize) -> Result<(), IpcError> {
 /// deadline (`KELD-IPC-006`) when the stream has an I/O timeout set.
 pub fn read_frame<S: Read>(stream: &mut S) -> Result<(FrameHeader, Vec<u8>), IpcError> {
     let mut header_bytes = [0u8; HEADER_LEN];
+    #[cfg(test)]
+    report_test_read_entry();
     stream.read_exact(&mut header_bytes)?;
     let header = FrameHeader::decode(&header_bytes)?;
     let len = usize::try_from(header.len).map_err(|_| IpcError::PayloadTooLarge)?;
@@ -1455,17 +1457,28 @@ mod tests {
     #[test]
     fn shutdown_app_link_unblocks_blocked_read() {
         let (mut reader, writer) = connected_pair();
+        let (entry_tx, entry_rx) = mpsc::channel();
         let (done_tx, done_rx) = mpsc::channel();
-        thread::spawn(move || {
+        let worker = thread::spawn(move || {
+            set_test_read_entry_witness(Some(entry_tx));
             let result = read_frame(&mut reader);
+            set_test_read_entry_witness(None);
             let _ = done_tx.send(result);
         });
-        writer
-            .shutdown_app_link()
-            .expect("shutdown both directions");
-        let result = done_rx
-            .recv_timeout(Duration::from_secs(2))
-            .expect("shutdown must unblock read_frame; timeout means the read leaked");
+        // Observe the Rust read boundary before starting the shutdown clock.
+        // This witnesses reader startup, not kernel entry or a blocked syscall.
+        let entry = entry_rx.recv_timeout(Duration::from_secs(2));
+        let shutdown = writer.shutdown_app_link();
+        // Preserve the two-second result deadline after the API returns.
+        let result = done_rx.recv_timeout(Duration::from_secs(2));
+        // Close the sole peer owner before joining, including a failed/no-op
+        // shutdown. Cleanup cannot replace the already-stored result timeout.
+        drop(writer);
+        let joined = worker.join();
+        shutdown.expect("shutdown both directions");
+        let result = result.expect("shutdown reader result was not published within two seconds");
+        entry.expect("read_frame startup witness missing");
+        joined.expect("reader thread panicked");
         let err = result.expect_err("shutdown is not a frame");
         assert!(
             matches!(err, IpcError::Io(ref e) if matches!(
