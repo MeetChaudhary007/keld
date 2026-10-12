@@ -125,11 +125,11 @@ Do not touch synced `sources/`, workspace manifests, dependencies, unsafe allowl
 
 ## 6. Tasks
 
-- [ ] **T0 contract approval.** Root independently refutes this exact draft, reviews architecture/permission/public-surface/private-wire implications, refreshes prerequisite and KEL-117/118 dispositions, then obtains exact-content child approval. No production lifecycle implementation begins from draft status.
+- [x] **T0 contract approval.** Exact-content approval is recorded in comment `3961f183-3e14-412f-a849-0525b6762727`; predecessor and exclusive source-owner entry admission after review/refutation and prerequisite reconciliation is recorded in comment `0a9ecffb-45ec-43f1-ba24-b03f81a3fd66`. No production lifecycle implementation begins from draft status.
 - [ ] **T1 atomic lifecycle change.** Land the smallest combined core/runtime broker retirement and preparation-release change with failure-first schedules and negative controls. Preserve all current guards and accepted-Quit regressions.
 - [ ] **T2 real Mac product evidence.** Exercise the approved held-call and ordinary same-document recovery cases through the actual renderer/API/native route, then ordered Quit/reap and next launch. Complete only the acceptance rows actually proved.
 
-KEL-140/KEL-142 exact product artifacts and ownership admission remain entry requirements; this draft does not assert they are currently satisfied. T1/T2 cannot close KEL-143 on source-only or fixture-only evidence.
+KEL-140/KEL-142 exact product artifacts and ownership admission remain entry requirements; their admission for this implementation is recorded in comment `0a9ecffb-45ec-43f1-ba24-b03f81a3fd66`. T1/T2 cannot close KEL-143 on source-only or fixture-only evidence.
 
 ## 7. Test plan and first falsifiers
 
@@ -155,6 +155,6 @@ Architecture/spec: required for exact child content, broker lifetime/root resele
 
 No performance claim. Recovery repeats existing cold retained-root preparation after old destruction and uses the same bounded native worker. The steady-state guard/kipc allow path gains no additional authorization, parser, queue or native worker. Capture recovery duration/resource census if the implementation changes an owned budget; an unbounded native stall is a correctness limitation, not benchmark success.
 
-## 10. Approval and remaining entry gate
+## 10. Approval and admitted implementation entry
 
-Exact-content child approval is recorded above after independent review and refutation. It covers generation broker lifetime and explicit anchor-object reselection, asynchronous owner completion, phase/attempt-safe reuse of the existing arm seam, runtime denial/provision serialization before core shutdown acceptance, attributed guardian survival until host EOF, and the explicitly excluded successor zero-byte native waiting phase. Approval satisfies KEL-139 lines 58–61; exact predecessor and ownership admission remain separate gates. Production lifecycle edits cannot begin until those entry predicates are admitted. Approval establishes no native acceptance or merge authorization.
+Exact-content child approval is recorded above after independent review and refutation. It covers generation broker lifetime and explicit anchor-object reselection, asynchronous owner completion, phase/attempt-safe reuse of the existing arm seam, runtime denial/provision serialization before core shutdown acceptance, attributed guardian survival until host EOF, and the explicitly excluded successor zero-byte native waiting phase. Approval satisfies KEL-139 lines 58–61; the separate exact predecessor and exclusive source-owner entry predicates were admitted in comment `0a9ecffb-45ec-43f1-ba24-b03f81a3fd66`. Production lifecycle implementation began after that admission. Approval establishes no native acceptance or merge authorization.
