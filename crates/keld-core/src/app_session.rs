@@ -8534,11 +8534,11 @@ mod tests {
             matches!(pending.poll(), Ok(None)),
             "on-time owner receipt became a false timeout"
         );
-        drop(client);
         fixture
             .router
             .shutdown()
             .expect("receipt deadline fixture cleanup");
+        drop(client);
     }
 
     /// One guarded primary router over a socket pair, with the FS worker held
