@@ -5545,7 +5545,7 @@ impl PrimaryRouterHandle {
         fs.has_outstanding_call_for(attempt)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "macos"))]
     #[cfg(not(keld_core_native_renderer_main))]
     fn begin_fs_call(
         &self,
@@ -6461,7 +6461,7 @@ impl PrimaryRouter {
     }
 }
 
-#[cfg(all(test, any(target_os = "macos", target_os = "linux", windows)))]
+#[cfg(all(test, target_os = "macos"))]
 #[cfg(not(keld_core_native_renderer_main))]
 fn prepare_fs_work(
     handle: &PrimaryRouterHandle,
