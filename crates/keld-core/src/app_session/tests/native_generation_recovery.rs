@@ -215,6 +215,42 @@ impl Inputs {
     }
 }
 
+#[path = "native_generation_actor.rs"]
+mod actor_owner;
+
+/// Reuses one held Native scope and the existing post-take gate in both owner cases.
+struct NativeWorkerSetup {
+    signals: NativeSignals,
+    gate: Arc<FsWorkerTestGate>,
+    gate_release: Sender<()>,
+    gate_taken: Receiver<()>,
+}
+
+fn native_worker_setup() -> NativeWorkerSetup {
+    let (setup, signals) = native_setup(true, false);
+    let (taken, gate_taken) = mpsc::sync_channel(8);
+    let (gate_release, release) = mpsc::channel();
+    let mut gate = FsWorkerTestGate {
+        taken,
+        release: Mutex::new(release),
+        before_entry: None,
+        initializer: Mutex::new(None),
+    };
+    setup(&mut gate);
+    // One G1 write, G2 write/read, and G2 denial. Releases never establish order.
+    for _ in 0..4 {
+        gate_release
+            .send(())
+            .expect("existing post-take gate release");
+    }
+    NativeWorkerSetup {
+        signals,
+        gate: Arc::new(gate),
+        gate_release,
+        gate_taken,
+    }
+}
+
 /// Releases test waits before router join and guardian EOF, also on an assertion unwind.
 struct Fixture {
     inputs: Inputs,
@@ -266,22 +302,12 @@ impl Fixture {
             SENTINEL
         );
         let snapshot = inputs.prepare_policy();
-        let (setup, signals) = native_setup(true, false);
-        let (taken, gate_taken) = mpsc::sync_channel(8);
-        let (gate_release, release) = mpsc::channel();
-        let mut gate = FsWorkerTestGate {
-            taken,
-            release: Mutex::new(release),
-            before_entry: None,
-            initializer: Mutex::new(None),
-        };
-        setup(&mut gate);
-        // One G1 write, G2 write/read, and G2 denial. Releases never establish order.
-        for _ in 0..4 {
-            gate_release
-                .send(())
-                .expect("existing post-take gate release");
-        }
+        let NativeWorkerSetup {
+            signals,
+            gate,
+            gate_release,
+            gate_taken,
+        } = native_worker_setup();
         let mut guardian = inputs.spawn_guardian();
         let bound = next_bound(&mut guardian, 1);
         let initial_generation = bound.generation();
@@ -295,7 +321,7 @@ impl Fixture {
             GuardianOwnerHandle { command_tx: owner },
             SessionShutdownState::new(),
             Some(&snapshot),
-            Some(Arc::new(gate)),
+            Some(gate),
         )
         .expect("real authenticated native router");
         // The paired test adapter defaults true; exercise the real initial arm/ACK seam.

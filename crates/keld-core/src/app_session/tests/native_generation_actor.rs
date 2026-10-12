@@ -1,0 +1,421 @@
+//! Actual owner-loop proof; Native/FSM census and window/document proof remain distinct.
+use super::super::super::super::{
+    AppWindowCommand, GUARDIAN_OWNER_REPLY_DEADLINE, GuardSnapshot, GuardianOwner,
+    GuardianOwnerCommand, GuardianOwnerHandle, PrimaryEchoCall, PrimaryRouter, PrimaryRouterHandle,
+    RecoveryArm, SessionShutdownState,
+};
+use super::super::{OBSERVATION_BOUND, sensor, support};
+use super::{
+    Inputs, NativeWorkerSetup, SENTINEL, assert_owned_groups, native_worker_setup, next_bound,
+    public_call, public_outcome, public_outcome_count, roundtrip,
+};
+use nix::errno::Errno;
+use nix::sys::signal::{Signal, killpg};
+use nix::unistd::Pid;
+use serde_json::json;
+use std::fs;
+use std::sync::atomic::Ordering;
+use std::sync::mpsc::Receiver;
+use std::sync::{Arc, mpsc};
+use std::thread;
+use std::time::Instant;
+
+const CASE: &str = "guardian-native-actor";
+const SELECTOR: &str = "app_session::tests::worker_link_e2e::native_observer_e2e::native_generation_recovery::actor_owner::actual_guardian_owner_services_commands_and_fs_completions_while_native_is_held";
+
+/// Test owns release/receipt custody; the actual owner alone owns the guardian and FSM.
+struct ActorFixture {
+    inputs: Inputs,
+    snapshot: GuardSnapshot,
+    native: NativeWorkerSetup,
+    router: Option<PrimaryRouter>,
+    owner: Option<GuardianOwner>,
+    window: Receiver<AppWindowCommand>,
+    guardian_group: u32,
+    initial_bun_group: u32,
+}
+
+impl ActorFixture {
+    fn start() -> Self {
+        let inputs = Inputs::supplied();
+        assert_eq!(
+            fs::read(&inputs.target).expect("Host-seeded target"),
+            SENTINEL
+        );
+        let snapshot = inputs.prepare_policy();
+        let native = native_worker_setup();
+        let mut guardian = inputs.spawn_guardian();
+        let bound = next_bound(&mut guardian, 1);
+        let guardian_group = guardian.guardian_pid();
+        let initial_bun_group = guardian.group_pid().expect("registered real G1");
+        assert_owned_groups(&guardian, initial_bun_group);
+        let (window, window_rx) = mpsc::channel();
+        let shutdown = SessionShutdownState::new();
+        let owner = GuardianOwner::start(guardian, window.clone(), None, shutdown.clone())
+            .expect("actual guardian owner loop");
+        let router = PrimaryRouter::start_with_fs_test_gate(
+            bound.into_stream(),
+            window,
+            owner.handle(),
+            shutdown,
+            Some(&snapshot),
+            Some(Arc::clone(&native.gate)),
+        )
+        .expect("actual native router");
+        router
+            .handle()
+            .recovery_armed
+            .store(false, Ordering::Release);
+        owner
+            .attach_router(router.handle())
+            .expect("actual owner attachment");
+        native
+            .signals
+            .initialized
+            .recv_timeout(OBSERVATION_BOUND)
+            .expect("existing Native scope installed on the real worker");
+        router
+            .handle()
+            .signal_ready()
+            .expect("actual initial arm and acknowledgment");
+        Self {
+            inputs,
+            snapshot,
+            native,
+            router: Some(router),
+            owner: Some(owner),
+            window: window_rx,
+            guardian_group,
+            initial_bun_group,
+        }
+    }
+
+    fn handle(&self) -> PrimaryRouterHandle {
+        self.router.as_ref().expect("owned router").handle()
+    }
+
+    fn owner_handle(&self) -> GuardianOwnerHandle {
+        self.owner.as_ref().expect("actual owner custody").handle()
+    }
+
+    fn assert_held(&self) {
+        assert!(
+            matches!(
+                self.native.signals.returned.try_recv(),
+                Err(mpsc::TryRecvError::Empty)
+            ),
+            "Native returned before explicit release"
+        );
+        let state = self
+            .snapshot
+            .fs
+            .state
+            .lock()
+            .expect("real Native accounting");
+        assert_eq!(state.in_flight, 1);
+        assert_eq!(
+            state.prepared_attempt,
+            Some(1),
+            "fresh broker appeared while Native was held"
+        );
+        drop(state);
+        assert_eq!(sensor::object_handle_count(&self.inputs.target), 1);
+        assert!(sensor::directory_handle_count(&self.inputs.allowed_root) > 0);
+        assert_eq!(
+            fs::read(&self.inputs.target).expect("held independent bytes"),
+            SENTINEL
+        );
+        assert!(
+            matches!(self.window.try_recv(), Err(mpsc::TryRecvError::Empty)),
+            "actual actor reported a window shutdown/fatal command"
+        );
+    }
+
+    fn finish(&mut self) {
+        let handle = self.handle();
+        assert!(handle.shutdown.reserve_cli_lease_lost());
+        handle
+            .cli_lease_lost()
+            .expect("existing ordered attributed shutdown tail");
+        assert_eq!(
+            self.window
+                .recv_timeout(OBSERVATION_BOUND)
+                .expect("existing tail UI wake"),
+            AppWindowCommand::Quit
+        );
+        self.router
+            .take()
+            .expect("one router owner")
+            .shutdown()
+            .expect("actual worker/readers join");
+        let fence = self
+            .native
+            .signals
+            .final_snapshot
+            .recv_timeout(OBSERVATION_BOUND)
+            .expect("actual Native final fence");
+        assert!(!fence.fixture_fault);
+        assert_eq!((fence.request_entries, fence.request_returns), (4, 4));
+        assert_eq!(sensor::directory_handle_count(&self.inputs.allowed_root), 0);
+        assert_eq!(sensor::object_handle_count(&self.inputs.target), 0);
+        self.owner
+            .take()
+            .expect("one guardian actor owner")
+            .shutdown()
+            .expect("actual guardian EOF, successful exit, owned reap and owner join");
+        for group in [self.initial_bun_group, self.guardian_group] {
+            let group = Pid::from_raw(i32::try_from(group).expect("diagnostic group fits"));
+            assert_eq!(
+                killpg(group, None::<Signal>),
+                Err(Errno::ESRCH),
+                "post-reap group remains (diagnostic only)"
+            );
+        }
+        assert!(
+            !self.inputs.stage_root.exists(),
+            "normal guardian stage cleanup absent"
+        );
+        println!(
+            "KELD_KEL143_ACTOR_CLEANUP entries=4 returns=4 roots=0 target_handles=0 owner_joined=true stage_absent=true"
+        );
+    }
+}
+
+impl Drop for ActorFixture {
+    fn drop(&mut self) {
+        if let Some(owner) = &self.owner {
+            owner.handle().deny_recovery();
+        }
+        if let Some(release) = self.native.signals.native_release.take() {
+            let _ = release.send(());
+        }
+        for _ in 0..4 {
+            let _ = self.native.gate_release.send(());
+        }
+        if let Some(router) = self.router.take() {
+            let _ = router.shutdown();
+        }
+        if let Some(owner) = self.owner.take() {
+            let _ = owner.shutdown();
+        }
+    }
+}
+
+/// The baton has at most two arm commands outstanding; the separate failure probe
+/// can add one test-issued command. Queue next arm before consuming the prior receipt.
+/// The actor's real reply send fences successive normal turns without an idle timeout.
+/// Dropping this receiver unblocks an actor reply before fixture fallback joins it.
+struct ActorTurns {
+    owner: GuardianOwnerHandle,
+    receipt: Receiver<Result<(), String>>,
+    completed: usize,
+}
+
+impl ActorTurns {
+    fn queue(owner: &GuardianOwnerHandle) -> Receiver<Result<(), String>> {
+        let (reply, receipt) = mpsc::sync_channel(0);
+        owner
+            .command_tx
+            .send(GuardianOwnerCommand::ArmRecovery(
+                RecoveryArm::Initial(1),
+                reply,
+            ))
+            .expect("queue existing duplicate arm command");
+        receipt
+    }
+
+    fn start(owner: GuardianOwnerHandle) -> Self {
+        let receipt = Self::queue(&owner);
+        Self {
+            owner,
+            receipt,
+            completed: 0,
+        }
+    }
+
+    fn advance(&mut self) {
+        let next = Self::queue(&self.owner);
+        let prior = std::mem::replace(&mut self.receipt, next);
+        prior
+            .recv_timeout(GUARDIAN_OWNER_REPLY_DEADLINE)
+            .expect("actual owner command reply while Native held/pending")
+            .expect("actual duplicate arm receipt");
+        self.completed += 1;
+    }
+}
+
+fn assert_old_return_and_broker_baseline(fixture: &mut ActorFixture) {
+    fixture
+        .native
+        .signals
+        .native_release
+        .take()
+        .expect("one Native release")
+        .send(())
+        .expect("existing Native Hold owner");
+    let returned = fixture
+        .native
+        .signals
+        .returned
+        .recv_timeout(OBSERVATION_BOUND)
+        .expect("actual Native normal return");
+    assert!(!returned.fixture_fault);
+    assert_eq!((returned.request_entries, returned.request_returns), (1, 1));
+    // An existing command receipt remains unconsumed: at most one normal turn
+    // can run here. A Retired receipt only queues Prepare; the next turn sends it.
+    // Observe the worker's actual old drop before resuming that next actor turn.
+    let deadline = Instant::now() + OBSERVATION_BOUND;
+    loop {
+        let state = fixture
+            .snapshot
+            .fs
+            .state
+            .lock()
+            .expect("real retirement metadata");
+        let retired = state.prepared_attempt.is_none() && state.in_flight == 0;
+        drop(state);
+        if retired {
+            break;
+        }
+        assert!(Instant::now() < deadline, "actual worker retirement absent");
+        thread::yield_now();
+    }
+    assert_eq!(sensor::object_handle_count(&fixture.inputs.target), 0);
+    assert_eq!(
+        sensor::directory_handle_count(&fixture.inputs.allowed_root),
+        0,
+        "actual old broker roots survive worker retirement"
+    );
+    assert_eq!(
+        fs::read(&fixture.inputs.target).expect("retired independent bytes"),
+        SENTINEL
+    );
+    println!("KELD_KEL143_ACTOR_OLD_BASELINE entries=1 returns=1 target_handles=0 root_handles=0");
+}
+
+fn observe_held_actor_retirement(
+    fixture: &ActorFixture,
+    turns: &mut ActorTurns,
+    old: &PrimaryEchoCall,
+) {
+    let handle = fixture.handle();
+    let revoked_by = Instant::now() + OBSERVATION_BOUND;
+    while handle.last_revoked_attempt.load(Ordering::Acquire) != 1 || handle.is_current(1) {
+        assert!(
+            Instant::now() < revoked_by,
+            "actual owner did not apply G1 Revoked"
+        );
+        turns.advance();
+    }
+    fixture.assert_held();
+    let replied_by = Instant::now() + GUARDIAN_OWNER_REPLY_DEADLINE;
+    let receipt = fixture
+        .owner_handle()
+        .request_fail_retired_generation(1)
+        .expect("existing retired-failure command");
+    let acknowledged = loop {
+        match receipt.try_recv() {
+            Ok(actual) => break actual.expect("actual held-state owner acknowledgment"),
+            Err(mpsc::TryRecvError::Empty) => turns.advance(),
+            Err(mpsc::TryRecvError::Disconnected) => panic!("actual actor lost failure receipt"),
+        }
+        assert!(
+            Instant::now() < replied_by,
+            "actor waited for Native before acknowledging"
+        );
+    };
+    assert!(acknowledged <= replied_by);
+    fixture.assert_held();
+    let retired_echo = old
+        .reply
+        .recv_timeout(OBSERVATION_BOUND)
+        .expect("one retired public-call outcome")
+        .expect_err("G1 pending echo must retire");
+    assert_eq!(retired_echo.code(), "KELD-CORE-037");
+    assert!(
+        matches!(old.reply.try_recv(), Err(mpsc::TryRecvError::Disconnected)),
+        "old public call received another outcome"
+    );
+    println!(
+        "KELD_KEL143_ACTOR_HELD_ACK attempt=1 native_entries=1 native_returns=0 actual_actor=true"
+    );
+}
+
+#[test]
+#[ignore = "explicit physical macOS source-bound actual guardian actor/native lane"]
+fn actual_guardian_owner_services_commands_and_fs_completions_while_native_is_held() {
+    if !support::is_native_child(CASE) {
+        support::isolated_guardian_case(CASE, SELECTOR);
+        return;
+    }
+    let mut fixture = ActorFixture::start();
+    let old = roundtrip(&fixture.handle(), "00000000000000000000000000003143");
+    fixture
+        .native
+        .gate_taken
+        .recv_timeout(OBSERVATION_BOUND)
+        .expect("actual G1 work taken");
+    let held = fixture
+        .native
+        .signals
+        .held
+        .recv_timeout(OBSERVATION_BOUND)
+        .expect("real Native after-walk hold");
+    assert!(!held.fixture_fault);
+    assert_eq!((held.request_entries, held.request_returns), (1, 0));
+    assert!(held.walk_entries > 0 && held.target_opens > 0);
+    fixture.assert_held();
+    fixture
+        .owner_handle()
+        .fail_generation(1)
+        .expect("actual owner requests G1 fault");
+    let mut turns = ActorTurns::start(fixture.owner_handle());
+    let handle = fixture.handle();
+    observe_held_actor_retirement(&fixture, &mut turns, &old);
+    assert_old_return_and_broker_baseline(&mut fixture);
+    let bound_by = Instant::now() + OBSERVATION_BOUND;
+    while !handle.is_current(2) {
+        assert!(
+            Instant::now() < bound_by,
+            "normal actor turns did not complete fresh recovery"
+        );
+        turns.advance();
+    }
+    let state = fixture
+        .snapshot
+        .fs
+        .state
+        .lock()
+        .expect("actual G2 preparation");
+    assert_eq!(state.prepared_attempt, Some(2));
+    assert_eq!(state.in_flight, 0);
+    drop(state);
+    assert_eq!(handle.last_revoked_attempt.load(Ordering::Acquire), 1);
+    assert!(sensor::directory_handle_count(&fixture.inputs.allowed_root) > 0);
+    let successor = roundtrip(&handle, "00000000000000000000000000003243");
+    assert_eq!(
+        public_outcome(&successor),
+        json!({"ok":true,"bytes":fixture.inputs.expected_content})
+    );
+    assert_eq!(
+        fs::read(&fixture.inputs.target).expect("independent G2 effect"),
+        fixture.inputs.expected_content
+    );
+    let denied = public_call(&handle, "00000000000000000000000000003244", "deny", 2);
+    let denied_outcome = public_outcome_count(&denied, 2);
+    assert_eq!(denied_outcome["ok"], false);
+    assert_eq!(denied_outcome["code"], "KELD-GUARD002");
+    assert_eq!(
+        fs::read(&fixture.inputs.outside).expect("independent denied sentinel"),
+        fixture.inputs.outside_content
+    );
+    println!(
+        "KELD_KEL143_ACTOR_G2 current=2 queued_command_turns={} allowed_exact_bytes=true denied_no_effect=true",
+        turns.completed
+    );
+    drop(turns); // Disconnect pending rendezvous before requesting/joining shutdown.
+    fixture.finish();
+    println!(
+        "KELD_AC7_CASE_DONE case={CASE} actual_actor=true normal_turn_completion=true window_document_claim=false"
+    );
+}

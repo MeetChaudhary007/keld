@@ -212,7 +212,11 @@ impl Observation {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
                         prepare_stream(&stream);
-                        let (path, body) = read_observation(&mut stream);
+                        let Some((path, body)) = read_observation(&mut stream) else {
+                            // Clean transport EOF before any request byte is not
+                            // an HTTP observation. Drop only this accepted peer.
+                            continue;
+                        };
                         match path.as_str() {
                             "/observe" => {
                                 let report: Value =
@@ -286,14 +290,14 @@ fn prepare_stream(stream: &TcpStream) {
         .expect("observer write kill switch");
 }
 
-fn read_observation(stream: &mut TcpStream) -> (String, Vec<u8>) {
+fn read_observation(stream: &mut TcpStream) -> Option<(String, Vec<u8>)> {
     read_observation_observing(stream, |_| {})
 }
 
 fn read_observation_observing(
     stream: &mut TcpStream,
     mut observe: impl FnMut(usize),
-) -> (String, Vec<u8>) {
+) -> Option<(String, Vec<u8>)> {
     let mut bytes = Vec::new();
     let mut chunk = [0_u8; 1024];
     let end = loop {
@@ -301,7 +305,15 @@ fn read_observation_observing(
             break offset + 4;
         }
         let read = stream.read(&mut chunk).expect("bounded observation header");
-        assert_ne!(read, 0, "observer peer closed before headers");
+        if read == 0 && bytes.is_empty() {
+            return None;
+        }
+        assert_ne!(
+            read,
+            0,
+            "observer peer closed after {} bytes before complete headers",
+            bytes.len()
+        );
         bytes.extend_from_slice(&chunk[..read]);
         assert!(bytes.len() <= 16 * 1024);
         observe(bytes.len());
@@ -330,7 +342,7 @@ fn read_observation_observing(
         .nth(1)
         .expect("request target")
         .to_owned();
-    (path, bytes[end..end + length].to_vec())
+    Some((path, bytes[end..end + length].to_vec()))
 }
 
 fn respond(stream: &mut TcpStream, body: &str) {
@@ -395,7 +407,8 @@ fn accepted_observation_stream_preserves_split_header_and_body() {
             progress
                 .send(count)
                 .expect("actual consumed TCP byte count");
-        });
+        })
+        .expect("complete split observation request");
         assert_eq!(path, "/observe");
         assert_eq!(actual, body);
         writer.join().expect("split-request writer completes");
@@ -431,5 +444,121 @@ fn await_byte_count(observed: &mpsc::Receiver<usize>, expected: usize) {
         if actual == expected {
             return;
         }
+    }
+}
+
+#[test]
+fn empty_observation_connection_is_not_request_or_worker_failure() {
+    let observation = Observation::bind();
+    let address = ("127.0.0.1", observation.port);
+    let empty = TcpStream::connect(address).expect("real empty TCP connection");
+    empty
+        .shutdown(std::net::Shutdown::Write)
+        .expect("clean EOF before any request byte");
+    drop(empty);
+
+    let report = serde_json::json!({"phase":"after-empty-connection","bytes":[0,255]});
+    let body = serde_json::to_vec(&report).expect("actual report bytes");
+    let mut client = TcpStream::connect(address).expect("next real observer connection");
+    prepare_stream(&client);
+    write!(
+        client,
+        "POST /observe HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    )
+    .expect("actual next request header");
+    client.write_all(&body).expect("actual next request body");
+    client
+        .shutdown(std::net::Shutdown::Write)
+        .expect("complete request EOF");
+    let mut response = Vec::new();
+    client
+        .read_to_end(&mut response)
+        .expect("bounded exact response");
+    assert_eq!(
+        response,
+        b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 8\r\nAccess-Control-Allow-Origin: *\r\nCache-Control: no-store\r\nConnection: close\r\n\r\nrecorded"
+    );
+    assert_eq!(
+        observation
+            .reports
+            .recv_timeout(EVENT_DEADLINE)
+            .expect("only complete report observed"),
+        report
+    );
+    assert!(
+        matches!(
+            observation.reports.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ),
+        "empty TCP connection became application evidence"
+    );
+    drop(observation); // Join the real listener owner; a panic cannot count as health.
+}
+
+#[test]
+fn empty_accepted_observation_does_not_consume_request_bytes() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("own empty-request listener");
+    let client = TcpStream::connect(listener.local_addr().expect("listener address"))
+        .expect("actual zero-byte client");
+    let (mut accepted, _) = listener.accept().expect("accepted exact empty peer");
+    prepare_stream(&accepted);
+    client
+        .shutdown(std::net::Shutdown::Write)
+        .expect("clean zero-byte EOF");
+    let mut consumed = Vec::new();
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        read_observation_observing(&mut accepted, |count| consumed.push(count))
+    }));
+    assert!(
+        outcome.is_ok(),
+        "clean empty transport close killed request reader"
+    );
+    assert!(
+        consumed.is_empty(),
+        "empty transport produced request bytes"
+    );
+}
+
+#[test]
+fn nonempty_incomplete_malformed_and_oversized_observations_still_reject() {
+    let oversized_header = vec![b'x'; 16 * 1024 + 1];
+    let controls: &[(&str, &[u8])] = &[
+        ("partial header", b"POST /observe HTTP/1.1\r\nContent-Len"),
+        (
+            "partial body",
+            b"POST /observe HTTP/1.1\r\nContent-Length: 3\r\n\r\nab",
+        ),
+        ("invalid header UTF-8", b"\xff\r\n\r\n"),
+        (
+            "invalid content length",
+            b"POST /observe HTTP/1.1\r\nContent-Length: nope\r\n\r\n",
+        ),
+        ("oversized header", &oversized_header),
+        (
+            "oversized declared body",
+            b"POST /observe HTTP/1.1\r\nContent-Length: 16384\r\n\r\n",
+        ),
+    ];
+    for (label, bytes) in controls {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("owned hostile request listener");
+        let mut client = TcpStream::connect(listener.local_addr().expect("listener address"))
+            .expect("actual hostile request peer");
+        let (mut accepted, _) = listener.accept().expect("accepted exact hostile peer");
+        prepare_stream(&accepted);
+        prepare_stream(&client);
+        thread::scope(|scope| {
+            let writer = scope.spawn(move || {
+                client.write_all(bytes).expect("bounded hostile bytes");
+                client
+                    .shutdown(std::net::Shutdown::Write)
+                    .expect("terminal hostile EOF");
+            });
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                read_observation(&mut accepted)
+            }));
+            writer.join().expect("hostile peer release/join");
+            assert!(outcome.is_err(), "accepted or ignored {label}");
+        });
     }
 }
