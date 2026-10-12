@@ -17,16 +17,19 @@ const OBSERVATION_BOUND: Duration = Duration::from_secs(5);
 const NATIVE_HOLD_BOUND: Duration = Duration::from_secs(10);
 
 pub(super) struct NativeSignals {
-    initialized: Receiver<()>,
+    pub(super) initialized: Receiver<()>,
     pub(super) held: Receiver<Snapshot>,
     pub(super) returned: Receiver<Snapshot>,
-    final_snapshot: Receiver<Snapshot>,
+    pub(super) final_snapshot: Receiver<Snapshot>,
     pub(super) native_release: Option<Sender<()>>,
     pub(super) pre_entry: Option<Receiver<()>>,
     pub(super) pre_release: Option<Sender<()>>,
 }
 
-fn native_setup(hold_native: bool, pre_entry: bool) -> (GuardedFsTestSetup, NativeSignals) {
+pub(super) fn native_setup(
+    hold_native: bool,
+    pre_entry: bool,
+) -> (GuardedFsTestSetup, NativeSignals) {
     let (initialized_tx, initialized) = mpsc::sync_channel(1);
     let (held_tx, held) = mpsc::sync_channel(1);
     let (returned_tx, returned) = mpsc::sync_channel(8);

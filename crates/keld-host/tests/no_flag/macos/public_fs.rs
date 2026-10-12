@@ -1181,6 +1181,150 @@ fn pid(report: &Value, key: &str) -> u32 {
     u32::try_from(report[key].as_u64().expect("reported PID")).expect("OS PID domain")
 }
 
+/// Root runs this owner alongside a Core/Runtime consumer; it starts no app.
+#[test]
+#[ignore = "Root-controlled staged public-FS fixture service; stdin finish after consumer DONE"]
+fn kel143_staged_public_fs_fixture_producer() {
+    use std::io::{BufRead as _, Write as _};
+    let receipt_path = std::path::PathBuf::from(
+        std::env::var("KELD_KEL143_FIXTURE_RECEIPT").expect("absolute Root-owned receipt path"),
+    );
+    assert!(
+        receipt_path.is_absolute(),
+        "fixture receipt must be absolute"
+    );
+    let fixture = PublicFsProject::new(Policy::Narrow);
+    let observation = Observation::bind_staged_fixture();
+    let prepared = fixture.prepare(0, observation.port);
+    assert_eq!(prepared.exercise, Exercise::RendererPointer);
+    assert!(prepared.recovery.is_none() && prepared.natural.is_none());
+    // Existing regular object gives Core's Native Hold an actual target handle.
+    // Distinct bytes make a no-op write differ from expectedContent.
+    fs::write(&prepared.target, b"unchanged").expect("seed owned retained-file target");
+    let receipt = staged_fixture_receipt(&prepared, observation.port, &fixture);
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&receipt_path)
+        .expect("fresh immutable fixture receipt");
+    file.write_all(&serde_json::to_vec_pretty(&receipt).expect("fixture receipt JSON"))
+        .expect("write source-bound fixture receipt");
+    file.flush().expect("publish completed fixture receipt");
+    drop(file);
+    println!(
+        "KELD_KEL143_STAGED_FIXTURE_READY receipt={}",
+        receipt_path.display()
+    );
+    let mut command = String::new();
+    assert_ne!(
+        std::io::stdin()
+            .lock()
+            .read_line(&mut command)
+            .expect("Root finish control"),
+        0,
+        "producer stdin closed before actual consumer completion"
+    );
+    assert_eq!(
+        command.trim(),
+        "finish",
+        "only Root consumer-finished control"
+    );
+    // Consumer Q/EOF owns normal removal; producer Drop cannot supply proof.
+    assert!(
+        matches!(fs::symlink_metadata(prepared.stage.root()), Err(error)
+        if error.kind() == std::io::ErrorKind::NotFound),
+        "consumer retained stage before producer fallback"
+    );
+    while let Ok(report) = observation.reports.try_recv() {
+        eprintln!("KELD_KEL143_STAGED_FIXTURE_OBSERVATION {report}");
+    }
+    drop(observation);
+    println!(
+        "KELD_KEL143_STAGED_FIXTURE_DONE receipt={}",
+        receipt_path.display()
+    );
+}
+
+fn staged_fixture_receipt(
+    prepared: &PreparedLaunch,
+    observer_port: u16,
+    fixture: &PublicFsProject,
+) -> Value {
+    use std::io::Write as _;
+    let captured_sources: [(&str, &[u8]); 6] = [
+        ("hostFixture", include_bytes!("public_fs.rs")),
+        ("hostObserver", include_bytes!("public_fs/observer.rs")),
+        (
+            "core",
+            include_bytes!("../../../../keld-core/src/app_session.rs"),
+        ),
+        (
+            "runtimeGuardian",
+            include_bytes!("../../../../keld-runtime/src/macos_guardian.rs"),
+        ),
+        (
+            "runtimeLibrary",
+            include_bytes!("../../../../keld-runtime/src/lib.rs"),
+        ),
+        (
+            "nativeFs",
+            include_bytes!("../../../../keld-native/src/fs.rs"),
+        ),
+    ];
+    let mut compiled_source_hashes = serde_json::Map::new();
+    for (key, bytes) in captured_sources {
+        let mut captured_file = tempfile::NamedTempFile::new_in(fixture.owned_root())
+            .expect("owned compile-time source bytes");
+        captured_file
+            .write_all(bytes)
+            .expect("materialize captured source bytes");
+        captured_file
+            .flush()
+            .expect("publish captured source bytes");
+        compiled_source_hashes.insert(
+            key.to_owned(),
+            json!(project::file_digest(captured_file.path())),
+        );
+    }
+    let stage = &prepared.stage;
+    let allowed = prepared.target.parent().expect("owned allowed root");
+    json!({
+        "schema":"keld.kel143.staged-public-fs-fixture/v1",
+        "producerPid":std::process::id(),
+        "stagedHost":stage.host(), "stageRoot":stage.root(),
+        "entryRelative":"src/main.ts", "allowedRoot":allowed, "target":prepared.target,
+        "expectedContent":CONTENT, "initialContent":b"unchanged", "observerPort":observer_port,
+        "outside":fixture.outside,
+        "outsideContent":fs::read(&fixture.outside).expect("captured existing outside sentinel bytes"),
+        "outsideIdentity":staged_fixture_identity(&fixture.outside),
+        "application":{"automaticComponent":false,"recoveryInputs":null,"handlerOnlyHold":false},
+        "stageIdentity":staged_fixture_identity(stage.root()),
+        "allowedRootIdentity":staged_fixture_identity(allowed),
+        "targetIdentity":staged_fixture_identity(&prepared.target),
+        "permissionsIdentity":staged_fixture_identity(&stage.root().join("keld.permissions.jsonc")),
+        "permissionsSha256":prepared.digest,
+        "entryIdentity":staged_fixture_identity(&stage.root().join("src/main.ts")),
+        "entrySha256":project::file_digest(&stage.root().join("src/main.ts")),
+        "transportIdentity":staged_fixture_identity(&stage.root().join("src/kipc-transport.ts")),
+        "stagedHostIdentity":staged_fixture_identity(stage.host()), "stagedHostSha256":prepared.host_digest,
+        "compiledSourceHashes":compiled_source_hashes,
+        "lifetime":"Root keeps producer alive; consumer performs Q then EOF/shutdown/DONE; stdin finish last",
+        "claims":"ordinary staged data only; no app spawn/Ready/arm/Q/native action by producer"
+    })
+}
+
+fn staged_fixture_identity(path: &Path) -> Value {
+    use std::os::unix::fs::MetadataExt as _;
+    let metadata = fs::symlink_metadata(path).expect("owned fixture object identity");
+    assert!(
+        metadata.is_file() || metadata.is_dir(),
+        "fixture object must be regular/directory"
+    );
+    json!({"path":path,"dev":metadata.dev(),"ino":metadata.ino(),
+        "kind":if metadata.is_file() { "file" } else { "directory" },
+        "sha256":metadata.is_file().then(|| project::file_digest(path))})
+}
+
 fn spawn_shipping_host(stage: &keld_cli::boot::DevBootStage) -> ShippingLaunchCleanup {
     let child = Command::new(stage.host())
         .current_dir(stage.root())

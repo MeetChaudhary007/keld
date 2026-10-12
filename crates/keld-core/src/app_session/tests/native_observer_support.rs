@@ -228,9 +228,10 @@ fn spawn_native_child(
     root: &Path,
     stdout: &File,
     stderr: &File,
-    observer: &ProcessObserver,
+    observer: Option<&ProcessObserver>,
 ) -> NativeChild {
-    let child = Command::new(std::env::current_exe().expect("exact native test binary"))
+    let mut command = Command::new(std::env::current_exe().expect("exact native test binary"));
+    command
         .args([
             "--exact",
             selector,
@@ -241,8 +242,6 @@ fn spawn_native_child(
         .env(CHILD_ENV, case)
         .env(ROOT_ENV, root)
         .env("TMPDIR", root)
-        .env(OBSERVER_SOCKET_ENV, observer.socket())
-        .env(OBSERVER_TOKEN_ENV, observer.token())
         .stdin(Stdio::null())
         .stdout(Stdio::from(
             stdout.try_clone().expect("native stdout clone"),
@@ -250,25 +249,33 @@ fn spawn_native_child(
         .stderr(Stdio::from(
             stderr.try_clone().expect("native stderr clone"),
         ))
-        .process_group(0)
-        .spawn()
-        .expect("spawn exact native proof child");
+        .process_group(0);
+    if let Some(observer) = observer {
+        command
+            .env(OBSERVER_SOCKET_ENV, observer.socket())
+            .env(OBSERVER_TOKEN_ENV, observer.token());
+    }
+    let child = command.spawn().expect("spawn exact native proof child");
     let child = NativeChild::own(child).expect("verify exact spawned native group");
-    assert_ne!(
-        child.group,
-        observer.group(),
-        "observer must not enter the target group"
-    );
+    if let Some(observer) = observer {
+        assert_ne!(
+            child.group,
+            observer.group(),
+            "observer must not enter the target group"
+        );
+    }
     child
 }
 
 fn await_native_child(
     child: &mut NativeChild,
-    observer: &mut ProcessObserver,
+    mut observer: Option<&mut ProcessObserver>,
 ) -> (ExitStatus, bool) {
     let started = Instant::now();
     let deadline = started + CHILD_BOUND;
-    observer.set_origin(started);
+    if let Some(observer) = observer.as_deref_mut() {
+        observer.set_origin(started);
+    }
     loop {
         if Instant::now() >= deadline {
             // Preserve successful completion priority at the original deadline.
@@ -277,12 +284,14 @@ fn await_native_child(
             }
             return (
                 child
-                    .stop_unreaped_group(Some(observer))
+                    .stop_unreaped_group(observer.as_deref_mut())
                     .expect("reap watchdog-stopped native child"),
                 true,
             );
         }
-        if !observer.has_failed() {
+        if let Some(observer) = observer.as_deref_mut()
+            && !observer.has_failed()
+        {
             let observation_deadline = deadline.min(Instant::now() + super::OBSERVATION_BOUND);
             if let Err(error) = observer.poll(child, observation_deadline) {
                 observer.fail(&error);
@@ -301,7 +310,7 @@ fn await_native_child(
         if Instant::now() >= deadline {
             return (
                 child
-                    .stop_unreaped_group(Some(observer))
+                    .stop_unreaped_group(observer.as_deref_mut())
                     .expect("reap watchdog-stopped native child"),
                 true,
             );
@@ -317,7 +326,7 @@ struct NativeReport {
     group_diagnostic: Result<(), Errno>,
     output: String,
     detail: String,
-    observation: Value,
+    observation: Option<Value>,
 }
 
 fn finish_case(
@@ -336,7 +345,10 @@ fn finish_case(
         Err(error) if error.kind() == io::ErrorKind::NotFound
     );
     let normal = !report.timed_out
-        && report.observation["ok"] == true
+        && report
+            .observation
+            .as_ref()
+            .is_none_or(|record| record["ok"] == true)
         && report.group_diagnostic == Err(Errno::ESRCH)
         && report.status.success()
         && report
@@ -349,7 +361,7 @@ fn finish_case(
             .output
             .contains("test result: ok. 1 passed; 0 failed;");
     println!(
-        "KELD_AC7_CHILD_CAPTURE selector={selector} status={:?} watchdog={} group_diagnostic={:?} normal_root_empty={normal_root_empty:?} parent_close={close:?} root_absent={absent}\nprocess_observation={}\nstdout={}\nstderr={}",
+        "KELD_AC7_CHILD_CAPTURE selector={selector} status={:?} watchdog={} group_diagnostic={:?} normal_root_empty={normal_root_empty:?} parent_close={close:?} root_absent={absent}\nprocess_observation={:?}\nstdout={}\nstderr={}",
         report.status,
         report.timed_out,
         report.group_diagnostic,
@@ -378,9 +390,15 @@ pub(super) fn isolated_case(case: &str, selector: &str) {
         .expect("parent-owned short native child root");
     let canonical_root = fs::canonicalize(root.path()).expect("canonical parent temp root");
     let mut observer = ProcessObserver::start(case).expect("portable process observer startup");
-    let mut child =
-        spawn_native_child(case, selector, &canonical_root, &stdout, &stderr, &observer);
-    let (status, timed_out) = await_native_child(&mut child, &mut observer);
+    let mut child = spawn_native_child(
+        case,
+        selector,
+        &canonical_root,
+        &stdout,
+        &stderr,
+        Some(&observer),
+    );
+    let (status, timed_out) = await_native_child(&mut child, Some(&mut observer));
     observer.record_leader_reaped(&child, status);
     // The leader is reaped and signalling is disarmed. A residual/error group
     // is diagnostic FAILED, never a reason to signal a cached numerical PGID.
@@ -395,7 +413,31 @@ pub(super) fn isolated_case(case: &str, selector: &str) {
         group_diagnostic,
         output: captured(&mut stdout),
         detail,
-        observation: observer.finish(),
+        observation: Some(observer.finish()),
+    };
+    drop(child);
+    finish_case(case, selector, root, &canonical_root, &report);
+}
+
+/// Reuses exact-self group/watchdog custody; the retained real guardian owns Bun.
+/// No legacy direct-Bun `ProcessObserver` enrollment is inferred for this case.
+pub(super) fn isolated_guardian_case(case: &str, selector: &str) {
+    let mut stdout = tempfile::tempfile().expect("owned guardian-native stdout");
+    let mut stderr = tempfile::tempfile().expect("owned guardian-native stderr");
+    let root = tempfile::Builder::new()
+        .prefix("k143c-")
+        .tempdir_in("/tmp")
+        .expect("parent-owned guardian-native child root");
+    let canonical_root = fs::canonicalize(root.path()).expect("canonical parent temp root");
+    let mut child = spawn_native_child(case, selector, &canonical_root, &stdout, &stderr, None);
+    let (status, timed_out) = await_native_child(&mut child, None);
+    let report = NativeReport {
+        status,
+        timed_out,
+        group_diagnostic: killpg(child.group, None::<Signal>),
+        output: captured(&mut stdout),
+        detail: captured(&mut stderr),
+        observation: None,
     };
     drop(child);
     finish_case(case, selector, root, &canonical_root, &report);

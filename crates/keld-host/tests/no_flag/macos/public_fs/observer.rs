@@ -161,11 +161,16 @@ impl Observation {
     }
 
     pub(super) fn bind() -> Self {
-        Self::bind_with_recovery(false)
+        Self::bind_with_recovery(false, false)
     }
 
     pub(super) fn bind_recovery() -> Self {
-        Self::bind_with_recovery(true)
+        Self::bind_with_recovery(true, false)
+    }
+
+    /// Core/Runtime own Q/EOF; their G1/G2 ordinary app Quit waits park here.
+    pub(super) fn bind_staged_fixture() -> Self {
+        Self::bind_with_recovery(false, true)
     }
 
     pub(super) fn send_recovery_command(&self, command: RecoveryCommand) {
@@ -176,7 +181,7 @@ impl Observation {
             .expect("recovery observer remains live");
     }
 
-    fn bind_with_recovery(recovery_mode: bool) -> Self {
+    fn bind_with_recovery(recovery_mode: bool, retain_fixture_quits: bool) -> Self {
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("prearm public FS observer");
         let port = listener.local_addr().expect("observer address").port();
         listener
@@ -194,6 +199,7 @@ impl Observation {
         let stopping = Arc::clone(&stop);
         let thread = thread::spawn(move || {
             let mut pending_quit = None;
+            let mut fixture_quits = Vec::new();
             let mut released = false;
             while !stopping.load(Ordering::Acquire) {
                 if let Some(recovery) = recovery.as_mut() {
@@ -213,6 +219,10 @@ impl Observation {
                                     serde_json::from_slice(&body).expect("actual app/page JSON");
                                 respond(&mut stream, "recorded");
                                 send.send(report).expect("report observed data");
+                            }
+                            "/quit" if retain_fixture_quits => {
+                                assert!(fixture_quits.len() < 2, "only G1/G2 fixture Quit waits");
+                                fixture_quits.push(stream);
                             }
                             "/quit" => {
                                 assert!(pending_quit.is_none(), "one public app Quit barrier");

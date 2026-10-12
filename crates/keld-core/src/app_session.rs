@@ -5022,6 +5022,7 @@ struct PrimaryRouterHandle {
 struct QuitDrainTestHooks {
     stall: Option<(SyncSender<()>, Receiver<()>)>,
     end: Option<SyncSender<QuitDrainEnd>>,
+    cli_acceptance: Option<(SyncSender<()>, Receiver<()>)>,
 }
 
 /// How a post-Quit drain ended (GH-527 §4.9). Every end leads to the same
@@ -5864,6 +5865,27 @@ impl PrimaryRouterHandle {
         Ok(())
     }
 
+    #[cfg(all(test, target_os = "macos"))]
+    fn hold_cli_acceptance_for_test(&self) -> Result<(), HostAppError> {
+        let hold = self
+            .quit_drain_hooks
+            .lock()
+            .map_err(|_| app_detail("CLI publication fixture", "fixture slot poisoned"))?
+            .cli_acceptance
+            .take();
+        if let Some((observed, resume)) = hold {
+            observed.send(()).map_err(|error| {
+                app_detail("CLI publication fixture witness", error.to_string())
+            })?;
+            resume
+                .recv_timeout(Duration::from_secs(5))
+                .map_err(|error| {
+                    app_detail("CLI publication fixture release", error.to_string())
+                })?;
+        }
+        Ok(())
+    }
+
     fn cli_lease_lost(&self) -> Result<(), HostAppError> {
         if self.shutdown.reserved_cause.load(Ordering::Acquire) != SESSION_CLI_LEASE_LOST
             || self.shutdown.tail_started.load(Ordering::Acquire)
@@ -5873,12 +5895,14 @@ impl PrimaryRouterHandle {
         self.guardian.prepare_accepted_shutdown()?;
         {
             let _transition = self.shutdown.transition_guard();
+            if !self.shutdown.begin_tail() {
+                return Ok(());
+            }
             if self.shutdown.cause() == SESSION_RUNNING {
                 self.shutdown
                     .accept_reserved_guarded(SESSION_CLI_LEASE_LOST);
-            }
-            if !self.shutdown.begin_tail() {
-                return Ok(());
+                #[cfg(all(test, target_os = "macos"))]
+                self.hold_cli_acceptance_for_test()?;
             }
         }
         self.quiesce_and_drain_fs()?;
