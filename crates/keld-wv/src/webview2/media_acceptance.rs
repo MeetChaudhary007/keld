@@ -135,6 +135,20 @@ const SWALLOW_BROWSER_EXIT_ENV: &str = "KELD_PROFILE_TEST_SWALLOW_BROWSER_EXIT";
 
 static SWALLOWED_BROWSER_EXIT_AT: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
 
+static PROBE_WINDOW_CREATION_FAILED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Injects the hidden predecessor-window setup failure only in this test binary.
+pub(super) fn fail_probe_window_creation() -> bool {
+    if std::env::var_os(SWALLOW_BROWSER_EXIT_ENV).is_some_and(|site| site == "probe-window") {
+        PROBE_WINDOW_CREATION_FAILED.store(true, std::sync::atomic::Ordering::Release);
+        println!("KELD_PROFILE_FAULT hidden-probe-window-creation");
+        true
+    } else {
+        false
+    }
+}
+
 /// Returns `true` when the fixture selected this site's event for swallowing.
 ///
 /// Records the first swallow instant so the child can prove the product
@@ -1927,13 +1941,15 @@ chrome.webview.postMessage('{nonce}:{phase}:'+prior+':resolved:{track}:'+matchin
                 "an unproven predecessor probe failed the current host's own release: {error}"
             )));
         }
-        if SWALLOWED_BROWSER_EXIT_AT.get().is_none() {
+        if SWALLOWED_BROWSER_EXIT_AT.get().is_none()
+            && !PROBE_WINDOW_CREATION_FAILED.load(std::sync::atomic::Ordering::Acquire)
+        {
             return Err(failure("the probe fault was never injected"));
         }
         if plan.control_dir.exists() {
             return Err(failure("the current host did not release its own leaf"));
         }
-        if !old_plan.control_dir.exists() {
+        if !old_plan.control_dir.exists() || !old_plan.user_data_dir.exists() {
             return Err(failure("the unproven predecessor leaf was deleted"));
         }
         println!("KELD_PROFILE_UNPROVEN_PROBE retained=true");
@@ -1955,6 +1971,30 @@ chrome.webview.postMessage('{nonce}:{phase}:'+prior+':resolved:{track}:'+matchin
             "unproven-probe",
             &[
                 "KELD_PROFILE_FAULT swallowed-browser-exit site=probe",
+                "KELD_PROFILE_SCAVENGE retained=unproven",
+                "KELD_PROFILE_UNPROVEN_PROBE retained=true",
+            ],
+        )
+    }
+
+    /// A failed hidden-window setup must retain the old leaf after actual own release.
+    #[test]
+    #[ignore = "real Windows predecessor probe-window setup fault"]
+    fn windows_unproven_probe_window_retains_predecessor_subprocess() -> Result<(), WvError> {
+        if std::env::var_os(SWALLOW_BROWSER_EXIT_ENV).is_some() {
+            return run_with_watchdog(FIXTURE_DEADLINE, unproven_probe_retains_predecessor_child);
+        }
+        let output = spawn_browser_exit_fault_child(
+            "windows_unproven_probe_window_retains_predecessor_subprocess",
+            "probe-window",
+        )?;
+        require_child_markers(
+            &output,
+            "unproven-probe-window",
+            &[
+                "KELD_MEDIA_BROWSER_EXIT",
+                "normal=true",
+                "KELD_PROFILE_FAULT hidden-probe-window-creation",
                 "KELD_PROFILE_SCAVENGE retained=unproven",
                 "KELD_PROFILE_UNPROVEN_PROBE retained=true",
             ],

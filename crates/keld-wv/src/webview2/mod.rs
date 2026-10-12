@@ -1609,6 +1609,12 @@ struct RecoveryWindow(HWND);
 
 impl RecoveryWindow {
     fn new() -> Result<Self, WvError> {
+        #[cfg(all(feature = "media-acceptance", test))]
+        if media_acceptance::fail_probe_window_creation() {
+            return Err(WvError::Window(
+                "injected hidden profile-probe window creation failure".to_owned(),
+            ));
+        }
         // SAFETY: the predefined STATIC class needs no registration, all
         // optional owner/menu/instance/parameter inputs are absent, and the
         // hidden top-level window remains on this STA. Contract:
