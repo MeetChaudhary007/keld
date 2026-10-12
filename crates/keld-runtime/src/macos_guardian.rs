@@ -5170,7 +5170,7 @@ while (!(await input.read()).done) {}
         entered: mpsc::Sender<()>,
         release: mpsc::Receiver<()>,
         observed: mpsc::SyncSender<(bool, u32)>,
-        initialized: mpsc::SyncSender<()>,
+        initialized: &mpsc::SyncSender<()>,
     ) -> (Result<(), RuntimeError>, bool, bool, SupervisorOutcome, u32) {
         let mut command = Command::new("/bin/sh");
         command.args(["-c", "exit 1"]);
@@ -5230,7 +5230,7 @@ while (!(await input.read()).done) {}
                 entered_tx,
                 release_rx,
                 observed_tx,
-                initialized_tx,
+                &initialized_tx,
             )
         });
         let initialized = initialized_rx.recv_timeout(GUARDIAN_SHUTDOWN_DEADLINE);
