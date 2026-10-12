@@ -175,6 +175,98 @@ class InputContractTests(unittest.TestCase):
         (self.root / "readers/check.py").unlink()
         self.assertTrue(self.route()["local_probe"])
 
+    def documentation_contract(self):
+        self.write("src/reader.rs", "include_str!(\"../docs/input.md\");\n")
+        self.git("add", "src/reader.rs")
+        self.git("commit", "-qm", "reader source")
+        self.base = self.git("rev-parse", "HEAD").strip()
+        self.contract["known_inputs"].append("src/*")
+        self.contract["consumers"].append({
+            "owner": "fixture registry reader",
+            "outputs": ["input_registry"],
+            "inputs": ["src/*"],
+            "documentation_inputs": ["docs/input.md"],
+            "reader_set": "fixture",
+        })
+        self.contract["rust_package_inputs"] = {"keld-reader": ["src/*"]}
+        self.contract["rust_package_documentation_inputs"] = {"keld-reader": ["docs/input.md"]}
+        self.save_contract()
+        self.git("add", "tools/ci-inputs.json")
+        self.git("commit", "-qm", "documentation edges")
+        self.base = self.git("rev-parse", "HEAD").strip()
+
+    def assert_narrowing(self, result, expected):
+        for key in ("documentation_only_registry", "documentation_only_package_keld-reader"):
+            self.assertIs(result[key], expected, key)
+
+    def test_documentation_only_edge_narrows_and_any_other_input_keeps_expansion(self):
+        self.documentation_contract()
+        self.write("docs/input.md", "documentation edit\n")
+        result = self.route()
+        self.assertTrue(result["input_registry"])
+        self.assertTrue(result["input_package_keld-reader"])
+        self.assert_narrowing(result, True)
+        # Negative control: one non-documentation input of the same edges in
+        # the same diff keeps reverse-dependent expansion for both edges.
+        self.write("src/reader.rs", "include_str!(\"../docs/input.md\"); // reader edit\n")
+        result = self.route()
+        self.assertTrue(result["input_registry"])
+        self.assertTrue(result["input_package_keld-reader"])
+        self.assert_narrowing(result, False)
+
+    def test_unrelated_and_fallback_selections_never_narrow(self):
+        self.documentation_contract()
+        self.write("README.md", "unrelated edit\n")
+        result = self.route()
+        self.assertFalse(result["input_registry"])
+        self.assert_narrowing(result, False)
+        self.write("docs/input.md", "documentation edit\n")
+        self.assert_narrowing(self.route(comparison_unknown=True), False)
+        self.write("docs/untracked.md", "no established contract\n")
+        self.assert_narrowing(self.route(), False)
+        (self.root / "docs/untracked.md").unlink()
+        self.contract["consumers"][1]["contract"] = "reviewed scope update"
+        self.save_contract()
+        result = self.route()
+        self.assertTrue(result["input_router"])
+        self.assert_narrowing(result, False)
+
+    def test_reader_drift_never_narrows(self):
+        self.documentation_contract()
+        self.write("readers/check.py", "from pathlib import Path\nPath('docs/other.md').read_text()\n")
+        self.git("add", "readers/check.py")
+        self.git("commit", "-qm", "reader drift")
+        self.base = self.git("rev-parse", "HEAD").strip()
+        self.write("docs/input.md", "documentation edit\n")
+        result = self.route()
+        # The fixture edge has no input_rust output, so only the drift guard
+        # (not the input_all fallback) can refuse this narrowing.
+        self.assertFalse(result["input_all"])
+        self.assertTrue(result["input_registry"])
+        self.assertFalse(result["documentation_only_registry"])
+        # The package edge has no reader set of its own; its documentation
+        # read still narrows.
+        self.assertTrue(result["documentation_only_package_keld-reader"])
+
+    def test_malformed_documentation_inputs_fail_before_selection(self):
+        self.documentation_contract()
+        for field, invalid in (("consumer", "docs/input.md"), ("consumer", [""]), ("consumer", [None]),
+                               ("package", {"keld-reader": "docs/input.md"}), ("package", {"keld-reader": []}),
+                               ("package", {"keld-reader": [""]}), ("package", ["docs/input.md"])):
+            with self.subTest(field=field, invalid=invalid):
+                self.documentation_contract_reset()
+                if field == "consumer":
+                    self.contract["consumers"][1]["documentation_inputs"] = invalid
+                else:
+                    self.contract["rust_package_documentation_inputs"] = invalid
+                self.save_contract()
+                with self.assertRaises(ValueError):
+                    ci_inputs.classify(self.root, ["docs/input.md"], paths_only=True)
+
+    def documentation_contract_reset(self):
+        self.contract["consumers"][1]["documentation_inputs"] = ["docs/input.md"]
+        self.contract["rust_package_documentation_inputs"] = {"keld-reader": ["docs/input.md"]}
+
     def test_missing_or_malformed_contract_fails_before_selection(self):
         for text in ("invalid", '{}', '[]', 'null', '42', '{"schema":"wrong","consumers":[]}'):
             self.write("tools/ci-inputs.json", text)
@@ -282,7 +374,9 @@ class FreshnessGateTests(unittest.TestCase):
         self.assertEqual((root / "tools/ci-inputs.json").read_bytes(), before)
 
 
-class ExecutorTests(unittest.TestCase):
+class SelectionTests(unittest.TestCase):
+    """Selection admission is pure Python, so these run in hosted CI (#650)."""
+
     def route(self, **overrides):
         data = {"local_contract": "v1", "local_default": "true",
                 "local_fmt-check": "true", "local_clippy": "true", "local_test": "true",
@@ -307,6 +401,15 @@ class ExecutorTests(unittest.TestCase):
             self.assertFalse(selected[gate])
             missing = "\n".join(line for line in self.route().splitlines() if not line.startswith("local_" + gate + "="))
             self.assertTrue(ci_local.selection(missing, ["fmt-check", "clippy", "test"])[gate])
+
+class ExecutorTests(SelectionTests):
+    """Inventory and execution drive real recipes through the `just` executable
+    (tools/ci_local.py inventory/execute), so these stay local-only: hosted
+    runners do not install `just` (#650). Inherits SelectionTests' helpers; the
+    selection cases are skipped here because SelectionTests runs them.
+    """
+    test_unknown_gate_runs_and_malformed_gate_fails = None
+    test_unrelated_rust_gates_need_explicit_false_not_missing_output = None
 
     def test_real_just_inventory_preserves_bodyful_prerequisites_and_order(self):
         with tempfile.TemporaryDirectory(prefix="keld-ci-inventory-") as temporary:
@@ -461,6 +564,94 @@ class ProductionConsumerTests(unittest.TestCase):
                              {package["name"] for package in metadata["packages"]},
                              "owned inputs must not narrow a shared workspace obligation")
 
+    def test_native_fs_inputs_select_bun_with_fresh_bindings_and_exact_edges(self):
+        source = Path(__file__).resolve().parent.parent
+        with tempfile.TemporaryDirectory(prefix="keld-ci-native-fs-readers-") as temporary:
+            root = Path(temporary)
+            tracked_snapshot(source, root)
+            fixture = "crates/keld-native/tests/fixtures/fs-payload-v0.tsv"
+            if not (root / fixture).exists():
+                # The CI edge can precede the feature artifact; contents are not a codec oracle here.
+                (root / fixture).parent.mkdir(parents=True, exist_ok=True)
+                (root / fixture).write_text("# native FS semantic fixture routing control\n", encoding="utf-8")
+            subprocess.run(["git", "add", "-f", fixture], cwd=root, check=True, capture_output=True)
+            # Bind only this disposable fixture's tracked membership/readers. No drift may mask an edge.
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(ci_inputs.rebind(root), 0)
+            self.assertEqual(ci_inputs.stale(root), [])
+            contract_path = root / "tools/ci-inputs.json"
+            original_contract = contract_path.read_bytes()
+            cases = (("crates/keld-native/src/fs.rs", True), (fixture, True),
+                     ("crates/keld-native/src/lib.rs", False))
+            for leaf, expected in cases:
+                with self.subTest(input=leaf):
+                    path = root / leaf
+                    original_input = path.read_bytes()
+                    path.write_bytes(original_input + b"\n// route content mutation\n")
+                    try:
+                        self.assertEqual(ci_inputs.stale(root), [], "input content is not reader drift")
+                        selected = ci_inputs.classify(root, [leaf])
+                        self.assertFalse(selected["input_all"], selected)
+                        for output in ("input_ts", "local_typescript"):
+                            self.assertEqual(selected[output], expected, (leaf, output, selected))
+                        if expected:
+                            contract = ci_inputs.load(root)
+                            consumer = next(item for item in contract["consumers"]
+                                            if item["owner"] == "Bun package readers")
+                            consumer["inputs"].remove(leaf)
+                            contract_path.write_text(json.dumps(contract), encoding="utf-8")
+                            self.assertEqual(ci_inputs.stale(root), [], "the policy artifact cannot hash itself")
+                            omitted = ci_inputs.classify(root, [leaf])
+                            self.assertFalse(omitted["input_all"], omitted)
+                            for output in ("input_ts", "local_typescript"):
+                                self.assertFalse(omitted[output], (leaf, output, omitted))
+                    finally:
+                        path.write_bytes(original_input)
+                        contract_path.write_bytes(original_contract)
+
+    def test_future_public_fs_reader_byte_drift_requires_exact_registration(self):
+        source = Path(__file__).resolve().parent.parent
+        with tempfile.TemporaryDirectory(prefix="keld-ci-future-fs-reader-") as temporary:
+            root = Path(temporary)
+            tracked_snapshot(source, root)
+            self.assertEqual(ci_inputs.stale(root), [], "an absent future pattern keeps existing readers valid")
+            reader = "crates/keld-host/tests/no_flag/macos/public_fs/project.rs"
+            path = root / reader
+            path.parent.mkdir(parents=True, exist_ok=True)
+            original = b"// prospective public API composition reader\n"
+            changed = original + b"// reviewed reader content changed\n"
+            path.write_bytes(original)
+            subprocess.run(["git", "add", "-f", reader], cwd=root, check=True, capture_output=True)
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(ci_inputs.rebind(root), 0)
+            self.assertEqual(ci_inputs.stale(root), [])
+            census_patterns = ci_inputs.load(root)["rust_source_census"]["patterns"]
+            membership = ci_inputs.membership_fingerprint(ci_inputs.files(root), census_patterns)
+
+            path.write_bytes(changed)
+            error = io.StringIO()
+            with contextlib.redirect_stderr(error):
+                self.assertEqual(ci_inputs.check(root), 1, "registered reader byte drift must reject freshness")
+            self.assertIn("CI-INPUTS-STALE", error.getvalue())
+            self.assertIn("rust-readers", error.getvalue())
+            self.assertEqual(ci_inputs.stale(root), ["rust-readers"])
+            self.assertEqual(ci_inputs.membership_fingerprint(ci_inputs.files(root), census_patterns), membership)
+
+            # Removing only the reader declaration falsifies the same direct freshness predicate.
+            # Bind the isolated control first so stale hashes or census cannot supply the rejection.
+            path.write_bytes(original)
+            contract = ci_inputs.load(root)
+            contract["reader_sets"]["rust-readers"]["patterns"].remove(reader)
+            (root / "tools/ci-inputs.json").write_text(json.dumps(contract), encoding="utf-8")
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(ci_inputs.rebind(root), 0)
+            self.assertEqual(ci_inputs.stale(root), [])
+            path.write_bytes(changed)
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(ci_inputs.check(root), 0, "omitting the exact reader hides its byte drift")
+            self.assertEqual(ci_inputs.stale(root), [])
+            self.assertEqual(ci_inputs.membership_fingerprint(ci_inputs.files(root), census_patterns), membership)
+
     def test_real_rust_content_edit_and_added_reader_have_distinct_scope(self):
         source = Path(__file__).resolve().parent.parent
         with tempfile.TemporaryDirectory(prefix="keld-ci-rust-census-") as temporary:
@@ -499,7 +690,11 @@ class ProductionConsumerTests(unittest.TestCase):
             subprocess.run(["git", "add", added], cwd=root, check=True, capture_output=True)
             unknown = ci_inputs.classify(root, [added])
             self.assertTrue(unknown["input_all"])
-            self.assertTrue(all(unknown.values()), "new unbound membership must never omit a consumer")
+            narrowing = {key: value for key, value in unknown.items() if key.startswith("documentation_only_")}
+            self.assertTrue(narrowing, "the production contract declares documentation-only edges")
+            self.assertTrue(all(value for key, value in unknown.items() if key not in narrowing),
+                            "new unbound membership must never omit a consumer")
+            self.assertFalse(any(narrowing.values()), "a fallback must never narrow a reverse-dependent closure")
 
     def test_committed_digests_match_live_bytes_and_stale_is_caught(self):
         # Unbound snapshot: the digests are exactly what is committed, so this can fail.
@@ -531,6 +726,45 @@ class ProductionConsumerTests(unittest.TestCase):
             if consumer["reader_set"] == victim:
                 for output in consumer["outputs"]:
                     self.assertTrue(selection[output], f"stale {victim} must still enable {output}")
+
+    def test_gitattributes_selects_keld_compat_through_its_declared_read(self):
+        # gh566 T3: the keld-compat snapshot normalisation check runs `git hash-object`,
+        # which reads .gitattributes, so the read is a declared Rust input edge.
+        # A bound tracked snapshot, so an unrelated dirty edit in the developer's checkout
+        # cannot turn on a fallback and mask the controls below.
+        source = Path(__file__).resolve().parent.parent
+        fixture = tempfile.TemporaryDirectory(prefix="keld-ci-gitattributes-")
+        self.addCleanup(fixture.cleanup)
+        root = Path(fixture.name)
+        tracked_snapshot(source, root)
+        live = ci_inputs.load(root)
+        rust = [c for c in live["consumers"] if c["owner"] == "Rust workspace external reads"]
+        self.assertEqual(len(rust), 1)
+        self.assertIn(".gitattributes", rust[0]["inputs"])
+        # Today .gitattributes is an unknown input, so the fail-safe selects every lane.
+        live_selection = ci_inputs.classify(root, [".gitattributes"], paths_only=True)
+        for output in ("input_all", "input_rust", "input_package_keld-compat", "local_test"):
+            self.assertTrue(live_selection[output], output)
+        # The declared edge alone still selects the Rust test lanes if .gitattributes
+        # ever becomes a known input; without the edge, nothing would select them.
+        def known(with_edge):
+            def load(root):
+                contract = json.loads(json.dumps(live))
+                contract["known_inputs"] = contract["known_inputs"] + [".gitattributes"]
+                if not with_edge:
+                    for consumer in contract["consumers"]:
+                        consumer["inputs"] = [i for i in consumer["inputs"] if i != ".gitattributes"]
+                return contract
+            return load
+        for with_edge in (True, False):
+            with unittest.mock.patch.object(ci_inputs, "load", known(with_edge)):
+                selected = ci_inputs.classify(root, [".gitattributes"], paths_only=True)
+            self.assertFalse(selected["input_all"], with_edge)
+            for output in ("input_rust", "local_test"):
+                self.assertIs(selected[output], with_edge, (output, with_edge))
+        unrelated = ci_inputs.classify(root, ["README.md"], paths_only=True)
+        for output in ("input_rust", "input_package_keld-compat", "local_test"):
+            self.assertFalse(unrelated[output], output)
 
     def test_bound_production_readers_and_real_cross_tree_inputs(self):
         source = Path(__file__).resolve().parent.parent
@@ -579,6 +813,20 @@ class ProductionConsumerTests(unittest.TestCase):
             self.assertFalse(result["input_all"], f"{path}: positive example must not hide behind fallback")
             for output in outputs:
                 self.assertTrue(result[output], f"{path} must select {output}")
+        # #624: documentation-only reads narrow; a non-documentation input of
+        # the same edge (the recursive tools scan) never does.
+        narrowing = {
+            "llms-full.txt": ("documentation_only_registry", True),
+            "docs/architecture/02-ipc.md": ("documentation_only_registry", True),
+            "docs/engineering/keld-error-codes.md": ("documentation_only_registry", True),
+            "tools/atomic_protocol.rs": ("documentation_only_registry", False),
+            "crates/keld-cli/src/lib.rs": ("documentation_only_registry", False),
+            "docs/specs/kel53-full-package-activation.md": ("documentation_only_package_keld-update", True),
+            "crates/keld-pack/tests/fixtures/windows-v0-content.tar": ("documentation_only_package_keld-update", False),
+        }
+        for path, (key, expected) in narrowing.items():
+            self.assertTrue((root / path).is_file(), path)
+            self.assertIs(ci_inputs.classify(root, [path], paths_only=True)[key], expected, (path, key))
         source_inventory = (root / "tools/llms_docs.rs").read_text(encoding="utf-8")
         source_inventory = source_inventory.split("const SOURCES: &[Source] = &[", 1)[1].split("\n];", 1)[0]
         corpus_sources = re.findall(r'path: "([^"]+)"', source_inventory)

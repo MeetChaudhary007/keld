@@ -44,7 +44,7 @@ header := magic:u16 | ver:u8 | kind:u8 | flags:u16 | channel:u16 | corr:u32 | le
 | 2 | 1 | `ver` | `u8` | Constant `PROTOCOL_VERSION` | Currently `2` (v2 HELLO token; KEL-60) |
 | 3 | 1 | `kind` | `u8` | `FrameKind as u8` | See §2. Values `0..=10` |
 | 4 | 2 | `flags` | `u16` LE | `FrameHeader.flags` | Bitfield. Only `FLAG_RAW` (`1 << 0`) is defined |
-| 6 | 2 | `channel` | `u16` LE | `ChannelId.0` | Handle, not a name. See §4 |
+| 6 | 2 | `channel` | `u16` LE | `FrameHeader.channel` (a `ChannelId`) | Handle, not a name. See §4 |
 | 8 | 4 | `corr` | `u32` LE | `CorrelationId.0` | `0` for uncorrelated kinds |
 | 12 | 4 | `len` | `u32` LE | Payload byte count | Bytes following the header |
 
@@ -185,12 +185,19 @@ reader. Fuzz decode paths — malformed webview input is expected.
 ## 4. `ChannelId` and `CorrelationId`
 
 ```rust
-// crates/keld-ipc/src/frame.rs:11-17
-pub struct ChannelId(pub u16);
+// crates/keld-ipc/src/frame.rs
+pub struct ChannelId(pub(crate) u16);
 pub struct CorrelationId(pub u32);
 ```
 
-**v0 contract: channel ids are hardcoded `u16` constants on both sides.**
+**`ChannelId` is unforgeable outside `keld-ipc` (#634).** Its field is private to the
+crate, so other crates get an id only from a `keld_ipc::channel_table` entry (or a
+constant derived from one) or from a header `keld-ipc` decoded, and compare it only
+with another id. Tests that need an unallocated id use `ChannelId::for_test`, behind
+keld-ipc's non-default `test-channel-ids` feature
+([gh508 §11](../specs/gh508-kipc-channel-table.md#11-implementation-record-x05-t4-597)).
+
+**v0 contract: channel ids are fixed `u16` values from that one table on both sides.**
 HELLO does not exchange a name table. Every frame still carries a two-byte
 `ChannelId` handle, never a string — that part of `crates/keld-ipc/src/lib.rs`
 ("Channel names never travel per-call") is already true. Handshake name/table
@@ -204,7 +211,7 @@ Currently allocated:
 
 | Channel | Value | Purpose | Defined at |
 |---|---:|---|---|
-| *(control)* | `0` | Handshake frames | Implicit — `link.rs` passes `ChannelId(0)`. **There is no named constant for this**; it is a convention waiting to be made explicit |
+| `HANDSHAKE_CHANNEL` | `0` | Handshake frames | `crates/keld-ipc/src/channel_table.rs` (reserved, never allocatable) |
 | `ECHO_CHANNEL` | `1` | The echo vertical slice | `crates/keld-ipc/src/echo.rs` |
 | `FS_CHANNEL` | `2` | Host `fs.read` / `fs.write` | `crates/keld-native/src/fs.rs` |
 | `LIFECYCLE_CHANNEL` | `3` | Host ready / last-window-closed / quit | `crates/keld-ipc/src/lifecycle.rs` |
@@ -212,8 +219,9 @@ Currently allocated:
 **`CorrelationId` pairs a `Reply` or `Err` with its `Call`.** The client picks it; the server echoes
 it back unchanged. Uncorrelated kinds use `0` (reserved for `HELLO`). `echo_call`
 hardcodes `CorrelationId(1)` for its one-shot path. `echo_invoke` takes the caller's
-`corr`; the Bun `AppLinkSession` allocates monotonically, skipping `0`. v0 is still
-one CALL in flight at a time (the reader has a single pending waiter).
+`corr`; the Bun `WorkerLink` under `AppLinkSession` allocates monotonically, skipping
+`0` and every id still pending. Its asynchronous calls may overlap; a role has at most
+one blocking call in flight (GH-527).
 
 ---
 
@@ -343,7 +351,7 @@ handler, one channel constant.
 
 ```rust
 // crates/keld-ipc/src/echo.rs:10-28
-pub const ECHO_CHANNEL: ChannelId = ChannelId(1);
+pub const ECHO_CHANNEL: ChannelId = crate::channel_table::ECHO.id();
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EchoRequest {

@@ -36,6 +36,20 @@ mod windows_machine;
 #[cfg(windows)]
 mod windows_owner_private;
 
+/// Manifest capability names that other crates reference by constant.
+///
+/// `keld-guard` owns the capability vocabulary (architecture 03 §2). Crates that
+/// name a capability, such as the `keld-ipc` channel table and the `keld-native`
+/// filesystem broker, reference these constants instead of repeating the string
+/// (GH-508 spec criterion 15). Only names another crate references are exported;
+/// this is not a capability registry.
+pub mod capability {
+    /// Scoped filesystem read (`app.fs.read` grants).
+    pub const FS_READ: &str = "fs.read";
+    /// Scoped filesystem write (`app.fs.write` grants).
+    pub const FS_WRITE: &str = "fs.write";
+}
+
 #[cfg(windows)]
 pub use windows_authenticode::{
     VerifiedWindowsImage, WindowsAuthenticodeError, WindowsAuthenticodeIdentity,
@@ -638,10 +652,18 @@ pub fn load_manifest(path: &Path) -> Result<PermissionsManifest, ManifestError> 
     parse_manifest_at(&text, Some(path))
 }
 
-pub(crate) fn read_manifest_bytes<R: Read>(
-    reader: R,
-    path: &Path,
-) -> Result<Vec<u8>, ManifestError> {
+/// Captures permissions-manifest bytes from an already selected reader.
+///
+/// The caller owns source selection, identity and containment checks. `path`
+/// is used only in diagnostics and is never opened. This function applies the
+/// shared manifest byte ceiling and returns one owned buffer; it does not
+/// decode, parse or authorize its contents.
+///
+/// # Errors
+///
+/// Returns [`ManifestError::Read`] when reading fails or
+/// [`ManifestError::TooLarge`] when the shared 64 KiB ceiling is exceeded.
+pub fn read_manifest_bytes<R: Read>(reader: R, path: &Path) -> Result<Vec<u8>, ManifestError> {
     let mut bytes = Vec::with_capacity(MAX_MANIFEST_BYTES + 1);
     reader
         .take((MAX_MANIFEST_BYTES + 1) as u64)
@@ -1026,7 +1048,7 @@ fn validate_portable_component(component: &str) -> Result<(), String> {
 }
 
 fn is_filesystem_capability(operation: &str) -> bool {
-    matches!(operation, "fs.read" | "fs.write")
+    matches!(operation, capability::FS_READ | capability::FS_WRITE)
 }
 
 fn is_fs_root(path: &str) -> bool {
@@ -1257,6 +1279,56 @@ mod tests {
             MAX_MANIFEST_BYTES + 1,
             "the reader must not consume the rest of an oversized source"
         );
+        assert_eq!(error.code(), "KELD-GUARD017");
+        assert!(error.to_string().contains("Reduce the manifest"), "{error}");
+    }
+
+    #[test]
+    fn manifest_byte_capture_keeps_exact_bytes_without_parsing_or_opening_path() {
+        let source = [0xff, 0x00, b'{', b'/', b'*', b'\n'];
+        let captured = read_manifest_bytes(
+            source.as_slice(),
+            Path::new("missing-diagnostics-only/keld.permissions.jsonc"),
+        )
+        .expect("byte capture must not parse or open its diagnostics path");
+        assert_eq!(captured, source);
+    }
+
+    #[test]
+    fn manifest_byte_capture_accepts_empty_and_exact_ceiling() {
+        let path = Path::new("keld.permissions.jsonc");
+        assert!(
+            read_manifest_bytes(&[][..], path)
+                .expect("empty capture is valid before parsing")
+                .is_empty()
+        );
+        let source = vec![0xff; MAX_MANIFEST_BYTES];
+        assert_eq!(
+            read_manifest_bytes(source.as_slice(), path).expect("exact byte ceiling"),
+            source
+        );
+    }
+
+    #[test]
+    fn manifest_byte_capture_retains_reader_failure_detail_and_fix() {
+        struct FailingReader;
+
+        impl Read for FailingReader {
+            fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::other("retained source read failed"))
+            }
+        }
+
+        let path = Path::new("selected/keld.permissions.jsonc");
+        let error = read_manifest_bytes(FailingReader, path).expect_err("failed source reader");
+        assert_eq!(error.code(), "KELD-GUARD004");
+        assert!(error.to_string().contains("retained source read failed"));
+        assert!(
+            error
+                .to_string()
+                .contains("Check the path exists and is readable.")
+        );
+        assert!(matches!(error, ManifestError::Read { path: actual, .. } if actual == path));
     }
 
     #[test]

@@ -1,6 +1,8 @@
 import { readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 
+import { TRANSPORT_STAMP_PREFIX, stampTransport, verifyTransportStamp } from "../src/transport.ts";
+
 const STRUCT_NAMES = ["EchoRequest", "EchoResponse"] as const;
 const repositoryRoot = resolve(import.meta.dir, "../../../..");
 const rustSourcePath = resolve(repositoryRoot, "crates/keld-ipc/src/echo.rs");
@@ -8,6 +10,10 @@ const generatedPaths = [
   resolve(repositoryRoot, "crates/keld-cli/templates/hello/src/echo.generated.ts"),
   resolve(repositoryRoot, "packages/@keld/api/src/echo.generated.ts"),
 ] as const;
+const channelTableSourcePath = resolve(repositoryRoot, "crates/keld-ipc/src/channel_table.rs");
+const transportPath = resolve(repositoryRoot, "packages/@keld/kipc/src/transport.ts");
+const fsSourcePath = resolve(repositoryRoot, "crates/keld-native/src/fs.rs");
+const fsGeneratedPath = resolve(repositoryRoot, "packages/@keld/api/src/fs.generated.ts");
 
 type StructName = (typeof STRUCT_NAMES)[number];
 type SupportedRustType = "String" | "u32";
@@ -97,12 +103,534 @@ export function assertEchoArtifactFresh(rustSource: string, artifact: Uint8Array
   }
 }
 
+// Bounded KEL-140 target: native enum declaration and field order own postcard.
+type FsEnumName = "FsRequest" | "FsResponse";
+type FsFieldType = "String" | "Vec<u8>";
+interface FsField { name: string; rustType: FsFieldType }
+interface FsVariant { name: "Read" | "Write"; fields: FsField[] }
+
+function parseFsEnum(lines: readonly string[], name: FsEnumName): FsVariant[] {
+  const declaration = new RegExp(`^\\s*(?:pub(?:\\([^)]*\\))?\\s+)?enum\\s+${name}\\b`);
+  const starts = lines.flatMap((line, index) => declaration.test(line) ? [index] : []);
+  if (starts.length !== 1) fail(`native ${name} requires exactly one public enum declaration`);
+  const start = starts[0];
+  if (lines[start] !== `pub enum ${name} {`) fail(`native ${name} must use the rustfmt-normalized named enum form`);
+  let derives = 0;
+  for (let index = start - 1; index >= 0; index -= 1) {
+    const line = lines[index];
+    if (line.length === 0 || /^\/\/\/(?: |$)/.test(line)) continue;
+    if (line.startsWith("#[")) {
+      if (!/^#\[derive\((?:Debug, )?Serialize, Deserialize\)\]$/.test(line)) {
+        fail(`native ${name} has unsupported enum attribute on source line ${index + 1}`);
+      }
+      derives += 1;
+      continue;
+    }
+    if (line === "}" || line.endsWith(";")) break;
+    fail(`native ${name} has unsupported declaration prefix on source line ${index + 1}`);
+  }
+  if (derives !== 1) fail(`native ${name} requires one admitted Serialize/Deserialize derive`);
+  const variants: FsVariant[] = [];
+  for (let index = start + 1; index < lines.length; index += 1) {
+    const line = lines[index];
+    if (line === "}") {
+      if (variants.length !== 2 || !variants.some((variant) => variant.name === "Read") ||
+          !variants.some((variant) => variant.name === "Write")) {
+        fail(`native ${name} must contain exactly Read and Write`);
+      }
+      for (const variant of variants) {
+        const expected: Record<string, FsFieldType> = name === "FsRequest"
+          ? variant.name === "Read" ? { path: "String" } : { path: "String", bytes: "Vec<u8>" }
+          : variant.name === "Read" ? { bytes: "Vec<u8>" } : {};
+        if (variant.fields.length !== Object.keys(expected).length ||
+            variant.fields.some((field) => expected[field.name] !== field.rustType)) {
+          fail(`native ${name}::${variant.name} fields differ from the admitted path/bytes schema`);
+        }
+      }
+      return variants;
+    }
+    if (line.length === 0 || /^    \/\/\/(?: |$)/.test(line)) continue;
+    const opening = /^    (Read|Write)( \{|,)$/.exec(line);
+    if (!opening) fail(`native ${name} contains unsupported variant syntax on source line ${index + 1}`);
+    const variantName = opening[1] as FsVariant["name"];
+    if (variants.some((variant) => variant.name === variantName)) fail(`native ${name} has duplicate ${variantName}`);
+    const fields: FsField[] = [];
+    if (opening[2] === " {") {
+      let closed = false;
+      for (index += 1; index < lines.length; index += 1) {
+        const fieldLine = lines[index];
+        if (fieldLine === "    },") { closed = true; break; }
+        if (fieldLine.length === 0 || /^        \/\/\/(?: |$)/.test(fieldLine)) continue;
+        const field = /^        ([A-Za-z_][A-Za-z0-9_]*): (String|Vec<u8>),$/.exec(fieldLine);
+        if (!field) fail(`native ${name}::${variantName} has unsupported field syntax on source line ${index + 1}`);
+        if (fields.some((candidate) => candidate.name === field[1])) fail(`native ${name}::${variantName} has duplicate field ${field[1]}`);
+        fields.push({ name: field[1], rustType: field[2] as FsFieldType });
+      }
+      if (!closed || fields.length === 0) fail(`native ${name}::${variantName} must have a nonempty named body`);
+    }
+    variants.push({ name: variantName, fields });
+  }
+  return fail(`unterminated native ${name}`);
+}
+
+/** Renders the one bounded native FS payload binding; Rust owns all variant/field order. */
+export function renderFsBinding(rustSource: string): string {
+  const lines = rustSource.replaceAll("\r\n", "\n").split("\n");
+  if (lines.some((line) => /^\s*#!\[/.test(line))) fail("native FS source-level attributes are not admitted");
+  const request = parseFsEnum(lines, "FsRequest");
+  const response = parseFsEnum(lines, "FsResponse");
+  const output = [
+    "// @generated by packages/@keld/kipc/scripts/echo-codegen.ts.",
+    "// Source: crates/keld-native/src/fs.rs. Do not edit by hand.",
+    "",
+    'import { MAX_FRAME_LEN, decodeVarint, encodeVarint, encodePostcardString, kipcError } from "../../kipc/src/transport.ts";',
+    "",
+  ];
+  for (const [name, variants] of [["FsRequest", request], ["FsResponse", response]] as const) {
+    output.push(`export type ${name} =`);
+    for (const variant of variants) {
+      const fields = variant.fields.map((field) => `; ${field.name}: ${field.rustType === "String" ? "string" : "Uint8Array"}`).join("");
+      output.push(`  | { variant: "${variant.name}"${fields} }${variant === variants[variants.length - 1] ? ";" : ""}`);
+    }
+    output.push("");
+  }
+  output.push(
+    "function encodeBytes(value: Uint8Array): Uint8Array {",
+    '  if (!(value instanceof Uint8Array)) throw kipcError("KELD-IPC-003", "FsRequest.bytes must be a Uint8Array");',
+    "  const length = encodeVarint(value.byteLength);",
+    '  if (length.length + value.byteLength > MAX_FRAME_LEN) throw kipcError("KELD-IPC-003", "FS payload exceeds MAX_FRAME_LEN");',
+    "  const encoded = new Uint8Array(length.length + value.byteLength);",
+    "  encoded.set(length);",
+    "  encoded.set(value, length.length);",
+    "  return encoded;",
+    "}",
+    "",
+    "function joinPayload(parts: readonly Uint8Array[]): Uint8Array {",
+    "  const length = parts.reduce((total, part) => total + part.byteLength, 0);",
+    '  if (length > MAX_FRAME_LEN) throw kipcError("KELD-IPC-003", "FS payload exceeds MAX_FRAME_LEN");',
+    "  const payload = new Uint8Array(length);",
+    "  let offset = 0;",
+    "  for (const part of parts) { payload.set(part, offset); offset += part.byteLength; }",
+    "  return payload;",
+    "}",
+    "",
+    "/** Encodes and snapshots a native request in Rust declaration order. */",
+    "export function encodeFsRequest(value: FsRequest): Uint8Array {",
+    '  if (!value || typeof value !== "object") throw kipcError("KELD-IPC-003", "FsRequest must be an object");',
+    "  switch (value.variant) {",
+  );
+  request.forEach((variant, index) => {
+    const fields = variant.fields.map((field) => field.rustType === "String"
+      ? `encodePostcardString(value.${field.name}, "FsRequest.${field.name}")`
+      : `encodeBytes(value.${field.name})`);
+    output.push(`    case "${variant.name}": return joinPayload([encodeVarint(${index}), ${fields.join(", ")}]);`);
+  });
+  output.push(
+    '    default: throw kipcError("KELD-IPC-003", "unknown FsRequest variant");',
+    "  }",
+    "}",
+    "",
+    "/** Decodes an exact native response; returned content owns an independent copy. */",
+    "export function decodeFsResponse(payload: Uint8Array): FsResponse {",
+    '  if (!(payload instanceof Uint8Array)) throw kipcError("KELD-IPC-003", "FsResponse payload must be a Uint8Array");',
+    "  const [variant, afterVariant] = decodeVarint(payload, 0);",
+    "  let offset = afterVariant;",
+    "  let response: FsResponse;",
+    "  switch (variant) {",
+  );
+  response.forEach((variant, index) => {
+    output.push(`    case ${index}: {`);
+    for (const field of variant.fields) {
+      // Only response byte vectors are admitted by parseFsEnum's current schema.
+      output.push(
+        `      const [${field.name}Length, afterLength] = decodeVarint(payload, offset);`,
+        `      const end = afterLength + ${field.name}Length;`,
+        '      if (end > payload.byteLength) throw kipcError("KELD-IPC-003", "FsResponse byte length does not match payload");',
+        `      const ${field.name} = new Uint8Array(payload.subarray(afterLength, end));`,
+        "      offset = end;",
+      );
+    }
+    output.push(`      response = { variant: "${variant.name}"${variant.fields.map((field) => `, ${field.name}`).join("")} };`, "      break;", "    }");
+  });
+  output.push(
+    '    default: throw kipcError("KELD-IPC-003", "unknown FsResponse variant");',
+    "  }",
+    '  if (offset !== payload.byteLength) throw kipcError("KELD-IPC-003", "trailing bytes after FsResponse");',
+    "  return response;",
+    "}",
+    "",
+  );
+  return output.join("\n");
+}
+
+/** Requires byte-exact generated FS binding freshness against the native enums. */
+export function assertFsArtifactFresh(rustSource: string, artifact: Uint8Array): void {
+  if (!Buffer.from(artifact).equals(Buffer.from(renderFsBinding(rustSource), "utf8"))) {
+    fail("committed fs.generated.ts is stale; run bun run echo:generate");
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Channel-table target (GH-508 spec docs/specs/gh508-kipc-channel-table.md §4.3).
+//
+// Reads the Rust channel table and rewrites one delimited region of the single
+// staged transport file. Rust compilation (`validate_table`) is the validator
+// of record; this parser admits only the rustfmt-normalized entry forms and
+// fails closed, naming the source line, on anything else. It never guesses.
+// ---------------------------------------------------------------------------
+
+/** First line of the generated region; the rest of the line is its provenance. */
+export const CHANNEL_REGION_BEGIN = "// @generated-begin channel-table";
+/** Last line of the generated region. */
+export const CHANNEL_REGION_END = "// @generated-end channel-table";
+
+const ENTRY_HEADER = /^pub const ([A-Z][A-Z0-9_]*): ChannelEntry =(.*)$/;
+const ENTRY_NAME = /^"([a-z][a-z0-9-]{0,31})"$/;
+const ENTRY_ID = /^(?:0|[1-9][0-9]{0,4})$/;
+const ENTRY_CLASS = /^ReceiveClass::[A-Z][A-Za-z0-9]*$/;
+const CAPABILITY_PATH = "[A-Za-z_][A-Za-z0-9_]*(?:::[A-Za-z_][A-Za-z0-9_]*)*";
+const ENTRY_AUTHORITY = new RegExp(
+  `^Authority::(?:HostInternal|Guarded\\(&\\[\\s*${CAPABILITY_PATH}(?:\\s*,\\s*${CAPABILITY_PATH})*\\s*,?\\s*\\]\\))$`,
+);
+const MAX_ENTRY_LINES = 32;
+
+/** One parsed `pub const NAME: ChannelEntry` declaration. */
+export interface ChannelTableEntry {
+  /** Rust constant name, e.g. `ECHO`. */
+  readonly rustName: string;
+  /** Entry name, e.g. `echo`. */
+  readonly name: string;
+  /** Wire channel id. */
+  readonly id: number;
+  /** `ReceiveClass` variant, e.g. `HostCall`. */
+  readonly receiveClass: string;
+}
+
+/** The parsed channel table in `CHANNEL_TABLE` order. */
+export interface ChannelTable {
+  /** `HANDSHAKE_CHANNEL`, reserved for `HELLO`. */
+  readonly handshake: number;
+  readonly entries: readonly ChannelTableEntry[];
+  /** `ReceiveClass` variants for which `carries_host_events` is true. */
+  readonly hostEventClasses: readonly string[];
+}
+
+interface SourceArgument {
+  text: string;
+  line: number;
+}
+
+function channelFail(line: number, detail: string): never {
+  return fail(`crates/keld-ipc/src/channel_table.rs source line ${line}: ${detail}`);
+}
+
+/** Splits call arguments at top-level commas, keeping each argument's source line. */
+function splitArguments(segments: readonly SourceArgument[]): SourceArgument[] {
+  const args: SourceArgument[] = [];
+  let depth = 0;
+  let inString = false;
+  let current = "";
+  let currentLine = segments[0]?.line ?? 0;
+  for (const segment of segments) {
+    for (let index = 0; index < segment.text.length; index += 1) {
+      const char = segment.text[index];
+      if (current.trim().length === 0) currentLine = segment.line;
+      if (inString) {
+        if (char === "\\") {
+          current += char + (segment.text[index + 1] ?? "");
+          index += 1;
+          continue;
+        }
+        if (char === '"') inString = false;
+      } else if (char === '"') {
+        inString = true;
+      } else if ("([{".includes(char)) {
+        depth += 1;
+      } else if (")]}".includes(char)) {
+        depth -= 1;
+      } else if (char === "," && depth === 0) {
+        args.push({ text: current.trim(), line: currentLine });
+        current = "";
+        continue;
+      }
+      current += char;
+    }
+    current += " ";
+  }
+  if (current.trim().length !== 0) args.push({ text: current.trim(), line: currentLine });
+  return args;
+}
+
+function parseEntry(
+  lines: readonly string[],
+  start: number,
+): { entry: ChannelTableEntry; consumed: number } {
+  const header = ENTRY_HEADER.exec(lines[start]);
+  if (!header) {
+    channelFail(start + 1, `unsupported ChannelEntry declaration: ${lines[start].trim()}`);
+  }
+  const [, rustName, rest] = header;
+  let segments: SourceArgument[];
+  let consumed: number;
+  const singleLine = /^ ChannelEntry::new\((.*)\);$/.exec(rest);
+  if (singleLine) {
+    segments = [{ text: singleLine[1], line: start + 1 }];
+    consumed = 1;
+  } else if (rest === "") {
+    const wrapped = /^    ChannelEntry::new\((.*)\);$/.exec(lines[start + 1] ?? "");
+    if (!wrapped) {
+      channelFail(start + 2, "expected the rustfmt-wrapped `    ChannelEntry::new(...);` line");
+    }
+    segments = [{ text: wrapped[1], line: start + 2 }];
+    consumed = 2;
+  } else if (rest === " ChannelEntry::new(") {
+    segments = [];
+    let index = start + 1;
+    for (; index < lines.length && lines[index] !== ");"; index += 1) {
+      if (index - start > MAX_ENTRY_LINES) channelFail(start + 1, `unterminated ${rustName} entry`);
+      if (!lines[index].startsWith("    ")) {
+        channelFail(index + 1, `entry argument is not rustfmt-indented: ${lines[index].trim()}`);
+      }
+      segments.push({ text: lines[index].trim(), line: index + 1 });
+    }
+    if (index >= lines.length) channelFail(start + 1, `unterminated ${rustName} entry`);
+    consumed = index - start + 1;
+  } else {
+    return channelFail(start + 1, `unsupported ${rustName} initializer; use ChannelEntry::new(...)`);
+  }
+
+  const args = splitArguments(segments);
+  if (args.length !== 4) {
+    channelFail(start + 1, `${rustName} must pass exactly 4 arguments to ChannelEntry::new`);
+  }
+  const [nameArg, idArg, classArg, authorityArg] = args;
+  const name = ENTRY_NAME.exec(nameArg.text);
+  if (!name) {
+    channelFail(nameArg.line, `entry name must be a "[a-z][a-z0-9-]{0,31}" string literal, found ${nameArg.text}`);
+  }
+  if (!ENTRY_ID.test(idArg.text) || Number(idArg.text) > 0xffff) {
+    channelFail(idArg.line, `channel id must be a decimal u16 literal, found ${idArg.text}`);
+  }
+  if (!ENTRY_CLASS.test(classArg.text)) {
+    channelFail(classArg.line, `receive class must be a ReceiveClass variant, found ${classArg.text}`);
+  }
+  if (!ENTRY_AUTHORITY.test(authorityArg.text)) {
+    channelFail(
+      authorityArg.line,
+      `authority must be Authority::HostInternal or Authority::Guarded(&[<keld_guard constant>, ...]), found ${authorityArg.text}`,
+    );
+  }
+  const receiveClass = classArg.text.slice("ReceiveClass::".length);
+  return { entry: { rustName, name: name[1], id: Number(idArg.text), receiveClass }, consumed };
+}
+
+function parseTableList(lines: readonly string[], start: number): { names: string[]; consumed: number } {
+  const singleLine = /^pub const CHANNEL_TABLE: &\[ChannelEntry\] = &\[(.*)\];$/.exec(lines[start]);
+  let raw: string[];
+  let consumed: number;
+  if (singleLine) {
+    raw = singleLine[1].split(",").map((name) => name.trim());
+    consumed = 1;
+  } else if (lines[start] === "pub const CHANNEL_TABLE: &[ChannelEntry] = &[") {
+    raw = [];
+    let index = start + 1;
+    for (; index < lines.length && lines[index] !== "];"; index += 1) {
+      const item = /^    ([A-Z][A-Z0-9_]*),$/.exec(lines[index]);
+      if (!item) channelFail(index + 1, `unsupported CHANNEL_TABLE item: ${lines[index].trim()}`);
+      raw.push(item[1]);
+    }
+    if (index >= lines.length) channelFail(start + 1, "unterminated CHANNEL_TABLE");
+    consumed = index - start + 1;
+  } else {
+    return channelFail(start + 1, `unsupported CHANNEL_TABLE declaration: ${lines[start].trim()}`);
+  }
+  for (const name of raw) {
+    if (!/^[A-Z][A-Z0-9_]*$/.test(name)) channelFail(start + 1, `CHANNEL_TABLE lists ${name}, which is not a constant name`);
+  }
+  return { names: raw, consumed };
+}
+
+/** TypeScript name: the entry name uppercased, `-` mapped to `_`, plus `_CHANNEL`. */
+export function channelConstantName(name: string): string {
+  return `${name.toUpperCase().replaceAll("-", "_")}_CHANNEL`;
+}
+
+/**
+ * The production lines of `channel_table.rs`: everything before its one
+ * `#[cfg(test)] mod tests { ... }`, which must be the file's last item. Any other
+ * `cfg` gate, anything after the test module and any block comment fails, so no
+ * entry can sit where this parser does not read it.
+ */
+function productionLines(all: readonly string[]): readonly string[] {
+  const gates = all.flatMap((line, index) => (/^\s*#\[cfg/.test(line) ? [index] : []));
+  if (gates.length > 1 || (gates.length === 1 && all[gates[0]] !== "#[cfg(test)]")) {
+    channelFail(gates[gates.length === 1 ? 0 : 1] + 1, "only one `#[cfg(test)]`, gating the final `mod tests {`, is admitted");
+  }
+  let production: readonly string[] = all;
+  if (gates.length === 1) {
+    const gate = gates[0];
+    if (all[gate + 1] !== "mod tests {") channelFail(gate + 2, "the `#[cfg(test)]` gate must open `mod tests {`");
+    const close = all.indexOf("}", gate + 2);
+    if (close === -1) channelFail(gate + 2, "unterminated `mod tests {`");
+    const trailing = all.slice(close + 1).findIndex((line) => line.trim().length !== 0);
+    if (trailing !== -1) channelFail(close + trailing + 2, "nothing may follow the test module");
+    production = all.slice(0, gate);
+  }
+  production.forEach((line, index) => {
+    if (line.includes("/*") || line.includes("*/")) channelFail(index + 1, "block comments are not admitted");
+  });
+  return production;
+}
+
+/** Parses the production half of `crates/keld-ipc/src/channel_table.rs`. */
+export function parseChannelTable(rustSource: string): ChannelTable {
+  const lines = productionLines(rustSource.replaceAll("\r\n", "\n").split("\n"));
+  let handshake: number | undefined;
+  const entries = new Map<string, ChannelTableEntry>();
+  let listed: string[] | undefined;
+  let hostEventClasses: string[] | undefined;
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    if (/^\s*\/\//.test(line)) continue;
+    if (line.startsWith("pub const HANDSHAKE_CHANNEL")) {
+      const parsed = /^pub const HANDSHAKE_CHANNEL: ChannelId = ChannelId\((0|[1-9][0-9]{0,4})\);$/.exec(line);
+      if (!parsed || Number(parsed[1]) > 0xffff) channelFail(index + 1, `unsupported HANDSHAKE_CHANNEL: ${line.trim()}`);
+      if (handshake !== undefined) channelFail(index + 1, "duplicate HANDSHAKE_CHANNEL");
+      handshake = Number(parsed[1]);
+    } else if (line === "    pub const fn carries_host_events(self) -> bool {") {
+      // The Rust table owns which classes carry host EVENTs; read, never mirror.
+      const body = /^        matches!\(self, (Self::[A-Z][A-Za-z0-9]*(?: \| Self::[A-Z][A-Za-z0-9]*)*)\)$/.exec(lines[index + 1] ?? "");
+      if (!body || lines[index + 2] !== "    }") {
+        channelFail(index + 2, "carries_host_events must be one `matches!(self, Self::A | Self::B)` line");
+      }
+      if (hostEventClasses !== undefined) channelFail(index + 1, "duplicate carries_host_events");
+      hostEventClasses = body[1].split(" | ").map((variant) => variant.slice("Self::".length));
+      index += 2;
+    } else if (line.startsWith("pub const CHANNEL_TABLE")) {
+      if (listed !== undefined) channelFail(index + 1, "duplicate CHANNEL_TABLE");
+      const table = parseTableList(lines, index);
+      listed = table.names;
+      index += table.consumed - 1;
+    } else if (/^pub const [A-Za-z0-9_]+: ChannelEntry\b/.test(line)) {
+      const { entry, consumed } = parseEntry(lines, index);
+      if (entries.has(entry.rustName)) channelFail(index + 1, `duplicate entry constant ${entry.rustName}`);
+      entries.set(entry.rustName, entry);
+      index += consumed - 1;
+    } else if (line.includes("ChannelEntry::new(") || /\b(?:const|static)\s+[A-Za-z0-9_]+\s*:\s*ChannelEntry\b/.test(line)) {
+      channelFail(index + 1, `ChannelEntry outside the admitted pub const form: ${line.trim()}`);
+    }
+  }
+  if (handshake === undefined) fail("crates/keld-ipc/src/channel_table.rs: missing HANDSHAKE_CHANNEL");
+  if (hostEventClasses === undefined) fail("crates/keld-ipc/src/channel_table.rs: missing ReceiveClass::carries_host_events");
+  if (listed === undefined) fail("crates/keld-ipc/src/channel_table.rs: missing CHANNEL_TABLE");
+
+  const ordered: ChannelTableEntry[] = [];
+  for (const rustName of listed) {
+    const entry = entries.get(rustName);
+    if (!entry) fail(`CHANNEL_TABLE lists ${rustName}, which is not a parsed ChannelEntry constant`);
+    if (ordered.includes(entry)) fail(`CHANNEL_TABLE lists ${rustName} more than once`);
+    ordered.push(entry);
+  }
+  for (const rustName of entries.keys()) {
+    if (!listed.includes(rustName)) fail(`ChannelEntry constant ${rustName} is not listed in CHANNEL_TABLE`);
+  }
+  const names = new Set<string>();
+  const constants = new Set<string>(["HANDSHAKE_CHANNEL"]);
+  for (const entry of ordered) {
+    if (names.has(entry.name)) fail(`duplicate channel entry name ${entry.name}`);
+    names.add(entry.name);
+    const constant = channelConstantName(entry.name);
+    if (constants.has(constant)) fail(`entry ${entry.name} would generate a duplicate ${constant}`);
+    constants.add(constant);
+  }
+  return { handshake, entries: ordered, hostEventClasses };
+}
+
+/** Renders the generated `transport.ts` region, markers included, without a trailing newline. */
+export function renderChannelTableRegion(rustSource: string): string {
+  const table = parseChannelTable(rustSource);
+  const lines = [
+    `${CHANNEL_REGION_BEGIN}: packages/@keld/kipc/scripts/echo-codegen.ts from`,
+    "// crates/keld-ipc/src/channel_table.rs. Do not edit by hand; run bun run echo:generate.",
+    "/** Reserved `HELLO` channel (`keld_ipc::channel_table::HANDSHAKE_CHANNEL`). */",
+    `export const HANDSHAKE_CHANNEL = ${table.handshake};`,
+  ];
+  for (const entry of table.entries) {
+    lines.push(`/** Channel \`${entry.name}\` (\`keld_ipc::channel_table::${entry.rustName}\`). */`);
+    lines.push(`export const ${channelConstantName(entry.name)} = ${entry.id};`);
+  }
+  const allocated = table.entries.map((entry) => channelConstantName(entry.name));
+  lines.push(
+    "/** An allocated channel id (`keld_ipc::channel_table::CHANNEL_TABLE`). */",
+    `export type AllocatedChannel = ${allocated.map((name) => `typeof ${name}`).join(" | ")};`,
+    "/** Every allocated channel id, in table order. */",
+    `export const ALLOCATED_CHANNELS: readonly AllocatedChannel[] = Object.freeze([${allocated.join(", ")}]);`,
+  );
+  const eventChannels = table.entries
+    .filter((entry) => table.hostEventClasses.includes(entry.receiveClass))
+    .map((entry) => channelConstantName(entry.name));
+  lines.push(
+    "/** Channels whose receive class carries host `EVENT`s (`ReceiveClass::carries_host_events`). */",
+    `export const HOST_EVENT_CHANNELS: readonly AllocatedChannel[] = Object.freeze([${eventChannels.join(", ")}]);`,
+  );
+  lines.push(CHANNEL_REGION_END);
+  return lines.join("\n");
+}
+
+/** Line bounds of the one generated region in `transportSource`. */
+export function channelRegionBounds(transportSource: string): { lines: string[]; begin: number; end: number } {
+  const lines = transportSource.split("\n");
+  const begins = lines.flatMap((line, index) => (line.startsWith(CHANNEL_REGION_BEGIN) ? [index] : []));
+  const ends = lines.flatMap((line, index) => (line.startsWith(CHANNEL_REGION_END) ? [index] : []));
+  if (begins.length !== 1 || ends.length !== 1 || begins[0] > ends[0]) {
+    fail(
+      "transport.ts must contain exactly one channel-table region: one `// @generated-begin channel-table` line before one `// @generated-end channel-table` line",
+    );
+  }
+  return { lines, begin: begins[0], end: ends[0] };
+}
+
+/** Replaces the generated region of `transportSource` with `region`. */
+export function replaceChannelTableRegion(transportSource: string, region: string): string {
+  const { lines, begin, end } = channelRegionBounds(transportSource);
+  return [...lines.slice(0, begin), region, ...lines.slice(end + 1)].join("\n");
+}
+
+/** Fails when the committed region is not byte-identical to the render of the Rust table. */
+export function assertChannelTableRegionFresh(rustSource: string, transportSource: string): void {
+  const { lines, begin, end } = channelRegionBounds(transportSource);
+  if (lines.slice(begin, end + 1).join("\n") !== renderChannelTableRegion(rustSource)) {
+    fail("channel table region is stale; run bun run echo:generate");
+  }
+}
+
+/** `transportSource` without its stamp line (#653); unchanged when it has none. */
+export function unstampedTransport(transportSource: string): string {
+  return transportSource.startsWith(TRANSPORT_STAMP_PREFIX)
+    ? transportSource.slice(transportSource.indexOf("\n") + 1)
+    : transportSource;
+}
+
+/** The transport with a fresh channel-table region, restamped over its final bytes. */
+export function regenerateTransport(rustSource: string, transportSource: string): string {
+  const region = renderChannelTableRegion(rustSource);
+  return stampTransport(replaceChannelTableRegion(unstampedTransport(transportSource), region));
+}
+
 function generate(): void {
+  const fsGenerated = renderFsBinding(readFileSync(fsSourcePath, "utf8"));
   const generated = currentGeneratedBytes();
   for (const path of generatedPaths) writeFileSync(path, generated, "utf8");
+  writeFileSync(fsGeneratedPath, fsGenerated, "utf8");
+  const regenerated = regenerateTransport(
+    readFileSync(channelTableSourcePath, "utf8"),
+    readFileSync(transportPath, "utf8"),
+  );
+  writeFileSync(transportPath, regenerated, "utf8");
 }
 
 function check(): void {
+  assertFsArtifactFresh(readFileSync(fsSourcePath, "utf8"), readFileSync(fsGeneratedPath));
   const rustSource = readFileSync(rustSourcePath, "utf8");
   for (const path of generatedPaths) {
     let actual: Buffer;
@@ -112,6 +640,15 @@ function check(): void {
       fail(`cannot read ${path}: ${String(error)}; run bun run echo:generate`);
     }
     assertEchoArtifactFresh(rustSource, actual);
+  }
+  assertChannelTableRegionFresh(
+    readFileSync(channelTableSourcePath, "utf8"),
+    readFileSync(transportPath, "utf8"),
+  );
+  try {
+    verifyTransportStamp(readFileSync(transportPath), "packages/@keld/kipc/src/transport.ts");
+  } catch (error) {
+    fail(`transport stamp is stale; run bun run echo:generate (${error instanceof Error ? error.message : String(error)})`);
   }
 }
 

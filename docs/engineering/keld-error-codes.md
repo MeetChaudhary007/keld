@@ -10,8 +10,9 @@ CI: `crates/keld-cli/tests/error_registry.rs` (runs with workspace nextest).
 - Duplicate `## KELD-…` headings fail the test.
 - A `KELD-*` code in `keld-ipc` / `keld-wv` / `keld-cli` / `keld-guard` /
   `keld-runtime` / `keld-native` / `keld-compat` / `keld-core` / `keld-update` /
-  `keld-pack` / `keld-updater-helper` `src`, `keld-cli` templates, or workspace
-  `tools/` that has no heading here fails the test.
+  `keld-pack` / `keld-host` / `keld-updater-helper` `src`, `keld-cli` templates, the
+  `@keld/kipc` TypeScript transport `src`, the `@keld/api` public API `src`, or
+  workspace `tools/` that has no heading here fails the test.
 - A heading here that is not emitted in those trees fails the test.
 - Every entry MUST have non-empty `crate`, `message`, and `fix` lines.
 
@@ -25,6 +26,12 @@ match the crate that already emits the code. Do not invent a third spelling.
 3. Emit the same code from `Display` / `KeldErrorObject`, with the `fix` in the
    message.
 4. Run `cargo nextest run -p keld-cli -- error_registry`.
+
+## KELD-API-001
+
+- crate: @keld/api
+- message: Application channel call failed or the declared channel configuration is invalid
+- fix: Check the declared application channel, handler registration, request/reply codecs and kipc frame-size bounds; diagnose handler failures in the application code.
 
 ## KELD-IPC-001
 
@@ -151,6 +158,42 @@ match the crate that already emits the code. Do not invent a third spelling.
 - crate: keld-ipc
 - message: keld-attempt health rolled back by the owner (KELD-AK1 result 2)
 - fix: Never arm the recovery gate: end the host on any later application-generation exit.
+
+## KELD-IPC-022
+
+- crate: @keld/kipc
+- message: link closed before the host replied; no reply was received and the call's host effect is unknown
+- fix: Treat the call as not answered. The role's link is gone: check the host log for the close cause, and do not retry on this link, because it cannot reconnect.
+
+## KELD-IPC-023
+
+- crate: keld-ipc
+- message: role generation retired before this call completed
+- fix: The role instance is being replaced or stopped, and the call's host effect is unknown: its handler may have run. Do not replay it, here or from the successor generation, without an idempotency contract for that call.
+
+## KELD-IPC-024
+
+- crate: keld-ipc
+- message: session ended by an accepted Quit before this call completed
+- fix: The application is quitting. Do not issue new work; finish only the shutdown path.
+
+## KELD-IPC-025
+
+- crate: @keld/kipc
+- message: transport Worker dead or unresponsive; the role's link is lost
+- fix: The role has no link and cannot reconnect. Report the crash. The host restarts the role per its policy; check the role log for the Worker's last error.
+
+## KELD-IPC-026
+
+- crate: @keld/kipc
+- message: parked ring or reply slot full; the link was closed rather than drop a frame
+- fix: Raise ringBytes, ringRecords or replyBytes at WorkerLink.open, or reduce the host event rate toward this role. Retained events were delivered in order.
+
+## KELD-IPC-027
+
+- crate: @keld/kipc
+- message: too many unanswered calls; the link was closed rather than track another abandoned id
+- fix: The host is not answering this role's calls. Check the host log for the stalled handler; raise call deadlines only if the host is slow rather than stuck. The role's link is gone and cannot reconnect.
 
 ## KELD-WV-001
 

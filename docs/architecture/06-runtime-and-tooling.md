@@ -98,11 +98,16 @@
   installs KEL-78/T3's separate unnamed, non-breakaway, kill-on-close inner
   Job, so host-only death reaps Bun and its enrolled descendants even while the
   launcher survives. The two Jobs have separate owners and separate host-death
-  falsifiers. The CLI keeps the full outer Job handle; only the reduced cleanup
-  duplicate reaches the sentinel, never the host or Bun. This `keld dev` proof does
-  not make it an installed updater launcher or select a MachineSeamless writer
-  mechanism. KEL-101 separately owns the named-pipe/DACL boundary; this KEL-96
-  slice makes no LPAC or privileged-dispatch claim.
+  falsifiers. The host keeps the inner Job's handle as a capability that nothing
+  closes while it runs, and clears that Job's kill-on-close exactly once, on a
+  `PerUserDirect` exit after a committed update, after a census of the Job shows only
+  the host and the committed candidate's family (KEL-53 §4 "Candidate release after
+  commit", slice S6b3); every other exit, and every abnormal death before that clear,
+  keeps the kill-on-close reap. The CLI keeps the full outer Job handle; only the
+  reduced cleanup duplicate reaches the sentinel, never the host or Bun. This
+  `keld dev` proof does not make it an installed updater launcher or select a
+  MachineSeamless writer mechanism. KEL-101 separately owns the named-pipe/DACL
+  boundary; this KEL-96 slice makes no LPAC or privileged-dispatch claim.
 - **Windows installed-root product direction (KEL-254/KEL-53):** the default direct
   install is per-user under the user's application location, with automatic updates
   under the same-user authority and no UAC. Program Files installs support explicit-UAC
@@ -408,13 +413,36 @@ KEL-78; KEL-96 consumes only the landed per-OS mechanisms.
 The Bun side speaks kipc directly — `packages/@keld/kipc/src/transport.ts` is the
 one TypeScript framing/HELLO/deadline/write owner (KEL-136). `keld create` embeds
 that file as `src/kipc-transport.ts`; the hello echo adapter and `@keld/electron`
-lifecycle adapter import it. `DirectedReader` on that transport parks lifecycle
-Events while waiting for Echo Reply so stock echo survives a preceding `Ready`.
+lifecycle adapter import it, and both open the role's link through its GH-527
+transport Worker (#528 T3). That Worker's entry is the transport file itself
+(`new Worker(new URL(import.meta.url))`), so the transport MUST stay its own staged
+file and MUST NOT be bundled into `src/main.ts`; `WorkerLink.open` refuses to run from
+any other file name. A release build of the transport (the future `keld build`,
+KEL-19) MUST build it as that separate file with `KELD_KIPC_RELEASE` defined as `true`
+and syntax minification, which removes every test-hook code path
+(`packages/@keld/kipc/src/release-build.test.ts`). `keld create` already writes every
+app's `src/kipc-transport.ts` with that constant defined
+(`crates/keld-cli/src/template.rs` `KIPC_RELEASE_DEFINITION`), so no created app can
+reach the hooks (`crates/keld-cli/tests/bun_echo.rs`
+`created_transport_registers_no_test_hook_seam`). Only the in-repo canonical file keeps
+them, reachable from `src/test-hooks.ts` under `KELD_KIPC_TEST_HOOKS=1`. The
+build path MUST keep the staged basename rule: the transport ships as its own file
+named `kipc-transport.ts` or `.js`. `WorkerLink.open` refuses a hashed chunk name, a
+transport that is the process entry (`bun build --compile` output included), and a
+call from inside a transport Worker. A name is not identity, so it also refuses a file
+whose line-1 transport stamp is not the SHA-256 of the bytes after it (#653,
+`TRANSPORT_STAMP_PREFIX`). It checks this before the Worker exists, so a bundle named
+`transport.js` is never evaluated by a transport Worker. `bun run echo:generate`
+restamps the canonical file and `keld create` restamps the copy it writes; the future
+`keld build` MUST stamp the transport file it stages.
 The non-release boot compiler copies that sidecar
 into the owner-private stage when present so `keld dev` Bun can resolve it.
 Linux strict remaps the entry to `/code/main.ts` and, when the sidecar exists,
 binds `src/kipc-transport.ts` to `/code/kipc-transport.ts` as a second file
-mount (directory-wide `/code` mounts stay forbidden). KEL-98's bounded cold generator
+mount (directory-wide `/code` mounts stay forbidden). The transport Worker loads from
+that second mount; no third file is bound
+(`crates/keld-runtime/tests/linux_strict_boundary.rs`
+`worker_link_self_entry_runs_from_the_two_staged_files`). KEL-98's bounded cold generator
 derives the checked-in `src/echo.generated.ts` payload declarations from the Rust echo
 structs for `keld create`; type-only use keeps that source-time file out of the runtime
 stage. General `keld gen` / `@keld/schema` codegen (KEL-13) is not built, so this shared
@@ -500,10 +528,14 @@ the [product-status ledger](../engineering/product-status.md#packages) owns pack
   reader `ExpectedAppIdentity::from_signed_image` (KEL-254 T3 Part B) have landed, and
   the KEL-96 host consumes them: a lease-less Windows launch verifies its own image once
   through `keld-guard`, reads the expectation from that pinned handle and selects its
-  installation before any listener, child or window. The entrypoint takes a closed image
-  choice, `keld-host.exe` or `keld-updater-helper.exe`, and the verified signer, and
-  `keld-update` requires the record's publisher scope and app id to equal that signer
-  before the snapshot lease, the one rule for both images (KEL-53 T4d S9a). The same
+  installation before any listener, child or window. That verification opens the
+  `current_exe()` path, so until KEL-53 T4d slice S9d binds the opened file to the
+  running image, for the host and the helper alike, the two are not proven to be one
+  file (KEL-270 owner decision `740998f4`, 2026-10-07, item 1). The entrypoint takes a
+  closed image choice, `keld-host.exe` or `keld-updater-helper.exe`, and the verified
+  signer, and `keld-update` requires the record's publisher scope and app id to equal
+  that signer before the snapshot lease, the one rule for both images (KEL-53 T4d
+  S9a). The same
   locator anchors the elevated helper itself: `anchor_updater_helper` reads the helper's
   own expectation, refuses every mode but `MachineUacDirect`, applies the signer rule and
   requires its own image to be the journaled one or, without a journal, its role's
@@ -519,10 +551,23 @@ the [product-status ledger](../engineering/product-status.md#packages) owns pack
   `KELD-AB1` health-receipt digest, the owner's expected digest and the two-step
   `accept_health` (a durable `health-accepted` before completion), the launch handle's
   liveness check, and the same-token `CREATE_SUSPENDED` candidate launch whose
-  attempt-Job membership precedes its first instruction. Live feed orchestration, that
-  composition (host candidate launch, the private health channel and its 30-second
-  `Ready` observation, candidate-mode selection) and installed-host lifecycle
-  composition remain unimplemented. Planned Windows
+  attempt-Job membership precedes its first instruction. KEL-53 T4d S6b3 adds the
+  candidate release after commit: the host keeps its host-death Job as an opaque
+  capability, one clear primitive strips kill-on-close with a read-back, the attempt
+  Job is released only after the journal is removed, and the host-death Job only after
+  the host has reaped its roles and a census shows only itself and the candidate
+  family; rollback releases nothing, and a release refused at its deadline costs only
+  availability. KEL-53 T4d S6c specifies the profile handover and S6b4 the launch-record
+  detach: the old host closes its window, gives the application a bounded time to quit
+  on its own before ending it, and releases the persistent WebView2 profile before it
+  launches the candidate; the writer lease refuses every other launch until the
+  candidate's or the restored session's profile is held; a rolled-back attempt restores
+  a fresh session in process, acquiring the profile before the journal is rolled back;
+  and after both Job clears the host detaches its launch record instead of terminating
+  the candidate on drop. Live feed orchestration, that
+  composition (host candidate launch, the profile handover, the private health channel
+  and its 30-second `Ready` observation, candidate-mode selection, the release order,
+  the detach) and installed-host lifecycle composition remain unimplemented. Planned Windows
   direct modes share this state machine: same-user authority for per-user installs,
   explicit UAC for machine installs, and no-UAC machine activation only after KEL-270's
   lifecycle proof and a separately approved architecture/spec amendment selects and
@@ -541,7 +586,13 @@ The default Windows direct install is per-user under the installing user's
 `FOLDERID_LocalAppData` application tree. `PerUserDirect` updates run as that ordinary
 user without UAC; strict Keld role restrictions deny Bun/webview writes to the install
 and updater state. This does not claim protection from the owning user or arbitrary
-native malware already running as that user.
+native malware already running as that user. Before it launches a candidate, the old
+host closes its window, gives the application a bounded time to quit on its own, ends
+its session and releases the persistent WebView2 profile, so the candidate's session
+owns that profile and at most one application instance runs on the user's data
+(KEL-53 §4 "Profile handover"). After a committed `PerUserDirect`
+update the old host releases the healthy candidate from its own two Jobs before it
+exits, so the candidate outlives it (KEL-53 §4 "Candidate release after commit").
 
 An explicitly selected Program Files installation records one of two machine-wide
 modes. `MachineUacDirect` is the simple fallback: its trusted installer assigns BUILTIN

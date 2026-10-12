@@ -429,7 +429,8 @@ magic:u16 | ver:u8 | kind:u8 | flags:u16 | channel:u16 | corr:u32 | len:u32
   `StreamOpen=5`, `StreamChunk=6`, `StreamClose=7`, `Cancel=8`, `Grant=9`, `Ping=10`,
   plus `from_u8`. All eleven round-trip through the header; only `Hello`, `Call`,
   `Reply`, and `Ping` are *handled* by any session code today.
-- `ChannelId(pub u16)`, `CorrelationId(pub u32)` — newtypes, both `Copy`.
+- `ChannelId`, `CorrelationId(pub u32)` — newtypes, both `Copy`. `ChannelId`'s field is
+  private to `keld-ipc` (#634): other crates take ids from `channel_table` entries.
 - `FLAG_RAW: u16 = 1 << 0` — payload is raw bytes rather than codec-encoded.
 - `HeaderError::{BadMagic, BadVersion, BadKind}`.
 
@@ -447,7 +448,7 @@ Transport and session:
 | `echo_call` | `session` | `<S: Read + Write + AppLinkDeadlines>(&mut S, &EchoRequest, &SessionToken) -> Result<EchoResponse, IpcError>` |
 
 The echo vertical slice ([`echo.rs`](../../crates/keld-ipc/src/echo.rs)):
-`ECHO_CHANNEL: ChannelId = ChannelId(1)`, `EchoRequest { message: String, count: u32 }`,
+`ECHO_CHANNEL: ChannelId = channel_table::ECHO.id()` (wire id 1), `EchoRequest { message: String, count: u32 }`,
 `EchoResponse { message: String, count: u32 }`, and `handle_echo(&[u8]) -> Result<Vec<u8>, IpcError>`.
 
 `IpcError`: `Io`, `Header`, `Codec`, `PayloadTooLarge`, `Protocol { detail }`, `HelloAuth { detail }`, `Timeout` — codes
@@ -656,11 +657,14 @@ if (import.meta.main) {
 
   const session = await AppLinkSession.connect(link);
   try {
+    // Listen before the first call, so an early host EVENT is not missed.
+    const windowsClosed = lastWindowClosed(session);
     const response = await session.echo({ message: "keld", count: 1 });
     console.log(`ipc-echo ok: message=${JSON.stringify(response.message)} count=${response.count}`);
     console.log("{{name}}: main process ready (IPC echo ok)");
-    await quitAfterLastWindowClosed(session);
-    session.close();
+    await windowsClosed;
+    // Resolves only on the host's `LifecycleResponse::Quit`, then the link closes.
+    await session.quit();
     process.exit(0);
   } finally {
     session.close();

@@ -38,6 +38,12 @@ const SCAN_REL: &[&str] = &[
     "crates/keld-host/src",
     // The elevated updater helper binary (KEL-270 T4d S9c) emits KELD-HELPER-*.
     "crates/keld-updater-helper/src",
+    // The canonical TypeScript transport (GH-527 §4.4): the WorkerLink wake
+    // codes KELD-IPC-022/025/026/027 are emitted only here. Before this entry
+    // a TypeScript code was registered only when Rust emitted the same string.
+    "packages/@keld/kipc/src",
+    // Application-layer errors must not rely on Rust fixture copies.
+    "packages/@keld/api/src",
     "tools",
 ];
 
@@ -343,5 +349,28 @@ fn scanned_source_codes_match_registry() {
     assert!(
         extra.is_empty(),
         "codes in {REGISTRY_REL} not emitted in scanned crates/tools (remove or emit them): {extra:?}"
+    );
+}
+
+#[test]
+fn api_emitter_is_scanned_without_a_rust_shadow() {
+    let root = tempfile::tempdir().expect("isolated registry source roots");
+    for rel in SCAN_REL {
+        fs::create_dir_all(root.path().join(rel)).expect("create scanner root");
+    }
+    // An empty Rust file keeps the scanner non-empty without supplying an
+    // accidental copy of an application-layer code.
+    fs::write(root.path().join("crates/keld-core/src/lib.rs"), "")
+        .expect("write empty Rust source");
+    let api = root.path().join("packages/@keld/api/src");
+    fs::create_dir_all(&api).expect("create application source root");
+    fs::copy(
+        workspace_root().join("packages/@keld/api/src/channels.ts"),
+        api.join("channels.ts"),
+    )
+    .expect("copy actual production API emitter");
+    assert!(
+        emitted_codes(root.path()).contains("KELD-API-001"),
+        "the production application emitter must be covered without a Rust copy"
     );
 }

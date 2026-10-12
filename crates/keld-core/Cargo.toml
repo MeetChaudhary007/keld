@@ -11,6 +11,10 @@ authors.workspace = true
 [features]
 # Test-owned metadata root and fault controls for signed KEL-135 fixtures.
 profile-test-hooks = ["keld-wv/profile-test-hooks"]
+# Explicit proof support only; ordinary debug/release tests do not enable it.
+fs-acceptance-observer = ["keld-native/fs-acceptance-observer"]
+# Opt-in test packaging only; no shipping API, permission or provider.
+native-renderer-acceptance = ["fs-acceptance-observer"]
 
 [dependencies]
 keld-ipc = { workspace = true }
@@ -45,6 +49,16 @@ tempfile = { workspace = true }
 # Enables only KEL-135 fault injection in the signed core test fixture; this
 # feature is absent from the normal release dependency above.
 keld-wv = { workspace = true, features = ["profile-test-hooks"] }
+# Unit tests send PINGs on an unallocated channel id (#634: `ChannelId::for_test`).
+keld-ipc = { workspace = true, features = ["test-channel-ids"] }
 
 [lints]
 workspace = true
+
+# The separate process-main test compiles the same private Core owner source.
+# A checked target-only cfg selects its fixture graph; ordinary libtest stays whole.
+[[test]]
+name = "native_renderer_joint_main"
+path = "src/native_renderer_joint_main.rs"
+harness = false
+required-features = ["native-renderer-acceptance"]

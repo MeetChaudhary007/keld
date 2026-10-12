@@ -14,34 +14,105 @@ use std::thread;
 const TITLE: &str = "KEL142 Renderer Bridge Acceptance";
 const RESPONSE_PATH: &str = "/KEL142_RENDERED_renderer-click_42";
 const BEACON_GIF: &[u8] = b"GIF89a\x01\x00\x01\x00\x80\x00\x00\x00\x00\x00\xff\xff\xff!\xf9\x04\x01\x00\x00\x00\x00,\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02D\x01\x00;";
-const CLICK_SCRIPT: &str = r#"
+// Reuse GH-652's notification drain and fresh front-to-back window census.
+// The geometric candidate is a posting prerequisite, not delivery proof.
+// Keep the existing 10-second helper budget; actual page/handler oracles and
+// all existing failure-pipe ownership remain with the callers.
+pub(crate) const CLICK_SCRIPT: &str = r#"
+import AppKit
 import CoreGraphics
 import Foundation
-let pid = Int(CommandLine.arguments[1])!
+let pid = pid_t(CommandLine.arguments[1])!
 let title = CommandLine.arguments[2]
+// Query the actual poster. An emitted CLICKED line alone proves no delivery.
+if !CGPreflightPostEventAccess() {
+  let message = "CLICK_POSTER_UNAVAILABLE poster=\(ProcessInfo.processInfo.processIdentifier) target=\(pid) post_event_access=false\n"
+  FileHandle.standardError.write(Data(message.utf8))
+  exit(5)
+}
 let deadline = Date().addingTimeInterval(10)
+let clickPulseMicroseconds: useconds_t = 30_000
+final class Active { var pid: pid_t = -1; var name = "none" }
+let active = Active()
+let workspace = NSWorkspace.shared
+// Register before the first read, so an activation in between is still delivered.
+let observer = workspace.notificationCenter.addObserver(
+  forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main
+) { note in
+  let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
+  active.pid = app?.processIdentifier ?? -1
+  active.name = app?.localizedName ?? "unknown"
+  // Ends the run-loop pass that delivered it, so a blocked wait re-checks now.
+  CFRunLoopStop(CFRunLoopGetMain())
+}
+active.pid = workspace.frontmostApplication?.processIdentifier ?? -1
+active.name = workspace.frontmostApplication?.localizedName ?? "none"
+// Zero-timeout passes until one delivers nothing, so `active` is current.
+func drainActivations() {
+  var result: CFRunLoopRunResult
+  repeat {
+    if Date() >= deadline { return }
+    result = CFRunLoopRunInMode(.defaultMode, 0, true)
+  } while result == .handledSource || result == .stopped
+}
+func census() -> [[String: Any]] {
+  CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
+    as! [[String: Any]]
+}
+func int(_ row: [String: Any], _ key: CFString) -> Int { (row[key as String] as? NSNumber)?.intValue ?? -1 }
+func frame(_ row: [String: Any]) -> CGRect {
+  var rect = CGRect.zero
+  precondition(CGRectMakeWithDictionaryRepresentation(row[kCGWindowBounds as String] as! CFDictionary, &rect))
+  return rect
+}
+func hostWindow(_ rows: [[String: Any]]) -> [String: Any]? {
+  rows.first { int($0, kCGWindowOwnerPID) == Int(pid) && $0[kCGWindowName as String] as? String == title && int($0, kCGWindowLayer) == 0 }
+}
+func hitAt(_ point: CGPoint, _ rows: [[String: Any]]) -> [String: Any]? {
+  rows.first { int($0, kCGWindowLayer) == 0 && (($0[kCGWindowAlpha as String] as? NSNumber)?.doubleValue ?? 1) > 0 && frame($0).contains(point) }
+}
+func describe(_ row: [String: Any]?) -> String {
+  guard let row else { return "none" }
+  return "pid=\(int(row, kCGWindowOwnerPID)) owner=\((row[kCGWindowOwnerName as String] as? String) ?? "?") title=\((row[kCGWindowName as String] as? String) ?? "?")"
+}
+func failAtDeadline() -> Never {
+  drainActivations()
+  let rows = census()
+  let host = hostWindow(rows)
+  let hit = host.flatMap { hitAt(CGPoint(x: frame($0).midX, y: frame($0).midY), rows) }
+  print("CLICK_TARGET_NOT_HOST active_pid=\(active.pid) active_name=\(active.name) hit=\(describe(hit)) host=\(describe(host))")
+  exit(3)
+}
+while hostWindow(census()) == nil {
+  if Date() >= deadline { print("NOT_PRESENTED pid=\(pid) title=\(title)"); exit(3) }
+  sched_yield()
+}
 while true {
-  let rows = CGWindowListCopyWindowInfo(
-    [.optionOnScreenOnly, .excludeDesktopElements],
-    kCGNullWindowID
-  ) as! [[String: Any]]
-  if let row = rows.first(where: {
-    ($0[kCGWindowOwnerPID as String] as? NSNumber)?.intValue == pid &&
-    $0[kCGWindowName as String] as? String == title &&
-    ($0[kCGWindowLayer as String] as? NSNumber)?.intValue == 0
-  }) {
-    let bounds = row[kCGWindowBounds as String] as! CFDictionary
-    var rect = CGRect.zero
-    precondition(CGRectMakeWithDictionaryRepresentation(bounds, &rect))
-    let point = CGPoint(x: rect.midX, y: rect.midY)
-    CGEvent(mouseEventSource: nil, mouseType: .mouseMoved, mouseCursorPosition: point, mouseButton: .left)!.post(tap: .cghidEventTap)
-    CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown, mouseCursorPosition: point, mouseButton: .left)!.post(tap: .cghidEventTap)
-    usleep(30_000)
-    CGEvent(mouseEventSource: nil, mouseType: .leftMouseUp, mouseCursorPosition: point, mouseButton: .left)!.post(tap: .cghidEventTap)
-    print("CLICKED window=\((row[kCGWindowNumber as String] as! NSNumber).uint32Value) x=\(point.x) y=\(point.y)")
-    exit(0)
+  drainActivations()
+  if Date() >= deadline { failAtDeadline() }
+  if active.pid != pid {
+    if Date() >= deadline { failAtDeadline() }
+    // Blocks until the next activation notification or the deadline.
+    _ = CFRunLoopRunInMode(.defaultMode, deadline.timeIntervalSinceNow, true)
+    continue
   }
-  if Date() >= deadline { exit(3) }
+  let rows = census()
+  if let row = hostWindow(rows) {
+    let point = CGPoint(x: frame(row).midX, y: frame(row).midY)
+    if let hit = hitAt(point, rows), int(hit, kCGWindowNumber) == int(row, kCGWindowNumber) {
+      // The deadline bounds selection/admission. Once down is admitted, always
+      // release it; an OS scheduling delay must not leave pressed input behind.
+      if deadline.timeIntervalSinceNow <= TimeInterval(clickPulseMicroseconds) / 1_000_000 { failAtDeadline() }
+      CGEvent(mouseEventSource: nil, mouseType: .mouseMoved, mouseCursorPosition: point, mouseButton: .left)!.post(tap: .cghidEventTap)
+      CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown, mouseCursorPosition: point, mouseButton: .left)!.post(tap: .cghidEventTap)
+      usleep(clickPulseMicroseconds)
+      CGEvent(mouseEventSource: nil, mouseType: .leftMouseUp, mouseCursorPosition: point, mouseButton: .left)!.post(tap: .cghidEventTap)
+      print("CLICKED window=\(int(row, kCGWindowNumber)) x=\(point.x) y=\(point.y) active=\(active.pid)")
+      exit(0)
+    }
+  }
+  if Date() >= deadline { failAtDeadline() }
+  // Active but not yet the hit target: the next window-server census decides.
   sched_yield()
 }
 "#;
@@ -137,18 +208,14 @@ go.addEventListener("click", async () => {{
 }
 
 fn bundle_api_entry(project: &Path, repo: &Path) {
-    let source = project.join("src/kel142-entry.ts");
-    let output = project.join("src/main.ts");
     let api = serde_json::to_string(
         &repo
             .join("packages/@keld/api/src/index.ts")
             .to_string_lossy(),
     )
     .expect("API import path JSON");
-    fs::write(
-        &source,
-        format!(
-            r#"import {{ app, channels, echoChannel }} from {api};
+    let entry = format!(
+        r#"import {{ app, channels, echoChannel }} from {api};
 let handlerCalls = 0;
 channels.handle(echoChannel, async (request) => {{
   handlerCalls += 1;
@@ -159,23 +226,70 @@ await app.whenReady();
 console.error("KELD_KEL142_BUN_READY");
 await new Promise(() => {{}});
 "#
-        ),
-    )
-    .expect("write KEL-142 API entry");
+    );
+    bundle_public_api_entry(project, repo, "kel142", &entry);
+}
+
+/// Uses the established public-index app composition and external transport.
+/// Callers provide complete source, including their public `@keld/api` import.
+pub(crate) fn bundle_public_api_entry(
+    project: &Path,
+    repo: &Path,
+    fixture_name: &str,
+    entry: &str,
+) {
+    let source = project.join(format!("src/{fixture_name}-entry.ts"));
+    let output = project.join("src/main.ts");
+    fs::write(&source, entry).expect("write public API fixture entry");
+    // GH-527 §4.2: the transport is the transport Worker's entry, so it stays
+    // its own staged file (`src/kipc-transport.ts`, which the dev stage copies
+    // beside `src/main.ts`); the bundle imports it rather than inlining it.
+    let build = project.join(format!("{fixture_name}-build.ts"));
+    fs::write(&build, KIPC_SIDECAR_BUILD).expect("write KEL-142 bundle script");
     let result = Command::new("bun")
-        .args([
-            "build",
-            source.to_str().expect("source path"),
-            "--target=bun",
-            "--format=esm",
-            "--outfile",
-        ])
+        .arg(&build)
+        .arg(&source)
         .arg(&output)
         .output()
         .expect("bundle exact @keld/api fixture");
     assert!(result.status.success(), "bun build failed: {result:?}");
+    fs::copy(
+        repo.join("packages/@keld/kipc/src/transport.ts"),
+        project.join("src/kipc-transport.ts"),
+    )
+    .expect("stage the canonical transport beside the bundle");
+    let bundled = fs::read_to_string(&output).expect("read KEL-142 bundle");
+    assert!(
+        bundled.contains("from \"./kipc-transport.ts\"") && !bundled.contains("class WorkerLink"),
+        "the bundle must import the staged transport, never inline it"
+    );
     fs::remove_file(source).expect("remove bundle-only source");
+    fs::remove_file(build).expect("remove bundle-only script");
 }
+
+/// Bundles an `@keld/api` entry with the kipc transport left external as
+/// `./kipc-transport.ts` (GH-527 §4.2: the Worker's entry is that file).
+const KIPC_SIDECAR_BUILD: &str = r#"const [entry, out] = process.argv.slice(2);
+const result = await Bun.build({
+  entrypoints: [entry],
+  target: "bun",
+  format: "esm",
+  plugins: [{
+    name: "kipc-transport-sidecar",
+    setup(build) {
+      build.onResolve({ filter: /[\\/]kipc[\\/]src[\\/]transport\.ts$/ }, () => ({
+        path: "./kipc-transport.ts",
+        external: true,
+      }));
+    },
+  }],
+});
+if (!result.success) {
+  console.error(result.logs);
+  process.exit(1);
+}
+await Bun.write(out, result.outputs[0]);
+"#;
 
 fn spawn_render_beacon() -> (u16, mpsc::Receiver<Vec<u8>>, thread::JoinHandle<()>) {
     let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind KEL-142 render beacon");
@@ -249,32 +363,33 @@ fn real_pointer_roundtrip_uses_isolated_bridge_and_keld_api_handler() {
     let host = cleanup.cli.as_mut().expect("KEL-142 host cleanup owner");
     let _lease = host.stdin.take().expect("retain dev lease");
     let host_pid = host.id();
-    let windows = observer.expect_initial(host_pid, "kel142-renderer-bridge");
-    assert_eq!(windows.len(), 1, "one host-owned WKWebView window");
-
-    let click = Command::new("/usr/bin/xcrun")
-        .args(["swift", "-e", CLICK_SCRIPT, &host_pid.to_string(), TITLE])
-        .output()
-        .expect("post real CoreGraphics pointer input");
-    assert!(click.status.success(), "OS-visible click failed: {click:?}");
-
-    let request = beacon_rx
-        .recv_timeout(EVENT_DEADLINE)
-        .expect("typed Echo response was not rendered into the beacon image");
-    let request = String::from_utf8_lossy(&request);
-    assert!(
-        request.starts_with(&format!("GET {RESPONSE_PATH} ")),
-        "unexpected rendered-response beacon: {request}"
-    );
-    beacon_thread.join().expect("render beacon joins");
-
-    let mut child = cleanup.release();
-    if child.try_wait().expect("probe KEL-142 host exit").is_none() {
-        child
-            .kill()
-            .expect("stop KEL-142 acceptance host after evidence");
-    }
-    let output = crate::support::control::wait_child_output(child, EVENT_DEADLINE);
+    let mut click_output = None;
+    // Retain the child owner and pipes outside the failed-oracle unwind.
+    let observation = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let windows = observer.expect_initial(host_pid, "kel142-renderer-bridge");
+        assert_eq!(windows.len(), 1, "one host-owned WKWebView window");
+        click_output = Some(
+            Command::new("/usr/bin/xcrun")
+                .args(["swift", "-e", CLICK_SCRIPT, &host_pid.to_string(), TITLE])
+                .output()
+                .expect("post real CoreGraphics pointer input"),
+        );
+        let click = click_output.as_ref().expect("click output retained");
+        assert!(click.status.success(), "OS-visible click failed: {click:?}");
+        let request = beacon_rx
+            .recv_timeout(EVENT_DEADLINE)
+            .expect("typed Echo response was not rendered into the beacon image");
+        let request = String::from_utf8_lossy(&request);
+        assert!(
+            request.starts_with(&format!("GET {RESPONSE_PATH} ")),
+            "unexpected rendered-response beacon: {request}"
+        );
+        beacon_thread.join().expect("render beacon joins");
+        windows
+    }));
+    let (windows, output) =
+        finish_renderer_observation(cleanup, host_pid, click_output.as_ref(), observation);
+    let click = click_output.expect("successful observation retained click output");
     assert!(
         output.status.success() || output.status.signal() == Some(9),
         "unexpected KEL-142 acceptance cleanup status: {output:?}"
@@ -308,4 +423,135 @@ fn real_pointer_roundtrip_uses_isolated_bridge_and_keld_api_handler() {
         windows[0],
         click_evidence.trim()
     );
+}
+
+// Observation failure still fails the test after actual owned-child evidence is
+// captured. Use the existing bounded pipe/reap owner, not a detached reader.
+fn finish_renderer_observation(
+    mut cleanup: ShippingLaunchCleanup,
+    host_pid: u32,
+    click: Option<&std::process::Output>,
+    observation: std::thread::Result<Vec<u32>>,
+) -> (Vec<u32>, std::process::Output) {
+    if observation.is_err() {
+        if let Some(click) = click {
+            eprintln!(
+                "KELD_KEL142_CLICK_EVIDENCE status={:?} stdout={:?} stderr={:?}",
+                click.status,
+                String::from_utf8_lossy(&click.stdout),
+                String::from_utf8_lossy(&click.stderr),
+            );
+        } else {
+            eprintln!("KELD_KEL142_CLICK_EVIDENCE poster_not_started=true");
+        }
+    }
+    let child = cleanup.cli.as_mut().expect("KEL-142 host cleanup owner");
+    if child.try_wait().expect("probe KEL-142 host exit").is_none() {
+        child
+            .kill()
+            .expect("stop KEL-142 acceptance host after evidence");
+    }
+    let output = crate::support::control::wait_child_output(cleanup.release(), EVENT_DEADLINE);
+    match observation {
+        Ok(windows) => (windows, output),
+        Err(failure) => {
+            eprintln!(
+                "KELD_KEL142_FAILURE_EVIDENCE host={host_pid} status={:?} stdout={:?} stderr={:?}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            std::panic::resume_unwind(failure);
+        }
+    }
+}
+
+#[test]
+fn failed_pointer_observation_preserves_child_and_click_evidence() {
+    for (fault, marker) in [
+        ("poster", "KEL652_POSTER_FAULT"),
+        ("beacon", "KEL652_BEACON_FAULT"),
+    ] {
+        let child = Command::new(std::env::current_exe().expect("host test executable"))
+            .args([
+                "--exact",
+                "renderer_bridge::pointer_failure_evidence_fixture_process",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("KEL652_EVIDENCE_FAULT", fault)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("run isolated failed-observation fixture");
+        let output = crate::support::control::wait_child_output(child, EVENT_DEADLINE);
+        assert!(
+            !output.status.success(),
+            "failed {fault} oracle became a pass"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        for expected in [
+            marker,
+            "KELD_KEL142_CLICK_EVIDENCE status=",
+            "KEL652_CLICK_STDOUT",
+            "KEL652_CLICK_STDERR",
+            "KELD_KEL142_FAILURE_EVIDENCE host=",
+            "KEL652_CHILD_STDOUT",
+            "KEL652_CHILD_STDERR",
+        ] {
+            assert!(stderr.contains(expected), "missing {expected}: {output:?}");
+        }
+    }
+}
+
+#[test]
+#[ignore = "isolated failed-observation fixture invoked by its parent"]
+fn pointer_failure_evidence_fixture_process() {
+    let fault = std::env::var("KEL652_EVIDENCE_FAULT").expect("failure fixture mode");
+    let click_exit = match fault.as_str() {
+        "poster" => "5",
+        "beacon" => "0",
+        _ => panic!("unknown failure fixture mode: {fault}"),
+    };
+    let root = tempfile::tempdir().expect("failure-evidence fixture root");
+    let ready = root.path().join("ready");
+    let child = Command::new("/bin/sh")
+        .args([
+            "-c",
+            "printf KEL652_CHILD_STDOUT; printf KEL652_CHILD_STDERR >&2; printf ready > \"$1\"; read hold",
+            "kel652-evidence-child",
+        ])
+        .arg(&ready)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("launch pipe-evidence child");
+    let cleanup = ShippingLaunchCleanup::new(child);
+    let host_pid = cleanup.cli.as_ref().expect("child cleanup owner").id();
+    let deadline = std::time::Instant::now() + EVENT_DEADLINE;
+    while !ready.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "pipe child never became ready"
+        );
+        thread::yield_now();
+    }
+    let click = Command::new("/bin/sh")
+        .args([
+            "-c",
+            "printf KEL652_CLICK_STDOUT; printf KEL652_CLICK_STDERR >&2; exit \"$1\"",
+            "kel652-evidence-click",
+        ])
+        .arg(click_exit)
+        .output()
+        .expect("run failed poster fixture");
+    let observation = std::panic::catch_unwind(|| {
+        assert!(click.status.success(), "KEL652_POSTER_FAULT");
+        let (_tx, rx) = mpsc::channel::<Vec<u8>>();
+        rx.recv_timeout(std::time::Duration::from_millis(1))
+            .expect("KEL652_BEACON_FAULT");
+        Vec::new()
+    });
+    let _ = finish_renderer_observation(cleanup, host_pid, Some(&click), observation);
 }
