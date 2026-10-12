@@ -34,6 +34,9 @@ mod actor_owner;
 #[path = "native_generation_anchor_failure.rs"]
 mod anchor_failure;
 
+#[path = "native_generation_root_identity.rs"]
+mod root_identity;
+
 /// Releases test waits before router join and guardian EOF, also on an assertion unwind.
 struct Fixture {
     inputs: Inputs,
