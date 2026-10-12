@@ -1120,7 +1120,7 @@ fn assert_product_quit(
     for process in [host_pid, bun, descendant, guardian] {
         await_process_gone(process);
     }
-    assert!(native_windows(host_pid, TITLE).is_empty());
+    assert_eq!(native_windows(host_pid, TITLE).len(), 0);
     assert!(
         matches!(fs::symlink_metadata(stage_root), Err(error) if error.kind() == std::io::ErrorKind::NotFound),
         "product Quit retained exact stage before fixture destruction: {}",

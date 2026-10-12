@@ -11336,7 +11336,7 @@ mod tests {
             .install_generation(3, late_server)
             .expect("late bound after admitted restart closes cleanly");
         assert!(handle.current.lock().expect("generation lock").is_none());
-        assert!(handle.readers.lock().expect("reader lock").is_empty());
+        assert_eq!(handle.readers.lock().expect("reader lock").len(), 0);
     }
 
     #[test]
@@ -11370,14 +11370,14 @@ mod tests {
             &failure,
             |attempt| restarted.push(attempt)
         ));
-        assert!(restarted.is_empty());
+        assert_eq!(restarted.len(), 0);
         assert!(handle.current.lock().expect("generation lock").is_none());
         let (late_server, _late_client) = primary_test_stream_pair();
         handle
             .install_generation(3, late_server)
             .expect("late bind is harmless after teardown");
         assert!(handle.current.lock().expect("generation lock").is_none());
-        assert!(handle.readers.lock().expect("reader lock").is_empty());
+        assert_eq!(handle.readers.lock().expect("reader lock").len(), 0);
     }
 
     #[test]
@@ -11434,14 +11434,14 @@ mod tests {
         assert_eq!(admitted, !requests.is_empty());
         assert!(handle.shutdown.reader_stop.load(Ordering::Acquire));
         assert!(handle.current.lock().expect("generation lock").is_none());
-        assert!(handle.readers.lock().expect("reader lock").is_empty());
+        assert_eq!(handle.readers.lock().expect("reader lock").len(), 0);
 
         let (late_server, _late_client) = primary_test_stream_pair();
         handle
             .install_generation(3, late_server)
             .expect("late bound closes after teardown");
         assert!(handle.current.lock().expect("generation lock").is_none());
-        assert!(handle.readers.lock().expect("reader lock").is_empty());
+        assert_eq!(handle.readers.lock().expect("reader lock").len(), 0);
     }
 
     #[test]

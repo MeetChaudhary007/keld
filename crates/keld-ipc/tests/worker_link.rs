@@ -1146,7 +1146,7 @@ fn criterion21_admitted_frames_and_ping_echo() {
         (ping.channel, ping.corr),
         (ChannelId::for_test(42), CorrelationId(9))
     );
-    assert!(ping_payload.is_empty());
+    assert_eq!(ping_payload, Vec::<u8>::new());
     let (answer, answer_payload) = answer.expect("echo CALL answer");
     assert_eq!(
         (answer.channel, answer.corr),
