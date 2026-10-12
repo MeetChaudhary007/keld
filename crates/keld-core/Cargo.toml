@@ -13,6 +13,8 @@ authors.workspace = true
 profile-test-hooks = ["keld-wv/profile-test-hooks"]
 # Explicit proof support only; ordinary debug/release tests do not enable it.
 fs-acceptance-observer = ["keld-native/fs-acceptance-observer"]
+# Opt-in test packaging only; no shipping API, permission or provider.
+native-renderer-acceptance = ["fs-acceptance-observer"]
 
 [dependencies]
 keld-ipc = { workspace = true }
@@ -52,3 +54,11 @@ keld-ipc = { workspace = true, features = ["test-channel-ids"] }
 
 [lints]
 workspace = true
+
+# The separate process-main test compiles the same private Core owner source.
+# A checked target-only cfg selects its fixture graph; ordinary libtest stays whole.
+[[test]]
+name = "native_renderer_joint_main"
+path = "src/native_renderer_joint_main.rs"
+harness = false
+required-features = ["native-renderer-acceptance"]

@@ -264,15 +264,22 @@ impl Observation {
     }
 }
 
-impl Drop for Observation {
-    fn drop(&mut self) {
+impl Observation {
+    /// Stop and join the sole HTTP owner before observing its final report queue.
+    pub(super) fn stop_and_join(&mut self) {
         self.stop.store(true, Ordering::Release);
-        if let Some(thread) = self.thread.take() {
-            let result = thread.join();
+        if let Some(worker) = self.thread.take() {
+            let result = worker.join();
             if !thread::panicking() {
                 result.expect("observer owns/join its worker");
             }
         }
+    }
+}
+
+impl Drop for Observation {
+    fn drop(&mut self) {
+        self.stop_and_join();
     }
 }
 

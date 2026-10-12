@@ -10,7 +10,7 @@ use std::time::Duration;
 #[path = "native_observer_fixture.rs"]
 mod fixture;
 #[path = "native_observer_sensor.rs"]
-mod sensor;
+pub(in crate::app_session) mod sensor;
 #[path = "native_observer_support.rs"]
 mod support;
 #[path = "native_namespace_race.rs"]

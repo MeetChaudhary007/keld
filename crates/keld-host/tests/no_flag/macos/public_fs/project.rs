@@ -43,6 +43,7 @@ pub(super) enum Exercise {
     RendererPointer,
     RendererRecovery,
     RendererPendingRecovery,
+    RendererNativeJoint,
     PublicAppComponent,
     PublicAppNaturalCases,
     PublicAppRetirement,
@@ -192,6 +193,10 @@ impl PublicFsProject {
 
     pub(super) fn prepare_pending_recovery(&self, launch: usize, port: u16) -> PreparedLaunch {
         self.prepare_for(launch, port, Exercise::RendererPendingRecovery)
+    }
+
+    pub(super) fn prepare_native_joint(&self, launch: usize, port: u16) -> PreparedLaunch {
+        self.prepare_for(launch, port, Exercise::RendererNativeJoint)
     }
 
     /// Replace fixture resources, never the captured policy or host authority.
@@ -391,6 +396,14 @@ impl PublicFsProject {
             )
             .replace("__DESCENDANT_QUIT__", &self.descendant_quit.to_string())
             .replace("__RECOVERY_INPUTS__", &recovery_config.to_string())
+            .replace(
+                "__NATIVE_JOINT__",
+                if exercise == Exercise::RendererNativeJoint {
+                    "true"
+                } else {
+                    "false"
+                },
+            )
             .replace("__NATURAL_CASE__", &natural_case.to_string())
             .replace("__NATURAL_INPUTS__", &natural_config.to_string())
             .replace(
@@ -426,24 +439,46 @@ impl PublicFsProject {
                 "import {{ app, channels, echoChannel, fs, isCallError }} from {api};\n{body}"
             ),
         );
-        fs::write(
-            self.project.join("index.html"),
-            include_str!("../../../fixtures/public_fs_page.html")
-                .replace("__PORT__", &port.to_string())
-                .replace(
-                    "__PENDING_RECOVERY__",
-                    if recovery.is_some_and(|input| input.pending_handler) {
-                        "true"
-                    } else {
-                        "false"
-                    },
-                )
-                .replace(
-                    "__RECOVERY_MODE__",
-                    if recovery.is_some() { "true" } else { "false" },
-                ),
-        )
-        .expect("public FS renderer");
+        self.prepare_renderer_page(exercise, port, recovery);
+    }
+
+    fn prepare_renderer_page(
+        &self,
+        exercise: Exercise,
+        port: u16,
+        recovery: Option<&RecoveryInputs>,
+    ) {
+        let page = include_str!("../../../fixtures/public_fs_page.html")
+            .replace("__PORT__", &port.to_string())
+            .replace(
+                "__PENDING_RECOVERY__",
+                if recovery.is_some_and(|input| input.pending_handler) {
+                    "true"
+                } else {
+                    "false"
+                },
+            )
+            .replace(
+                "__RECOVERY_MODE__",
+                if recovery.is_some() { "true" } else { "false" },
+            )
+            .replace(
+                "__NATIVE_JOINT__",
+                if exercise == Exercise::RendererNativeJoint {
+                    "true"
+                } else {
+                    "false"
+                },
+            )
+            .replace(
+                "__JOINT_BUTTON__",
+                if exercise == Exercise::RendererNativeJoint {
+                    ""
+                } else {
+                    "<button id=\"go\">Write, read and verify scope denial</button>"
+                },
+            );
+        fs::write(self.project.join("index.html"), page).expect("public FS renderer");
     }
 
     fn stage_and_verify_inputs(&self) -> (keld_cli::boot::DevBootStage, String, String) {

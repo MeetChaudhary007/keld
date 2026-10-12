@@ -28,6 +28,7 @@ type NaturalInputs = {
 const naturalInputs: NaturalInputs | null = __NATURAL_INPUTS__;
 type RecoveryInputs = { after: string; witness: string; afterContent: number[]; pendingHandler: boolean };
 const recoveryInputs: RecoveryInputs | null = __RECOVERY_INPUTS__;
+const nativeJoint = __NATIVE_JOINT__;
 const sampleControlBudget = 4096;
 let handlerCalls = 0;
 function rejectedFsOutcome(error: unknown): FsSampleOutcome {
@@ -137,6 +138,19 @@ channels.handle(echoChannel, async request => {
   if (recoveryInputs && request.count === 1 &&
       (control.action === "recovery-before" || control.action === "recovery-after")) {
     outcome = await performRecoveryOperation(control.action);
+  } else if (nativeJoint && request.count === 1 && control.action === "native-hold") {
+    try {
+      await fs.write(target, content);
+      throw new Error("native-held filesystem write returned before the expiry control");
+    } catch (error: unknown) {
+      if (!isCallError(error) || error.code !== "KELD-IPC-006") throw error;
+      const report = { phase: "joint-native-expiry", pid: process.pid,
+        nonce: control.nonce, code: error.code, message: error.message };
+      const observed = await fetch(base + "/observe", { method: "POST",
+        headers: { "Content-Type": "text/plain" }, body: JSON.stringify(report) });
+      if (!observed.ok) throw new Error("native expiry observation refused");
+      throw error;
+    }
   } else if (recoveryInputs?.pendingHandler && request.count === 3 &&
       control.action === "recovery-pending") {
     const bytes = await fs.read(target);
@@ -165,7 +179,7 @@ channels.handle(echoChannel, async request => {
   }));
   return response;
 });
-if (recoveryInputs) {
+if (recoveryInputs && !nativeJoint) {
   // Ordinary fixture data holds only this app's first public whenReady call.
   // It gives the observer time to test old credentials before fresh HELLO.
   const bootstrap = process.env.KELD_APP_LINK;
@@ -244,7 +258,8 @@ if (automaticComponent) {
   if (!observed.ok) throw new Error("public natural-case observation refused");
 }
 // The observer retains this stream without blocking other page observations.
-const quit = await fetch(base + (recoveryInputs ? "/recovery-quit/" + process.pid : "/quit"));
+const quit = await fetch(base + (recoveryInputs || nativeJoint
+  ? "/recovery-quit/" + process.pid : "/quit"));
 if (!quit.ok || await quit.text() !== "quit") throw new Error("invalid sample quit command");
 console.error("KELD_KEL140_PUBLIC_QUIT_REQUEST calls=" + handlerCalls);
 const pendingQuit = app.quit();

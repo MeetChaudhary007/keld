@@ -77,7 +77,7 @@ use keld_ipc::{
     APP_LINK_IO_DEADLINE, APP_LINK_READER_POLL, BootstrapStream, ECHO_CHANNEL, IpcError,
     LIFECYCLE_CHANNEL, LifecycleEvent, LifecycleRequest, LifecycleResponse,
 };
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(all(test, target_os = "macos", not(keld_core_native_renderer_main)))]
 use keld_native::fs::FsResponse;
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
 use keld_native::fs::{FS_CHANNEL, FsBroker, FsPrepareError, FsRequest};
@@ -322,6 +322,7 @@ impl FsDispatchSession {
     }
 
     #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+    #[cfg(not(keld_core_native_renderer_main))]
     fn admit(self: &Arc<Self>) -> Result<Option<FsInFlight>, HostAppError> {
         self.admit_with_pending(None)
     }
@@ -476,6 +477,7 @@ impl FsDispatchSession {
     }
 
     #[cfg(all(test, target_os = "macos"))]
+    #[cfg(not(keld_core_native_renderer_main))]
     fn observe_next_drain_wait(&self, observer: SyncSender<()>) {
         *self
             .drain_wait_observer
@@ -487,6 +489,7 @@ impl FsDispatchSession {
     /// releases the generation lock and before its lease drops, until the
     /// test resumes it.
     #[cfg(all(test, target_os = "macos"))]
+    #[cfg(not(keld_core_native_renderer_main))]
     fn hold_next_terminal_write(&self, written: SyncSender<()>, resume: Receiver<()>) {
         *self
             .terminal_write_hold
@@ -2032,22 +2035,26 @@ impl SessionShutdownState {
     }
 
     #[cfg(all(test, target_os = "macos"))]
+    #[cfg(not(keld_core_native_renderer_main))]
     fn claim_lifecycle_quit(&self) -> bool {
         self.claim(SESSION_LIFECYCLE_QUIT)
     }
 
     #[cfg(any(target_os = "linux", test))]
+    #[cfg(not(keld_core_native_renderer_main))]
     fn claim_cli_lease_lost(&self) -> bool {
         self.claim(SESSION_CLI_LEASE_LOST)
     }
 
     #[cfg(any(target_os = "linux", test))]
+    #[cfg(not(keld_core_native_renderer_main))]
     fn claim(&self, cause: u8) -> bool {
         let _transition = self.transition_guard();
         self.claim_guarded(cause)
     }
 
     #[cfg(any(target_os = "linux", windows, test))]
+    #[cfg(not(keld_core_native_renderer_main))]
     fn claim_guarded(&self, cause: u8) -> bool {
         self.reserve_guarded(cause) && self.accept_reserved_guarded(cause)
     }
@@ -3272,6 +3279,7 @@ fn linux_strict_primary_config_x86(
 /// self-contained entries. Symlinks fail closed so
 /// `LinuxReadonlyMount::new` cannot canonicalize them to an external file.
 #[cfg(any(all(target_os = "linux", target_arch = "x86_64"), test))]
+#[cfg(not(keld_core_native_renderer_main))]
 fn admit_kipc_transport_sidecar(path: &Path) -> Result<bool, HostAppError> {
     match std::fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() => Err(app_detail(
@@ -5484,6 +5492,7 @@ impl PrimaryRouterHandle {
 
     /// Test hook: reports how the next post-Quit drain ended.
     #[cfg(all(test, target_os = "macos"))]
+    #[cfg(not(keld_core_native_renderer_main))]
     fn observe_next_quit_drain_end(&self, end: SyncSender<QuitDrainEnd>) {
         self.quit_drain_hooks
             .lock()
@@ -5508,6 +5517,7 @@ impl PrimaryRouterHandle {
     /// the test resumes it, then gives it an idle deadline that has already
     /// passed, as a host stall longer than its idle backstop would.
     #[cfg(all(test, target_os = "macos"))]
+    #[cfg(not(keld_core_native_renderer_main))]
     fn stall_next_quit_drain(&self, stalled: SyncSender<()>, resume: Receiver<()>) {
         self.quit_drain_hooks
             .lock()
@@ -5539,6 +5549,7 @@ impl PrimaryRouterHandle {
     }
 
     #[cfg(test)]
+    #[cfg(not(keld_core_native_renderer_main))]
     fn begin_fs_call(
         &self,
         attempt: u32,
@@ -5962,6 +5973,7 @@ impl PrimaryRouterHandle {
     // Paired-stream regressions and historical non-macOS composition wait on
     // their calling thread. The macOS guardian actor never uses this adapter.
     #[cfg(any(test, not(target_os = "macos")))]
+    #[cfg(not(keld_core_native_renderer_main))]
     fn install_generation(
         &self,
         attempt: u32,
@@ -6263,6 +6275,7 @@ impl FsWorker {
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
 impl PrimaryRouter {
     #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+    #[cfg(not(keld_core_native_renderer_main))]
     fn start(
         stream: BootstrapStream,
         window_commands: Sender<AppWindowCommand>,
@@ -6273,6 +6286,7 @@ impl PrimaryRouter {
     }
 
     #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+    #[cfg(not(keld_core_native_renderer_main))]
     fn start_with_fs(
         stream: BootstrapStream,
         window_commands: Sender<AppWindowCommand>,
@@ -6451,6 +6465,7 @@ impl PrimaryRouter {
 }
 
 #[cfg(all(test, any(target_os = "macos", target_os = "linux", windows)))]
+#[cfg(not(keld_core_native_renderer_main))]
 fn prepare_fs_work(
     handle: &PrimaryRouterHandle,
     attempt: u32,
@@ -7076,6 +7091,38 @@ fn app_ipc(phase: &'static str, source: &IpcError) -> HostAppError {
     app_detail(phase, source.to_string())
 }
 
+#[cfg(test)]
+#[cfg(target_os = "macos")]
+type GuardedFsTestSetup = Box<dyn FnOnce(&mut FsWorkerTestGate)>;
+
+#[cfg(test)]
+#[cfg(feature = "fs-acceptance-observer")]
+keld_native::keld_native_fs_observer_items! {
+    #[cfg(test)]
+    #[path = "app_session/tests/native_observer_setup.rs"]
+    mod native_observer_setup;
+    #[cfg(test)]
+    #[path = "app_session/tests/native_generation_fixture.rs"]
+    mod native_generation_fixture;
+}
+
+#[cfg(test)]
+#[cfg(all(keld_core_native_renderer_main, target_os = "macos", debug_assertions))]
+#[path = "app_session/tests/native_observer_sensor.rs"]
+mod native_observer_sensor;
+
+#[cfg(test)]
+#[cfg(all(keld_core_native_renderer_main, target_os = "macos", debug_assertions))]
+#[path = "app_session/tests/native_renderer_main_entry.rs"]
+mod native_renderer_main_entry;
+
+#[cfg(test)]
+#[cfg(all(keld_core_native_renderer_main, target_os = "macos", debug_assertions))]
+pub(crate) fn native_renderer_main_thread_entry() {
+    native_renderer_main_entry::run_main();
+}
+
+#[cfg(not(keld_core_native_renderer_main))]
 #[cfg(test)]
 mod tests {
     #[cfg(windows)]
@@ -8530,9 +8577,6 @@ mod tests {
     }
 
     #[cfg(target_os = "macos")]
-    type GuardedFsTestSetup = Box<dyn FnOnce(&mut FsWorkerTestGate)>;
-
-    #[cfg(target_os = "macos")]
     fn guarded_router_with_test_setup(
         server: std::os::unix::net::UnixStream,
         setup: Option<GuardedFsTestSetup>,
@@ -8595,7 +8639,7 @@ mod tests {
     /// GH-528 T2 end-to-end cases: a Bun `WorkerLink` role against this
     /// router (`app_session/tests/worker_link_e2e.rs`).
     #[cfg(target_os = "macos")]
-    mod worker_link_e2e;
+    pub(in crate::app_session) mod worker_link_e2e;
 
     #[cfg(target_os = "macos")]
     fn write_fs_call(client: &mut std::os::unix::net::UnixStream, corr: u32, target: &Path) {
@@ -11877,12 +11921,28 @@ mod tests {
         let (server, client) = UnixStream::pair().expect("gap session pair");
         let (window_tx, window_rx) = mpsc::channel();
         let (guardian_tx, guardian_rx) = mpsc::channel();
+        let shutdown = SessionShutdownState::new();
+        let guardian_shutdown = shutdown.clone();
         let guardian_thread = std::thread::spawn(move || {
             let prepare = guardian_rx
                 .recv_timeout(Duration::from_secs(5))
                 .expect("gap accepted-shutdown attribution");
             match prepare {
                 GuardianOwnerCommand::PrepareAcceptedShutdown(reply) => {
+                    assert_eq!(
+                        guardian_shutdown.cause(),
+                        SESSION_RUNNING,
+                        "gap published CLI acceptance before guardian attribution"
+                    );
+                    assert_eq!(
+                        guardian_shutdown.reserved_cause.load(Ordering::Acquire),
+                        SESSION_CLI_LEASE_LOST,
+                        "gap must reserve the CLI loss first"
+                    );
+                    assert!(
+                        !guardian_shutdown.tail_started.load(Ordering::Acquire),
+                        "gap started the tail before guardian attribution"
+                    );
                     reply.send(Ok(())).expect("gap attribution reply");
                 }
                 _ => panic!("gap skipped accepted-shutdown attribution"),
@@ -11894,10 +11954,26 @@ mod tests {
                 GuardianOwnerCommand::Shutdown(reply) => {
                     reply.send(Ok(())).expect("gap shutdown reply");
                 }
-                _ => panic!("gap skipped guardian shutdown"),
+                unexpected => {
+                    let detail = match unexpected {
+                        GuardianOwnerCommand::AttachRouter(_, _) => "AttachRouter".to_owned(),
+                        GuardianOwnerCommand::ArmRecovery(_, _) => "ArmRecovery".to_owned(),
+                        GuardianOwnerCommand::DenyRecovery => "DenyRecovery".to_owned(),
+                        GuardianOwnerCommand::FailGeneration(attempt, _) => {
+                            format!("FailGeneration({attempt})")
+                        }
+                        GuardianOwnerCommand::FailRetiredGeneration(attempt, _) => {
+                            format!("FailRetiredGeneration({attempt})")
+                        }
+                        GuardianOwnerCommand::PrepareAcceptedShutdown(_) => {
+                            "PrepareAcceptedShutdown".to_owned()
+                        }
+                        GuardianOwnerCommand::Shutdown(_) => "Shutdown".to_owned(),
+                    };
+                    panic!("gap expected Shutdown, observed {detail}");
+                }
             }
         });
-        let shutdown = SessionShutdownState::new();
         let router = PrimaryRouter::start(
             server,
             window_tx,
@@ -11910,11 +11986,28 @@ mod tests {
         router.handle().signal_ready().expect("gap Ready");
         router.handle().retire_generation(1).expect("retire g1");
         drop(client);
-        assert!(shutdown.claim_cli_lease_lost());
+        assert!(shutdown.reserve_cli_lease_lost());
+        assert_eq!(
+            shutdown.cause(),
+            SESSION_RUNNING,
+            "reservation is not acceptance"
+        );
+        assert!(!shutdown.tail_started.load(Ordering::Acquire));
+        assert!(
+            !router.handle().is_current(1),
+            "fixture must remain a generation gap"
+        );
+
         router
             .handle()
             .cli_lease_lost()
             .expect("generation-gap lease-loss tail");
+        assert_eq!(
+            shutdown.cause(),
+            SESSION_CLI_LEASE_LOST,
+            "acknowledged tail must publish the reserved cause"
+        );
+        assert!(shutdown.tail_started.load(Ordering::Acquire));
         assert_eq!(
             window_rx
                 .recv_timeout(Duration::from_secs(5))

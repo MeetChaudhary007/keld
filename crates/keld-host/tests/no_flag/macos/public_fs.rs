@@ -172,6 +172,7 @@ fn run_launch_with_descendant_quit(
         Exercise::PublicAppComponent => fixture.prepare_component(launch, observer.port),
         Exercise::PublicAppNaturalCases => fixture.prepare_natural(launch, observer.port),
         Exercise::PublicAppRetirement => fixture.prepare_retirement(launch, observer.port),
+        Exercise::RendererNativeJoint => fixture.prepare_native_joint(launch, observer.port),
     };
     let stage = &prepared.stage;
     if exercise != Exercise::RendererPointer {
@@ -294,6 +295,7 @@ fn observe_launch(
         Exercise::RendererRecovery | Exercise::RendererPendingRecovery => {
             observe_recovery_actions(observer, cleanup, evidence, fixture, prepared, host_pid);
         }
+        Exercise::RendererNativeJoint => panic!("joint fixture uses its root-controlled producer"),
         Exercise::PublicAppComponent
         | Exercise::PublicAppNaturalCases
         | Exercise::PublicAppRetirement => {
@@ -1059,7 +1061,7 @@ fn assert_product_quit(
     assert!(output.status.success(), "{output:?}");
     let stderr = std::str::from_utf8(&output.stderr).expect("host diagnostic UTF-8");
     let expected_calls = match exercise {
-        Exercise::RendererPointer => 3,
+        Exercise::RendererPointer | Exercise::RendererNativeJoint => 3,
         Exercise::RendererRecovery => 4,
         Exercise::RendererPendingRecovery => 5,
         Exercise::PublicAppComponent
@@ -1076,7 +1078,9 @@ fn assert_product_quit(
     assert!(stderr.contains("KELD_KEL142_BIND webview="), "{stderr}");
     let quit_calls = if matches!(
         exercise,
-        Exercise::RendererRecovery | Exercise::RendererPendingRecovery
+        Exercise::RendererRecovery
+            | Exercise::RendererPendingRecovery
+            | Exercise::RendererNativeJoint
     ) {
         2
     } else {
@@ -1107,6 +1111,7 @@ fn assert_product_quit(
         | Exercise::PublicAppRetirement => {
             assert_component_trace(stderr, &evidence.reports);
         }
+        Exercise::RendererNativeJoint => panic!("joint fixture uses its root-controlled producer"),
     }
     if let Some(retired) = evidence.retired_family {
         await_process_gone(retired.bun);
@@ -1179,6 +1184,261 @@ fn assert_recovery_trace(stderr: &str, evidence: &LaunchEvidence) {
 
 fn pid(report: &Value, key: &str) -> u32 {
     u32::try_from(report[key].as_u64().expect("reported PID")).expect("OS PID domain")
+}
+
+const JOINT_REPORT_PHASES: [&str; 6] = [
+    "joint-page-ready",
+    "joint-pending-start",
+    "joint-pending-settled",
+    "joint-final",
+    "joint-native-expiry",
+    "joint-g2-released",
+];
+
+struct JointReportJournal {
+    path: std::path::PathBuf,
+    file: fs::File,
+    app_ready: Vec<u32>,
+    phases: std::collections::BTreeSet<String>,
+    records: usize,
+    bytes: usize,
+}
+
+impl JointReportJournal {
+    fn create(path: std::path::PathBuf) -> Self {
+        use std::io::Write as _;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .expect("fresh empty producer-owned joint report");
+        file.flush().expect("publish empty report object");
+        Self {
+            path,
+            file,
+            app_ready: Vec::new(),
+            phases: std::collections::BTreeSet::new(),
+            records: 0,
+            bytes: 0,
+        }
+    }
+
+    fn append(&mut self, report: &Value) -> String {
+        use std::io::Write as _;
+        let phase = report["phase"].as_str().expect("named joint report phase");
+        if phase == "app-ready" {
+            let app_pid = pid(report, "pid");
+            assert!(
+                !self.app_ready.contains(&app_pid),
+                "one Ready per distinct Bun generation"
+            );
+            self.app_ready.push(app_pid);
+            assert!(self.app_ready.len() <= 2, "exactly G1/G2 app Ready rows");
+        } else {
+            assert!(
+                JOINT_REPORT_PHASES.contains(&phase),
+                "unexpected joint report: {report}"
+            );
+            assert!(
+                self.phases.insert(phase.to_owned()),
+                "duplicate joint report phase {phase}"
+            );
+        }
+        let mut line = serde_json::to_vec(report).expect("actual JSON report bytes");
+        line.push(b'\n');
+        assert!(
+            line.len() <= 4096,
+            "joint record exceeds 4096 bytes: {phase}"
+        );
+        self.bytes = self
+            .bytes
+            .checked_add(line.len())
+            .expect("bounded report bytes");
+        self.records += 1;
+        assert!(
+            self.records <= 8 && self.bytes <= 32768,
+            "joint report budget exceeded"
+        );
+        self.file
+            .write_all(&line)
+            .expect("append actual joint observation");
+        self.file.flush().expect("publish each actual observation");
+        phase.to_owned()
+    }
+
+    fn assert_complete(&self) {
+        assert_eq!(self.records, 8, "exact eight-row joint journal");
+        assert_eq!(
+            self.app_ready.len(),
+            2,
+            "actual G1 and G2 whenReady observations"
+        );
+        assert_ne!(
+            self.app_ready[0], self.app_ready[1],
+            "G2 uses a fresh Bun PID"
+        );
+        assert_eq!(
+            self.phases.len(),
+            6,
+            "all page/native/Core facts exactly once"
+        );
+        for phase in JOINT_REPORT_PHASES {
+            assert!(
+                self.phases.contains(phase),
+                "missing required joint observation {phase}"
+            );
+        }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn records(&self) -> usize {
+        self.records
+    }
+
+    fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    fn g2_pid(&self) -> u32 {
+        self.app_ready[1]
+    }
+
+    fn assert_no_late_report(&mut self, observation: &mut Observation) {
+        use std::io::Write as _;
+        self.file.flush().expect("final joint report flush");
+        observation.stop_and_join();
+        let late_report = observation.reports.try_recv();
+        assert!(
+            matches!(
+                late_report,
+                Err(std::sync::mpsc::TryRecvError::Empty
+                    | std::sync::mpsc::TryRecvError::Disconnected)
+            ),
+            "HTTP observer queued a report beyond the eight-row journal: {late_report:?}"
+        );
+    }
+}
+
+struct JointFixtureOwner {
+    _fixture: PublicFsProject,
+    observation: Observation,
+    prepared: PreparedLaunch,
+    journal: JointReportJournal,
+}
+
+fn prepare_joint_fixture(receipt_path: &Path) -> JointFixtureOwner {
+    use std::io::Write as _;
+    let fixture = PublicFsProject::new(Policy::Narrow);
+    let observation = Observation::bind_recovery();
+    let prepared = fixture.prepare_native_joint(0, observation.port);
+    assert_eq!(prepared.exercise, Exercise::RendererNativeJoint);
+    assert!(prepared.recovery.is_none() && prepared.natural.is_none());
+    fs::write(&prepared.target, b"unchanged").expect("seed retained Native target");
+    let journal = JointReportJournal::create(fixture.owned_root().join("joint-observations.jsonl"));
+    let mut receipt = staged_fixture_receipt(&prepared, observation.port, &fixture);
+    receipt["jointRenderer"] = json!({
+        "schema":"keld.kel143.joint-native-renderer/v1",
+        "pageIdentity":staged_fixture_identity(&prepared.stage.root().join("index.html")),
+        "reportIdentity":staged_fixture_identity(journal.path()),
+        "censusIdentity":staged_fixture_identity(&fixture.census),
+        "observerPort":observation.port,
+        "title":TITLE,
+    });
+    let mut receipt_file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(receipt_path)
+        .expect("fresh immutable fixture receipt");
+    receipt_file
+        .write_all(&serde_json::to_vec_pretty(&receipt).expect("fixture receipt JSON"))
+        .expect("write source-bound fixture receipt");
+    receipt_file
+        .flush()
+        .expect("publish completed fixture receipt");
+    drop(receipt_file);
+    println!(
+        "KELD_KEL143_JOINT_FIXTURE_READY receipt={}",
+        receipt_path.display()
+    );
+    JointFixtureOwner {
+        _fixture: fixture,
+        observation,
+        prepared,
+        journal,
+    }
+}
+
+/// Root runs this owner alongside the real Core/Runtime and renderer consumer.
+/// It stages inputs and observes reports only; it starts no application process.
+#[test]
+#[ignore = "Root-controlled joint Native/renderer producer; stdin finish after consumer DONE"]
+fn kel143_joint_native_renderer_fixture_producer() {
+    use std::io::BufRead as _;
+    let receipt_path = std::path::PathBuf::from(
+        std::env::var("KELD_KEL143_FIXTURE_RECEIPT").expect("absolute Root-owned receipt path"),
+    );
+    assert!(
+        receipt_path.is_absolute(),
+        "fixture receipt must be absolute"
+    );
+    let JointFixtureOwner {
+        _fixture,
+        mut observation,
+        prepared,
+        mut journal,
+    } = prepare_joint_fixture(&receipt_path);
+    let mut quit_pending = false;
+    let mut quit_sent = false;
+    while journal.records() < 8 {
+        let report = observation
+            .reports
+            .recv_timeout(EVENT_DEADLINE)
+            .expect("bounded joint Host/Core/page observation");
+        let phase = journal.append(&report);
+        if phase == "joint-g2-released" {
+            observation.send_recovery_command(RecoveryCommand::Invoke(RecoveryPhase::After));
+        }
+        if phase == "joint-final" {
+            quit_pending = true;
+        }
+        if quit_pending && !quit_sent && journal.app_ready.len() == 2 {
+            observation.send_recovery_command(RecoveryCommand::Quit(journal.g2_pid()));
+            quit_sent = true;
+        }
+    }
+    assert!(
+        quit_sent,
+        "joint-final released only the actual G2 app Quit"
+    );
+    journal.assert_complete();
+    let mut command = String::new();
+    assert_ne!(
+        std::io::stdin()
+            .lock()
+            .read_line(&mut command)
+            .expect("Root finish control"),
+        0,
+        "producer stdin closed before actual consumer completion"
+    );
+    assert_eq!(
+        command.trim(),
+        "finish",
+        "only Root consumer-finished control"
+    );
+    assert!(
+        matches!(fs::symlink_metadata(prepared.stage.root()), Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound),
+        "Core consumer must remove the exact stage before producer finish"
+    );
+    journal.assert_no_late_report(&mut observation);
+    println!(
+        "KELD_KEL143_JOINT_FIXTURE_DONE records={} bytes={}",
+        journal.records(),
+        journal.bytes()
+    );
 }
 
 /// Root runs this owner alongside a Core/Runtime consumer; it starts no app.

@@ -1,6 +1,6 @@
 <!doctype html><html><head><meta charset="utf-8"><title>KEL140 Public FS Acceptance</title>
 <style>html,body{margin:0;width:100%;height:100%;background:#111;color:#eee}#go{position:fixed;inset:0;border:0;background:#163;color:white;font:28px system-ui}#result{font:18px system-ui;padding:24px}</style>
-</head><body><button id="go">Write, read and verify scope denial</button><pre id="result"></pre>
+</head><body>__JOINT_BUTTON__<pre id="result"></pre>
 <script>
 "use strict";
 const base = "http://127.0.0.1:__PORT__";
@@ -14,7 +14,9 @@ const initial = { bridge: typeof window.keld?.invoke === "function",
 const requests = [];
 const outcomes = [];
 const recoveryMode = __RECOVERY_MODE__;
-const pendingRecovery = __PENDING_RECOVERY__;
+const nativeJoint = __NATIVE_JOINT__;
+const go = document.getElementById("go");
+const pendingRecovery = __PENDING_RECOVERY__ || nativeJoint;
 const terminals = [];
 const invokeNonces = new Map();
 const resultEnvelopes = new Map();
@@ -87,7 +89,7 @@ async function report(phase, extra) {
     headers: { "Content-Type": "text/plain" }, body: JSON.stringify(value) });
   if (!response.ok) throw new Error("public FS page observation refused");
 }
-go.addEventListener("click", async event => {
+go?.addEventListener("click", async event => {
   try {
     await report("page-click-start", { trusted: event.isTrusted });
     for (const [index, action] of ["roundtrip", "deny", "unknown"].entries()) {
@@ -105,6 +107,34 @@ go.addEventListener("click", async event => {
     go.remove();
   } catch (error) { await report("error", { error: String(error) }); }
 }, { once: true });
+async function runNativeJointConsumer() {
+  go?.remove();
+  await report("joint-page-ready", { automaticRecovery: true });
+  const held = { action: "native-hold", nonce: nonce(), count: 1 };
+  requests.push(held);
+  await report("joint-pending-start", { automaticRecovery: true });
+  try {
+    const payload = encodeRequest(JSON.stringify({ action: held.action, nonce: held.nonce }), held.count);
+    const outcome = decodeResponse(await window.keld.invoke(1, payload), held.count);
+    outcomes.push({ action: held.action, outcome });
+  } catch (error) {
+    outcomes.push({ action: held.action, name: error.name,
+      error: error.message, code: error.code ?? null });
+  }
+  await report("joint-pending-settled", { automaticRecovery: true });
+  const command = await fetch(base + "/recovery-page");
+  if (!command.ok || await command.text() !== "after") {
+    throw new Error("invalid joint G2 page command");
+  }
+  for (const [index, action] of ["roundtrip", "deny"].entries()) {
+    const request = { action, nonce: nonce(), count: index + 1 };
+    requests.push(request);
+    const payload = encodeRequest(JSON.stringify({ action: request.action, nonce: request.nonce }), request.count);
+    const outcome = decodeResponse(await window.keld.invoke(1, payload), request.count);
+    outcomes.push({ action: request.action, outcome });
+  }
+  await report("joint-final", { automaticRecovery: true });
+}
 async function runRecoveryConsumer() {
   go.remove();
   await report("page-ready", { automaticRecovery: true });
@@ -137,7 +167,9 @@ async function runRecoveryConsumer() {
   }
 }
 // Recovery uses the real renderer dataplane and no DOM or OS input action.
-if (recoveryMode) {
+if (nativeJoint) {
+  runNativeJointConsumer().catch(error => report("error", { error: String(error) }));
+} else if (recoveryMode) {
   runRecoveryConsumer().catch(error => report("error", { error: String(error) }));
 } else {
   // The parent sees this only after the actual listener is installed.

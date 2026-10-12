@@ -1,255 +1,38 @@
 //! KEL-143 T1: real guardian recovery waits for actual native return and root drop.
 //! Test-only composition of existing owners; no window/document product claim.
 use super::super::super::{
-    AppWindowCommand, FsRecoveryAttempt, FsWorkerCommand, FsWorkerTestGate, GuardSnapshot,
-    GuardianOwnerCommand, GuardianOwnerHandle, PrimaryEchoCall, PrimaryEchoReply, PrimaryRouter,
-    PrimaryRouterHandle, RecoveryArm, SessionShutdownState, apply_guardian_recovery_arm,
-    load_verified_manifest,
+    AppWindowCommand, FsRecoveryAttempt, FsWorkerCommand, GuardSnapshot, GuardianOwnerCommand,
+    GuardianOwnerHandle, PERMISSIONS_FILE, PrimaryRouter, PrimaryRouterHandle, RecoveryArm,
+    SessionShutdownState, apply_guardian_recovery_arm,
 };
-use super::fixture::{NativeSignals, native_setup};
 use super::{OBSERVATION_BOUND, sensor, support};
-use keld_ipc::codec::{decode, encode};
-use keld_ipc::echo::{EchoRequest, EchoResponse};
-use keld_runtime::macos_guardian::{
-    GuardedPrimary, GuardedPrimaryUpdate, GuardianBootstrap, SUPERVISED_GUARDIAN_ARG,
+use crate::app_session::native_generation_fixture::{
+    Inputs, NativeWorkerSetup, SENTINEL, assert_owned_groups, captured_digest, file_digest,
+    native_worker_setup, next_bound, public_call, public_outcome, public_outcome_count, roundtrip,
 };
-use keld_runtime::primary::{
-    BoundPrimaryGeneration as BoundRoleGeneration, PrimaryRoleEvent as RoleEvent, RoleGeneration,
-};
+use crate::app_session::native_observer_setup::NativeSignals;
+use keld_runtime::macos_guardian::{GuardedPrimary, GuardedPrimaryUpdate};
+use keld_runtime::primary::{PrimaryRoleEvent as RoleEvent, RoleGeneration};
 use nix::errno::Errno;
 use nix::sys::signal::{Signal, killpg};
-use nix::unistd::{Pid, getpgid, getpgrp};
-use serde::Deserialize;
-use serde_json::{Value, json};
-use sha2::{Digest as _, Sha256};
-use std::fs::{self, File};
-use std::os::unix::fs::MetadataExt as _;
-use std::os::unix::process::CommandExt as _;
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use nix::unistd::Pid;
+use serde_json::json;
+use std::fs;
+
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{Receiver, Sender};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
 const CASE: &str = "guardian-native-retirement";
 const SELECTOR: &str = "app_session::tests::worker_link_e2e::native_observer_e2e::native_generation_recovery::real_guardian_waits_for_native_return_and_old_broker_directory_baseline";
-const SENTINEL: &[u8] = b"unchanged";
-
-/// The Host fixture owns staging, HTTP and project lifetime. Root supplies its receipt.
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct Inputs {
-    schema: String,
-    application: Value,
-    staged_host: PathBuf,
-    stage_root: PathBuf,
-    entry_relative: PathBuf,
-    allowed_root: PathBuf,
-    target: PathBuf,
-    expected_content: Vec<u8>,
-    outside: PathBuf,
-    outside_content: Vec<u8>,
-    outside_identity: ObjectIdentity,
-    permissions_sha256: String,
-    staged_host_sha256: String,
-    entry_sha256: String,
-    permissions_identity: ObjectIdentity,
-    staged_host_identity: ObjectIdentity,
-    entry_identity: ObjectIdentity,
-    allowed_root_identity: ObjectIdentity,
-    target_identity: ObjectIdentity,
-    stage_identity: ObjectIdentity,
-    transport_identity: ObjectIdentity,
-}
-
-#[derive(Deserialize)]
-struct ObjectIdentity {
-    path: PathBuf,
-    dev: u64,
-    ino: u64,
-    kind: String,
-    sha256: Option<String>,
-}
-
-impl ObjectIdentity {
-    fn verify(&self, configured: &Path) {
-        assert_eq!(
-            fs::canonicalize(configured).expect("canonical supplied object"),
-            fs::canonicalize(&self.path).expect("canonical captured object")
-        );
-        let metadata = fs::symlink_metadata(&self.path).expect("actual supplied object metadata");
-        assert!(
-            !metadata.file_type().is_symlink(),
-            "receipt leaf became a symlink"
-        );
-        assert_eq!(
-            (metadata.dev(), metadata.ino()),
-            (self.dev, self.ino),
-            "fixture object changed"
-        );
-        assert!(
-            matches!(self.kind.as_str(), "file" | "directory"),
-            "unknown receipt object kind"
-        );
-        assert_eq!(metadata.is_dir(), self.kind == "directory");
-        assert_eq!(metadata.is_file(), self.kind == "file");
-        if let Some(expected) = &self.sha256 {
-            assert_eq!(
-                file_digest(&self.path),
-                *expected,
-                "captured fixture bytes changed"
-            );
-        } else {
-            assert!(metadata.is_dir(), "file receipt lacks captured bytes");
-        }
-    }
-}
-
-fn file_digest(path: &Path) -> String {
-    format!(
-        "{:x}",
-        Sha256::digest(fs::read(path).expect("actual supplied object bytes"))
-    )
-}
-
-fn captured_digest(text: &str) -> [u8; 32] {
-    assert!(
-        text.len() == 64 && text.bytes().all(|byte| byte.is_ascii_hexdigit()),
-        "invalid captured digest"
-    );
-    let mut digest = [0; 32];
-    for (index, byte) in digest.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&text[index * 2..index * 2 + 2], 16)
-            .expect("captured hexadecimal digest");
-    }
-    digest
-}
-
-impl Inputs {
-    fn supplied() -> Self {
-        let path = std::env::var_os("KELD_KEL143_FIXTURE_RECEIPT")
-            .expect("Root must supply the retained Host public-FS fixture receipt");
-        let inputs: Self = serde_json::from_slice(&fs::read(path).expect("fixture receipt bytes"))
-            .expect("existing Host fixture receipt schema");
-        assert_eq!(inputs.schema, "keld.kel143.staged-public-fs-fixture/v1");
-        assert_eq!(
-            inputs.application,
-            json!({"automaticComponent":false,"recoveryInputs":null,"handlerOnlyHold":false})
-        );
-        assert!(inputs.staged_host.is_absolute() && inputs.stage_root.is_absolute());
-        assert!(
-            inputs.allowed_root.is_absolute() && inputs.target.starts_with(&inputs.allowed_root)
-        );
-        assert!(!inputs.entry_relative.is_absolute());
-        assert!(!inputs.expected_content.is_empty() && inputs.expected_content != SENTINEL);
-        inputs.verify_fixture();
-        inputs
-    }
-
-    fn verify_fixture(&self) {
-        let permissions = self.stage_root.join("keld.permissions.jsonc");
-        let entry = self.stage_root.join(&self.entry_relative);
-        let transport = self.stage_root.join("src/kipc-transport.ts");
-        for (identity, path) in [
-            (&self.permissions_identity, permissions.as_path()),
-            (&self.staged_host_identity, self.staged_host.as_path()),
-            (&self.entry_identity, entry.as_path()),
-            (&self.allowed_root_identity, self.allowed_root.as_path()),
-            (&self.target_identity, self.target.as_path()),
-            (&self.stage_identity, self.stage_root.as_path()),
-            (&self.transport_identity, transport.as_path()),
-            (&self.outside_identity, self.outside.as_path()),
-        ] {
-            identity.verify(path);
-        }
-        assert_eq!(
-            self.permissions_identity.sha256.as_deref(),
-            Some(self.permissions_sha256.as_str())
-        );
-        assert_eq!(
-            self.staged_host_identity.sha256.as_deref(),
-            Some(self.staged_host_sha256.as_str())
-        );
-        assert_eq!(
-            self.entry_identity.sha256.as_deref(),
-            Some(self.entry_sha256.as_str())
-        );
-    }
-
-    fn prepare_policy(&self) -> GuardSnapshot {
-        sensor::calibrate_directory_sensor(&self.allowed_root);
-        sensor::calibrate_object_sensor(&self.target);
-        let path = self.stage_root.join("keld.permissions.jsonc");
-        let digest = captured_digest(&self.permissions_sha256);
-        let verified =
-            load_verified_manifest(File::open(&path).expect("staged policy"), path, digest)
-                .expect("existing verified manifest owner");
-        let snapshot =
-            GuardSnapshot::prepare(verified).expect("existing native initial preparation");
-        assert!(
-            sensor::directory_handle_count(&self.allowed_root) > 0,
-            "prepared roots absent"
-        );
-        snapshot
-    }
-
-    fn spawn_guardian(&self) -> GuardedPrimary {
-        let entry = fs::metadata(self.stage_root.join(&self.entry_relative)).expect("staged entry");
-        let mut command = Command::new(&self.staged_host);
-        command
-            .arg(SUPERVISED_GUARDIAN_ARG)
-            .arg(&self.stage_root)
-            .arg(&self.entry_relative)
-            .arg(entry.dev().to_string())
-            .arg(entry.ino().to_string())
-            .env_remove("KELD_DEV_LEASE")
-            .stderr(Stdio::inherit())
-            .process_group(0);
-        // spawn_supervised owns the dedicated ACK stdout; the test never reads it.
-        GuardianBootstrap::spawn_supervised(command)
-            .expect("retained real guardian Child")
-            .register_guarded_primary_until(Instant::now() + OBSERVATION_BOUND)
-            .expect("actual supervised guardian registration")
-    }
-}
 
 #[path = "native_generation_actor.rs"]
 mod actor_owner;
 
-/// Reuses one held Native scope and the existing post-take gate in both owner cases.
-struct NativeWorkerSetup {
-    signals: NativeSignals,
-    gate: Arc<FsWorkerTestGate>,
-    gate_release: Sender<()>,
-    gate_taken: Receiver<()>,
-}
-
-fn native_worker_setup() -> NativeWorkerSetup {
-    let (setup, signals) = native_setup(true, false);
-    let (taken, gate_taken) = mpsc::sync_channel(8);
-    let (gate_release, release) = mpsc::channel();
-    let mut gate = FsWorkerTestGate {
-        taken,
-        release: Mutex::new(release),
-        before_entry: None,
-        initializer: Mutex::new(None),
-    };
-    setup(&mut gate);
-    // One G1 write, G2 write/read, and G2 denial. Releases never establish order.
-    for _ in 0..4 {
-        gate_release
-            .send(())
-            .expect("existing post-take gate release");
-    }
-    NativeWorkerSetup {
-        signals,
-        gate: Arc::new(gate),
-        gate_release,
-        gate_taken,
-    }
-}
+#[path = "native_generation_anchor_failure.rs"]
+mod anchor_failure;
 
 /// Releases test waits before router join and guardian EOF, also on an assertion unwind.
 struct Fixture {
@@ -265,33 +48,6 @@ struct Fixture {
     initial_arm: bool,
     groups: Vec<u32>,
     initial_generation: RoleGeneration,
-}
-
-fn next_bound(guardian: &mut GuardedPrimary, expected: u32) -> BoundRoleGeneration {
-    let deadline = Instant::now() + OBSERVATION_BOUND;
-    loop {
-        assert!(
-            Instant::now() < deadline,
-            "actual bound generation {expected} absent"
-        );
-        guardian
-            .poll_fatal()
-            .expect("retained guardian/control health");
-        match guardian.recv_update(Duration::from_millis(10)) {
-            Some(GuardedPrimaryUpdate::Bound(bound)) => {
-                assert_eq!(bound.attempt(), expected);
-                return bound;
-            }
-            Some(GuardedPrimaryUpdate::Role(event)) => {
-                println!("KELD_KEL143_REAL_EVENT {event:?}");
-                assert!(
-                    !matches!(event, RoleEvent::Revoked { .. }),
-                    "initial role revoked"
-                );
-            }
-            None => {}
-        }
-    }
 }
 
 impl Fixture {
@@ -378,6 +134,97 @@ impl Fixture {
             .expect("Ready sender join")
             .expect("actual Ready receipt");
         assert!(self.initial_arm && self.handle().recovery_armed.load(Ordering::Acquire));
+    }
+
+    fn edit_staged_policy_after_ready(&self) {
+        use std::io::Write as _;
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        assert!(self.initial_arm && self.handle().recovery_armed.load(Ordering::Acquire));
+        let path = self.inputs.stage_root.join(PERMISSIONS_FILE);
+        let original_metadata =
+            fs::symlink_metadata(&path).expect("owned original policy identity");
+        assert!(
+            original_metadata.is_file(),
+            "staged policy must remain a regular object"
+        );
+        let original_mode = original_metadata.permissions().mode() & 0o7777;
+        assert_eq!(
+            original_mode & 0o222,
+            0,
+            "producer input is deliberately read-only"
+        );
+        let original = file_digest(&path);
+        assert_eq!(original, self.inputs.permissions_sha256);
+        let retained = captured_digest(&self.inputs.permissions_sha256);
+        assert_eq!(self.snapshot.verified.verified_sha256(), retained);
+        assert_eq!(self.snapshot.fs.verified.verified_sha256(), retained);
+        let parent = self
+            .inputs
+            .outside
+            .parent()
+            .expect("outside sentinel directory");
+        assert!(self.inputs.allowed_root.starts_with(parent));
+        let scope = format!("{}/**", parent.display());
+        let edited = serde_json::to_string(&json!({
+            "app": { "fs": { "read": [&scope], "write": [&scope] } }
+        }))
+        .expect("valid widened fixture policy JSON");
+        let _ = keld_guard::parse_manifest(&edited)
+            .expect("existing guard parser accepts widened fixture scope");
+        let mut replacement = tempfile::Builder::new()
+            .prefix("kel143-policy-")
+            .permissions(original_metadata.permissions())
+            .tempfile_in(&self.inputs.stage_root)
+            .expect("existing owned staging parent permits fresh policy control");
+        replacement
+            .write_all(edited.as_bytes())
+            .expect("complete replacement policy bytes");
+        replacement
+            .as_file()
+            .sync_all()
+            .expect("complete replacement input before publish");
+        assert_eq!(
+            replacement
+                .as_file()
+                .metadata()
+                .expect("new candidate mode")
+                .permissions()
+                .mode()
+                & 0o7777,
+            original_mode,
+            "candidate must retain original narrow mode"
+        );
+        let published = replacement
+            .persist(&path)
+            .expect("atomic owned policy-leaf replacement");
+        let replacement_metadata = published
+            .metadata()
+            .expect("published policy object identity");
+        assert_ne!(
+            (replacement_metadata.dev(), replacement_metadata.ino()),
+            (original_metadata.dev(), original_metadata.ino()),
+            "policy namespace did not select a fresh object"
+        );
+        assert_eq!(
+            replacement_metadata.permissions().mode() & 0o7777,
+            original_mode
+        );
+        let selected =
+            fs::symlink_metadata(&path).expect("canonical staged policy after replacement");
+        assert_eq!(
+            (selected.dev(), selected.ino()),
+            (replacement_metadata.dev(), replacement_metadata.ino())
+        );
+        drop(published);
+        let changed = file_digest(&path);
+        assert_ne!(changed, original, "actual disk policy did not change");
+        println!(
+            "KELD_KEL143_POLICY_DISK_EDIT original_sha256={original} edited_sha256={changed} original_dev={} original_ino={} edited_dev={} edited_ino={} mode=0o{original_mode:o} original_verified_policy_retained=true",
+            original_metadata.dev(),
+            original_metadata.ino(),
+            replacement_metadata.dev(),
+            replacement_metadata.ino()
+        );
     }
 
     fn pump_failure_commands(&mut self) {
@@ -660,40 +507,6 @@ impl Drop for Fixture {
     }
 }
 
-fn assert_owned_groups(guardian: &GuardedPrimary, bun: u32) {
-    let guardian_pid =
-        Pid::from_raw(i32::try_from(guardian.guardian_pid()).expect("guardian PID fits"));
-    let bun_pid = Pid::from_raw(i32::try_from(bun).expect("Bun PID fits"));
-    assert_eq!(getpgid(Some(guardian_pid)), Ok(guardian_pid));
-    assert_eq!(getpgid(Some(bun_pid)), Ok(bun_pid));
-    assert_ne!(
-        guardian_pid,
-        getpgrp(),
-        "guardian cannot enter the hostile host group"
-    );
-    assert_ne!(bun_pid, guardian_pid);
-    assert_parent(guardian.guardian_pid(), std::process::id());
-    assert_parent(bun, guardian.guardian_pid());
-}
-
-fn assert_parent(pid: u32, expected: u32) {
-    // Read-only identity prerequisite, inside the existing exact-self45s watchdog.
-    let output = Command::new("/bin/ps")
-        .args(["-p", &pid.to_string(), "-o", "ppid="])
-        .output()
-        .expect("actual retained-family parent census");
-    assert!(
-        output.status.success() && output.stderr.is_empty(),
-        "parent census unavailable: {output:?}"
-    );
-    let parent: u32 = std::str::from_utf8(&output.stdout)
-        .expect("ASCII parent census")
-        .trim()
-        .parse()
-        .expect("one exact parent identity");
-    assert_eq!(parent, expected, "actual guardian/Bun parent ownership");
-}
-
 fn assert_no_successor(update: &GuardedPrimaryUpdate) {
     println!("KELD_KEL143_REAL_EVENT {update:?}");
     match update {
@@ -710,45 +523,6 @@ fn assert_no_successor(update: &GuardedPrimaryUpdate) {
     }
 }
 
-fn roundtrip(handle: &PrimaryRouterHandle, nonce: &str) -> PrimaryEchoCall {
-    public_call(handle, nonce, "roundtrip", 1)
-}
-
-fn public_call(
-    handle: &PrimaryRouterHandle,
-    nonce: &str,
-    action: &str,
-    count: u32,
-) -> PrimaryEchoCall {
-    handle
-        .begin_echo_call(
-            &encode(&EchoRequest {
-                message: json!({"action":action, "nonce": nonce}).to_string(),
-                count,
-            })
-            .expect("owning Echo request codec"),
-        )
-        .expect("actual primary/public API call")
-}
-
-fn public_outcome(call: &PrimaryEchoCall) -> Value {
-    public_outcome_count(call, 1)
-}
-
-fn public_outcome_count(call: &PrimaryEchoCall, count: u32) -> Value {
-    let reply = call
-        .reply
-        .recv_timeout(Duration::from_secs(6))
-        .expect("actual public outcome")
-        .expect("host Echo path remains live");
-    let PrimaryEchoReply::Reply(bytes) = reply else {
-        panic!("unexpected public handler result {reply:?}");
-    };
-    let response: EchoResponse = decode(&bytes).expect("owning Echo response codec");
-    assert_eq!(response.count, count);
-    serde_json::from_str(&response.message).expect("public FS sample JSON")
-}
-
 #[test]
 #[ignore = "explicit physical macOS source-bound real guardian/native/root-census lane"]
 fn real_guardian_waits_for_native_return_and_old_broker_directory_baseline() {
@@ -758,6 +532,7 @@ fn real_guardian_waits_for_native_return_and_old_broker_directory_baseline() {
     }
     let mut fixture = Fixture::start();
     fixture.ready();
+    fixture.edit_staged_policy_after_ready();
     let began = Instant::now();
     let old = roundtrip(&fixture.handle(), "00000000000000000000000000000143");
     fixture
@@ -1017,9 +792,14 @@ fn cli_acceptance_publication_preserves_acknowledged_shutdown() {
         "KELD_KEL143_CLI_PUBLICATION_RESULT attribution={:?} reader={primary_result:?} executor={executor_result:?} shutdown={:?} events={:?} delivery_faults={:?} unsupported={:?} reader_expired={reader_expired} executor_expired={executor_expired}",
         facts.attribution, facts.shutdown, facts.events, facts.delivery_faults, facts.unsupported
     );
-    assert_cli_terminal(&fixture, &facts, primary_result, executor_result, (reader_expired, executor_expired));
+    assert_cli_terminal(
+        &fixture,
+        &facts,
+        primary_result,
+        executor_result,
+        (reader_expired, executor_expired),
+    );
 }
-
 
 fn assert_cli_terminal(
     fixture: &Fixture,

@@ -20,7 +20,7 @@ mod public_fs_ring_e2e;
 #[cfg(feature = "fs-acceptance-observer")]
 keld_native::keld_native_fs_observer_items! {
     #[path = "native_observer_e2e.rs"]
-    mod native_observer_e2e;
+    pub(in crate::app_session) mod native_observer_e2e;
 }
 
 /// One Bun role running the GH-527 `WorkerLink` fixture

@@ -139,10 +139,12 @@ fn parse_object_count(
     Ok(count)
 }
 
+#[cfg(not(keld_core_native_renderer_main))]
 fn parse_count(pid: u32, identity: (u64, u64), bytes: &[u8]) -> SensorResult<usize> {
     parse_object_count(pid, identity, "REG", bytes)
 }
 
+#[cfg(not(keld_core_native_renderer_main))]
 fn reported_count(
     success: bool,
     stderr: &[u8],
@@ -157,11 +159,11 @@ fn reported_count(
 }
 
 /// Reports numeric REG descriptors for the exact target device and inode.
-pub(super) fn object_handle_count(target: &Path) -> usize {
+pub(in crate::app_session) fn object_handle_count(target: &Path) -> usize {
     census_object(target, "REG")
 }
 
-pub(super) fn directory_handle_count(target: &Path) -> usize {
+pub(in crate::app_session) fn directory_handle_count(target: &Path) -> usize {
     assert!(fs::metadata(target).expect("directory identity").is_dir());
     census_object(target, "DIR")
 }
@@ -189,7 +191,7 @@ fn census_object(target: &Path, expected_kind: &str) -> usize {
 }
 
 /// Calibrates distinct READ and WRITE controls; closes both before native entry.
-pub(super) fn calibrate_object_sensor(target: &Path) {
+pub(in crate::app_session) fn calibrate_object_sensor(target: &Path) {
     for write_only in [false, true] {
         assert_eq!(object_handle_count(target), 0, "pre-call target handle");
         let deliberate = OpenOptions::new()
@@ -209,7 +211,7 @@ pub(super) fn calibrate_object_sensor(target: &Path) {
 }
 
 /// Closes every calibration handle before the broker prepares this object.
-pub(super) fn calibrate_directory_sensor(target: &Path) {
+pub(in crate::app_session) fn calibrate_directory_sensor(target: &Path) {
     assert_eq!(
         directory_handle_count(target),
         0,
@@ -243,6 +245,7 @@ pub(super) fn calibrate_directory_sensor(target: &Path) {
     );
 }
 
+#[cfg(not(keld_core_native_renderer_main))]
 #[cfg(test)]
 mod tests {
     use super::{parse_count, parse_object_count, reported_count};

@@ -1,14 +1,15 @@
 //! Actual owner-loop proof; Native/FSM census and window/document proof remain distinct.
 use super::super::super::super::{
     AppWindowCommand, GUARDIAN_OWNER_REPLY_DEADLINE, GuardSnapshot, GuardianOwner,
-    GuardianOwnerCommand, GuardianOwnerHandle, PrimaryEchoCall, PrimaryRouter, PrimaryRouterHandle,
-    RecoveryArm, SessionShutdownState,
+    GuardianOwnerHandle, PrimaryEchoCall, PrimaryRouter, PrimaryRouterHandle,
+    SessionShutdownState,
 };
 use super::super::{OBSERVATION_BOUND, sensor, support};
 use super::{
     Inputs, NativeWorkerSetup, SENTINEL, assert_owned_groups, native_worker_setup, next_bound,
     public_call, public_outcome, public_outcome_count, roundtrip,
 };
+use crate::app_session::native_generation_fixture::ActorTurns;
 use nix::errno::Errno;
 use nix::sys::signal::{Signal, killpg};
 use nix::unistd::Pid;
@@ -201,49 +202,6 @@ impl Drop for ActorFixture {
     }
 }
 
-/// The baton has at most two arm commands outstanding; the separate failure probe
-/// can add one test-issued command. Queue next arm before consuming the prior receipt.
-/// The actor's real reply send fences successive normal turns without an idle timeout.
-/// Dropping this receiver unblocks an actor reply before fixture fallback joins it.
-struct ActorTurns {
-    owner: GuardianOwnerHandle,
-    receipt: Receiver<Result<(), String>>,
-    completed: usize,
-}
-
-impl ActorTurns {
-    fn queue(owner: &GuardianOwnerHandle) -> Receiver<Result<(), String>> {
-        let (reply, receipt) = mpsc::sync_channel(0);
-        owner
-            .command_tx
-            .send(GuardianOwnerCommand::ArmRecovery(
-                RecoveryArm::Initial(1),
-                reply,
-            ))
-            .expect("queue existing duplicate arm command");
-        receipt
-    }
-
-    fn start(owner: GuardianOwnerHandle) -> Self {
-        let receipt = Self::queue(&owner);
-        Self {
-            owner,
-            receipt,
-            completed: 0,
-        }
-    }
-
-    fn advance(&mut self) {
-        let next = Self::queue(&self.owner);
-        let prior = std::mem::replace(&mut self.receipt, next);
-        prior
-            .recv_timeout(GUARDIAN_OWNER_REPLY_DEADLINE)
-            .expect("actual owner command reply while Native held/pending")
-            .expect("actual duplicate arm receipt");
-        self.completed += 1;
-    }
-}
-
 fn assert_old_return_and_broker_baseline(fixture: &mut ActorFixture) {
     fixture
         .native
@@ -418,4 +376,86 @@ fn actual_guardian_owner_services_commands_and_fs_completions_while_native_is_he
     println!(
         "KELD_AC7_CASE_DONE case={CASE} actual_actor=true normal_turn_completion=true window_document_claim=false"
     );
+}
+
+/// The actual loop owns error/denial/fatal cleanup; the direct case owns event history.
+#[test]
+#[ignore = "explicit physical macOS source-bound actual owner absent-anchor fatal lane"]
+fn actual_owner_preserves_absent_anchor_error_and_fatal_cleanup() {
+    use super::anchor_failure::AnchorAbsence;
+    const CASE: &str = "guardian-actor-anchor-absent";
+    const SELECTOR: &str = "app_session::tests::worker_link_e2e::native_observer_e2e::native_generation_recovery::actor_owner::actual_owner_preserves_absent_anchor_error_and_fatal_cleanup";
+    if !support::is_native_child(CASE) {
+        support::isolated_guardian_case(CASE, SELECTOR);
+        return;
+    }
+
+    let mut fixture = ActorFixture::start();
+    let old = roundtrip(&fixture.handle(), "00000000000000000000000000004143");
+    fixture
+        .native
+        .gate_taken
+        .recv_timeout(OBSERVATION_BOUND)
+        .expect("actual G1 work taken");
+    let held = fixture
+        .native
+        .signals
+        .held
+        .recv_timeout(OBSERVATION_BOUND)
+        .expect("actual Native after-walk hold");
+    assert!(!held.fixture_fault);
+    assert_eq!((held.request_entries, held.request_returns), (1, 0));
+    assert!(held.walk_entries > 0 && held.target_opens > 0);
+    fixture.assert_held();
+    fixture
+        .owner_handle()
+        .fail_generation(1)
+        .expect("actual owner requests G1 retirement");
+    let mut turns = ActorTurns::start(fixture.owner_handle());
+    observe_held_actor_retirement(&fixture, &mut turns, &old);
+    let absence = AnchorAbsence::remove(&fixture.inputs.allowed_root, &fixture.inputs.target);
+    assert!(sensor::directory_handle_count(absence.renamed_root()) > 0);
+    assert_eq!(sensor::object_handle_count(absence.renamed_target()), 1);
+    // Disconnect the existing bounded baton before the real worker returns.
+    drop(turns);
+    fixture
+        .native
+        .signals
+        .native_release
+        .take()
+        .expect("one Native release")
+        .send(())
+        .expect("existing Native Hold owner");
+    let returned = fixture
+        .native
+        .signals
+        .returned
+        .recv_timeout(OBSERVATION_BOUND)
+        .expect("actual Native return");
+    assert!(!returned.fixture_fault);
+    assert_eq!((returned.request_entries, returned.request_returns), (1, 1));
+    assert_eq!(
+        fixture.window.recv_timeout(OBSERVATION_BOUND).expect("actual preflight Fatal wake"),
+        AppWindowCommand::Fatal
+    );
+    let error = fixture.owner.take().expect("one actor owner").shutdown()
+        .expect_err("actual actor must preserve failed fresh preparation");
+    assert_eq!(error.code(), "KELD-NATIVE-008");
+    fixture.router.take().expect("one router owner").shutdown()
+        .expect("fatal-path Native worker and reader joins");
+    let fence = fixture.native.signals.final_snapshot.recv_timeout(OBSERVATION_BOUND)
+        .expect("actual final Native fence");
+    assert!(!fence.fixture_fault);
+    assert_eq!((fence.request_entries, fence.request_returns), (1, 1));
+    assert_eq!(sensor::directory_handle_count(absence.renamed_root()), 0);
+    assert_eq!(sensor::object_handle_count(absence.renamed_target()), 0);
+    for group in [fixture.initial_bun_group, fixture.guardian_group] {
+        let group = Pid::from_raw(i32::try_from(group).expect("diagnostic group fits"));
+        assert_eq!(killpg(group, None::<Signal>), Err(Errno::ESRCH),
+            "fatal cleanup left an owned process group");
+    }
+    assert!(!fixture.inputs.stage_root.exists(), "fatal cleanup retained the exact stage");
+    println!("KELD_KEL143_AC4_ACTOR_FAILURE code={} fatal=true entries=1 returns=1 roots=0 target_handles=0 owner_joined=true stage_absent=true provision_trace_owned_by=direct", error.code());
+    absence.restore();
+    println!("KELD_AC7_CASE_DONE case={CASE} actual_actor=true provision_trace_owned_by=direct");
 }
