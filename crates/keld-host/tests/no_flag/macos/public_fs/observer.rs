@@ -19,6 +19,7 @@ pub(super) struct Observation {
 
 #[derive(Clone, Copy, Debug)]
 pub(super) enum RecoveryPhase {
+    Pending,
     Before,
     After,
 }
@@ -26,6 +27,7 @@ pub(super) enum RecoveryPhase {
 impl RecoveryPhase {
     pub(super) fn as_str(self) -> &'static str {
         match self {
+            Self::Pending => "pending",
             Self::Before => "before",
             Self::After => "after",
         }
@@ -36,6 +38,7 @@ pub(super) enum RecoveryCommand {
     Admit(u32),
     Invoke(RecoveryPhase),
     Quit(u32),
+    RetirePending(u32),
 }
 
 /// Owns only ordinary fixture HTTP waits; two app generations, one real page.
@@ -47,6 +50,7 @@ struct RecoveryObserver {
     invoke: Option<RecoveryPhase>,
     quits: BTreeMap<u32, TcpStream>,
     quitting: Option<u32>,
+    pending: Option<(u32, TcpStream)>,
 }
 
 impl RecoveryObserver {
@@ -59,6 +63,7 @@ impl RecoveryObserver {
             invoke: None,
             quits: BTreeMap::new(),
             quitting: None,
+            pending: None,
         }
     }
 
@@ -72,6 +77,11 @@ impl RecoveryObserver {
                 RecoveryCommand::Invoke(phase) => {
                     assert!(self.invoke.replace(phase).is_none(), "one page command");
                 }
+                RecoveryCommand::RetirePending(pid) => {
+                    let (held, stream) = self.pending.take().expect("one pending handler stream");
+                    assert_eq!(held, pid, "retire only the observed old handler");
+                    drop(stream);
+                }
                 RecoveryCommand::Quit(pid) => {
                     assert!(self.quitting.replace(pid).is_none(), "one recovery Quit");
                 }
@@ -80,7 +90,17 @@ impl RecoveryObserver {
         self.respond_ready();
     }
 
-    fn accept_wait(&mut self, path: &str, stream: TcpStream) {
+    fn accept_wait(&mut self, path: &str, stream: TcpStream) -> Option<Value> {
+        if let Some(identity) = path.strip_prefix("/recovery-pending/") {
+            let (pid, nonce) = identity.split_once('/').expect("pending handler identity");
+            let pid = pid.parse::<u32>().expect("owned pending handler PID");
+            assert!(self.admitted.contains(&pid));
+            assert_eq!(nonce.len(), 32);
+            assert!(nonce.bytes().all(|byte| byte.is_ascii_hexdigit()));
+            assert!(self.pending.replace((pid, stream)).is_none());
+            return Some(serde_json::json!({"phase":"recovery-handler-pending",
+                "pid":pid,"nonce":nonce,"barrier":"application-handler-only"}));
+        }
         if path == "/recovery-page" {
             assert!(self.page.replace(stream).is_none(), "one real page wait");
         } else if let Some(pid) = path.strip_prefix("/recovery-admit/") {
@@ -95,6 +115,7 @@ impl RecoveryObserver {
             panic!("unexpected recovery fixture route {path}");
         }
         self.respond_ready();
+        None
     }
 
     fn respond_ready(&mut self) {
@@ -140,11 +161,16 @@ impl Observation {
     }
 
     pub(super) fn bind() -> Self {
-        Self::bind_with_recovery(false)
+        Self::bind_with_recovery(false, false)
     }
 
     pub(super) fn bind_recovery() -> Self {
-        Self::bind_with_recovery(true)
+        Self::bind_with_recovery(true, false)
+    }
+
+    /// Core/Runtime own Q/EOF; their G1/G2 ordinary app Quit waits park here.
+    pub(super) fn bind_staged_fixture() -> Self {
+        Self::bind_with_recovery(false, true)
     }
 
     pub(super) fn send_recovery_command(&self, command: RecoveryCommand) {
@@ -155,7 +181,7 @@ impl Observation {
             .expect("recovery observer remains live");
     }
 
-    fn bind_with_recovery(recovery_mode: bool) -> Self {
+    fn bind_with_recovery(recovery_mode: bool, retain_fixture_quits: bool) -> Self {
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("prearm public FS observer");
         let port = listener.local_addr().expect("observer address").port();
         listener
@@ -173,6 +199,7 @@ impl Observation {
         let stopping = Arc::clone(&stop);
         let thread = thread::spawn(move || {
             let mut pending_quit = None;
+            let mut fixture_quits = Vec::new();
             let mut released = false;
             while !stopping.load(Ordering::Acquire) {
                 if let Some(recovery) = recovery.as_mut() {
@@ -185,13 +212,21 @@ impl Observation {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
                         prepare_stream(&stream);
-                        let (path, body) = read_observation(&mut stream);
+                        let Some((path, body)) = read_observation(&mut stream) else {
+                            // Clean transport EOF before any request byte is not
+                            // an HTTP observation. Drop only this accepted peer.
+                            continue;
+                        };
                         match path.as_str() {
                             "/observe" => {
                                 let report: Value =
                                     serde_json::from_slice(&body).expect("actual app/page JSON");
                                 respond(&mut stream, "recorded");
                                 send.send(report).expect("report observed data");
+                            }
+                            "/quit" if retain_fixture_quits => {
+                                assert!(fixture_quits.len() < 2, "only G1/G2 fixture Quit waits");
+                                fixture_quits.push(stream);
                             }
                             "/quit" => {
                                 assert!(pending_quit.is_none(), "one public app Quit barrier");
@@ -202,7 +237,11 @@ impl Observation {
                                 }
                             }
                             _ => match recovery.as_mut() {
-                                Some(recovery) => recovery.accept_wait(&path, stream),
+                                Some(recovery) => {
+                                    if let Some(report) = recovery.accept_wait(&path, stream) {
+                                        send.send(report).expect("pending handler observation");
+                                    }
+                                }
                                 None => panic!("unexpected public FS observation route {path}"),
                             },
                         }
@@ -225,15 +264,22 @@ impl Observation {
     }
 }
 
-impl Drop for Observation {
-    fn drop(&mut self) {
+impl Observation {
+    /// Stop and join the sole HTTP owner before observing its final report queue.
+    pub(super) fn stop_and_join(&mut self) {
         self.stop.store(true, Ordering::Release);
-        if let Some(thread) = self.thread.take() {
-            let result = thread.join();
+        if let Some(worker) = self.thread.take() {
+            let result = worker.join();
             if !thread::panicking() {
                 result.expect("observer owns/join its worker");
             }
         }
+    }
+}
+
+impl Drop for Observation {
+    fn drop(&mut self) {
+        self.stop_and_join();
     }
 }
 
@@ -251,14 +297,14 @@ fn prepare_stream(stream: &TcpStream) {
         .expect("observer write kill switch");
 }
 
-fn read_observation(stream: &mut TcpStream) -> (String, Vec<u8>) {
+fn read_observation(stream: &mut TcpStream) -> Option<(String, Vec<u8>)> {
     read_observation_observing(stream, |_| {})
 }
 
 fn read_observation_observing(
     stream: &mut TcpStream,
     mut observe: impl FnMut(usize),
-) -> (String, Vec<u8>) {
+) -> Option<(String, Vec<u8>)> {
     let mut bytes = Vec::new();
     let mut chunk = [0_u8; 1024];
     let end = loop {
@@ -266,7 +312,15 @@ fn read_observation_observing(
             break offset + 4;
         }
         let read = stream.read(&mut chunk).expect("bounded observation header");
-        assert_ne!(read, 0, "observer peer closed before headers");
+        if read == 0 && bytes.is_empty() {
+            return None;
+        }
+        assert_ne!(
+            read,
+            0,
+            "observer peer closed after {} bytes before complete headers",
+            bytes.len()
+        );
         bytes.extend_from_slice(&chunk[..read]);
         assert!(bytes.len() <= 16 * 1024);
         observe(bytes.len());
@@ -295,7 +349,7 @@ fn read_observation_observing(
         .nth(1)
         .expect("request target")
         .to_owned();
-    (path, bytes[end..end + length].to_vec())
+    Some((path, bytes[end..end + length].to_vec()))
 }
 
 fn respond(stream: &mut TcpStream, body: &str) {
@@ -360,7 +414,8 @@ fn accepted_observation_stream_preserves_split_header_and_body() {
             progress
                 .send(count)
                 .expect("actual consumed TCP byte count");
-        });
+        })
+        .expect("complete split observation request");
         assert_eq!(path, "/observe");
         assert_eq!(actual, body);
         writer.join().expect("split-request writer completes");
@@ -396,5 +451,121 @@ fn await_byte_count(observed: &mpsc::Receiver<usize>, expected: usize) {
         if actual == expected {
             return;
         }
+    }
+}
+
+#[test]
+fn empty_observation_connection_is_not_request_or_worker_failure() {
+    let observation = Observation::bind();
+    let address = ("127.0.0.1", observation.port);
+    let empty = TcpStream::connect(address).expect("real empty TCP connection");
+    empty
+        .shutdown(std::net::Shutdown::Write)
+        .expect("clean EOF before any request byte");
+    drop(empty);
+
+    let report = serde_json::json!({"phase":"after-empty-connection","bytes":[0,255]});
+    let body = serde_json::to_vec(&report).expect("actual report bytes");
+    let mut client = TcpStream::connect(address).expect("next real observer connection");
+    prepare_stream(&client);
+    write!(
+        client,
+        "POST /observe HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    )
+    .expect("actual next request header");
+    client.write_all(&body).expect("actual next request body");
+    client
+        .shutdown(std::net::Shutdown::Write)
+        .expect("complete request EOF");
+    let mut response = Vec::new();
+    client
+        .read_to_end(&mut response)
+        .expect("bounded exact response");
+    assert_eq!(
+        response,
+        b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 8\r\nAccess-Control-Allow-Origin: *\r\nCache-Control: no-store\r\nConnection: close\r\n\r\nrecorded"
+    );
+    assert_eq!(
+        observation
+            .reports
+            .recv_timeout(EVENT_DEADLINE)
+            .expect("only complete report observed"),
+        report
+    );
+    assert!(
+        matches!(
+            observation.reports.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ),
+        "empty TCP connection became application evidence"
+    );
+    drop(observation); // Join the real listener owner; a panic cannot count as health.
+}
+
+#[test]
+fn empty_accepted_observation_does_not_consume_request_bytes() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("own empty-request listener");
+    let client = TcpStream::connect(listener.local_addr().expect("listener address"))
+        .expect("actual zero-byte client");
+    let (mut accepted, _) = listener.accept().expect("accepted exact empty peer");
+    prepare_stream(&accepted);
+    client
+        .shutdown(std::net::Shutdown::Write)
+        .expect("clean zero-byte EOF");
+    let mut consumed = Vec::new();
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        read_observation_observing(&mut accepted, |count| consumed.push(count))
+    }));
+    assert!(
+        outcome.is_ok(),
+        "clean empty transport close killed request reader"
+    );
+    assert!(
+        consumed.is_empty(),
+        "empty transport produced request bytes"
+    );
+}
+
+#[test]
+fn nonempty_incomplete_malformed_and_oversized_observations_still_reject() {
+    let oversized_header = vec![b'x'; 16 * 1024 + 1];
+    let controls: &[(&str, &[u8])] = &[
+        ("partial header", b"POST /observe HTTP/1.1\r\nContent-Len"),
+        (
+            "partial body",
+            b"POST /observe HTTP/1.1\r\nContent-Length: 3\r\n\r\nab",
+        ),
+        ("invalid header UTF-8", b"\xff\r\n\r\n"),
+        (
+            "invalid content length",
+            b"POST /observe HTTP/1.1\r\nContent-Length: nope\r\n\r\n",
+        ),
+        ("oversized header", &oversized_header),
+        (
+            "oversized declared body",
+            b"POST /observe HTTP/1.1\r\nContent-Length: 16384\r\n\r\n",
+        ),
+    ];
+    for (label, bytes) in controls {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("owned hostile request listener");
+        let mut client = TcpStream::connect(listener.local_addr().expect("listener address"))
+            .expect("actual hostile request peer");
+        let (mut accepted, _) = listener.accept().expect("accepted exact hostile peer");
+        prepare_stream(&accepted);
+        prepare_stream(&client);
+        thread::scope(|scope| {
+            let writer = scope.spawn(move || {
+                client.write_all(bytes).expect("bounded hostile bytes");
+                client
+                    .shutdown(std::net::Shutdown::Write)
+                    .expect("terminal hostile EOF");
+            });
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                read_observation(&mut accepted)
+            }));
+            writer.join().expect("hostile peer release/join");
+            assert!(outcome.is_err(), "accepted or ignored {label}");
+        });
     }
 }

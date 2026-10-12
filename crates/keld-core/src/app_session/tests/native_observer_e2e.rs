@@ -10,7 +10,7 @@ use std::time::Duration;
 #[path = "native_observer_fixture.rs"]
 mod fixture;
 #[path = "native_observer_sensor.rs"]
-mod sensor;
+pub(in crate::app_session) mod sensor;
 #[path = "native_observer_support.rs"]
 mod support;
 #[path = "native_namespace_race.rs"]
@@ -18,6 +18,9 @@ mod namespace_race;
 #[path = "native_create_new_race.rs"]
 mod create_new_race;
 use fixture::{DrainProbe, NativeFixture, held_snapshot};
+
+#[path = "native_generation_recovery.rs"]
+mod native_generation_recovery;
 
 #[path = "native_deadline_e2e.rs"]
 mod native_deadline_e2e;

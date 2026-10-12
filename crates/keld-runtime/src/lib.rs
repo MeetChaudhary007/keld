@@ -1585,6 +1585,13 @@ fn supervise<P>(
                 }
             },
             Err(error) => {
+                #[cfg(target_os = "macos")]
+                if stop_was_requested(shutdown, accepted_shutdown)
+                    && macos_guardian::is_owned_preparation_interruption(&error, attempt)
+                {
+                    let _ = events_tx.send(SupervisorEvent::Stopped);
+                    return;
+                }
                 *terminal_error
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner) = Some(error);

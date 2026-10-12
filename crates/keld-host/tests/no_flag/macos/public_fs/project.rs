@@ -42,6 +42,8 @@ pub(super) struct PublicFsProject {
 pub(super) enum Exercise {
     RendererPointer,
     RendererRecovery,
+    RendererPendingRecovery,
+    RendererNativeJoint,
     PublicAppComponent,
     PublicAppNaturalCases,
     PublicAppRetirement,
@@ -87,6 +89,7 @@ pub(super) struct PreparedLaunch {
 pub(super) struct RecoveryInputs {
     pub(super) after: PathBuf,
     pub(super) witness: PathBuf,
+    pub(super) pending_handler: bool,
 }
 
 impl PublicFsProject {
@@ -188,6 +191,33 @@ impl PublicFsProject {
         self.prepare_for(launch, port, Exercise::RendererRecovery)
     }
 
+    pub(super) fn prepare_pending_recovery(&self, launch: usize, port: u16) -> PreparedLaunch {
+        self.prepare_for(launch, port, Exercise::RendererPendingRecovery)
+    }
+
+    pub(super) fn prepare_native_joint(&self, launch: usize, port: u16) -> PreparedLaunch {
+        self.prepare_for(launch, port, Exercise::RendererNativeJoint)
+    }
+
+    /// Replace fixture resources, never the captured policy or host authority.
+    pub(super) fn replace_recovery_anchor(&self, prepared: &PreparedLaunch) -> PathBuf {
+        use std::os::unix::fs::MetadataExt as _;
+        let before = fs::metadata(&self.allowed).expect("G1 granted root identity");
+        let retired = self.owned_root().join("retired-allowed");
+        fs::rename(&self.allowed, &retired).expect("rename original granted root");
+        fs::create_dir(&self.allowed).expect("distinct replacement granted root");
+        let after = fs::metadata(&self.allowed).expect("replacement root identity");
+        assert_ne!((before.dev(), before.ino()), (after.dev(), after.ino()));
+        let input = prepared.recovery.as_ref().expect("owned recovery inputs");
+        fs::write(&input.witness, [1]).expect("seed replacement replay witness");
+        eprintln!(
+            "KELD_KEL143_ANCHOR_REPLACED old={:?} new={:?}",
+            (before.dev(), before.ino()),
+            (after.dev(), after.ino())
+        );
+        retired
+    }
+
     fn natural_inputs(&self, launch: usize) -> NaturalInputs {
         let read_sentinel = self.allowed.join(format!("read-sentinel-{launch}.bin"));
         fs::write(&read_sentinel, READ_SENTINEL).expect("independent read-only sentinel");
@@ -280,12 +310,17 @@ impl PublicFsProject {
         let target = self.allowed.join(format!("result-{launch}.bin"));
         let natural =
             (exercise == Exercise::PublicAppNaturalCases).then(|| self.natural_inputs(launch));
-        let recovery = (exercise == Exercise::RendererRecovery).then(|| {
+        let recovery = matches!(
+            exercise,
+            Exercise::RendererRecovery | Exercise::RendererPendingRecovery
+        )
+        .then(|| {
             let witness = self.allowed.join(format!("recovery-witness-{launch}.bin"));
             fs::write(&witness, []).expect("seed independent completed-call witness");
             RecoveryInputs {
                 after: self.allowed.join(format!("recovery-after-{launch}.bin")),
                 witness,
+                pending_handler: exercise == Exercise::RendererPendingRecovery,
             }
         });
         self.prepare_application_inputs(
@@ -319,7 +354,7 @@ impl PublicFsProject {
     ) {
         let recovery_config = recovery.map_or(Value::Null, |input| {
             json!({"after":input.after,"witness":input.witness,
-                "afterContent":RECOVERY_AFTER_CONTENT})
+                "afterContent":RECOVERY_AFTER_CONTENT,"pendingHandler":input.pending_handler})
         });
         let natural_case = natural.map_or(Value::Null, |input| {
             json!(match input.case {
@@ -361,6 +396,14 @@ impl PublicFsProject {
             )
             .replace("__DESCENDANT_QUIT__", &self.descendant_quit.to_string())
             .replace("__RECOVERY_INPUTS__", &recovery_config.to_string())
+            .replace(
+                "__NATIVE_JOINT__",
+                if exercise == Exercise::RendererNativeJoint {
+                    "true"
+                } else {
+                    "false"
+                },
+            )
             .replace("__NATURAL_CASE__", &natural_case.to_string())
             .replace("__NATURAL_INPUTS__", &natural_config.to_string())
             .replace(
@@ -396,16 +439,46 @@ impl PublicFsProject {
                 "import {{ app, channels, echoChannel, fs, isCallError }} from {api};\n{body}"
             ),
         );
-        fs::write(
-            self.project.join("index.html"),
-            include_str!("../../../fixtures/public_fs_page.html")
-                .replace("__PORT__", &port.to_string())
-                .replace(
-                    "__RECOVERY_MODE__",
-                    if recovery.is_some() { "true" } else { "false" },
-                ),
-        )
-        .expect("public FS renderer");
+        self.prepare_renderer_page(exercise, port, recovery);
+    }
+
+    fn prepare_renderer_page(
+        &self,
+        exercise: Exercise,
+        port: u16,
+        recovery: Option<&RecoveryInputs>,
+    ) {
+        let page = include_str!("../../../fixtures/public_fs_page.html")
+            .replace("__PORT__", &port.to_string())
+            .replace(
+                "__PENDING_RECOVERY__",
+                if recovery.is_some_and(|input| input.pending_handler) {
+                    "true"
+                } else {
+                    "false"
+                },
+            )
+            .replace(
+                "__RECOVERY_MODE__",
+                if recovery.is_some() { "true" } else { "false" },
+            )
+            .replace(
+                "__NATIVE_JOINT__",
+                if exercise == Exercise::RendererNativeJoint {
+                    "true"
+                } else {
+                    "false"
+                },
+            )
+            .replace(
+                "__JOINT_BUTTON__",
+                if exercise == Exercise::RendererNativeJoint {
+                    ""
+                } else {
+                    "<button id=\"go\">Write, read and verify scope denial</button>"
+                },
+            );
+        fs::write(self.project.join("index.html"), page).expect("public FS renderer");
     }
 
     fn stage_and_verify_inputs(&self) -> (keld_cli::boot::DevBootStage, String, String) {

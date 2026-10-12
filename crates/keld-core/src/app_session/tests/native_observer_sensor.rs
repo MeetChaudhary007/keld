@@ -1,6 +1,6 @@
-//! Own-process regular-file census without opening another target descriptor.
+//! Own-process REG/DIR object census without opening another target descriptor.
 use std::collections::BTreeSet;
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::os::unix::fs::MetadataExt as _;
 use std::path::Path;
 use std::process::Command;
@@ -50,6 +50,7 @@ fn known_type(value: &str) -> bool {
 fn record_matches(
     fields: &[&str],
     identity: (u64, u64),
+    expected_kind: &str,
     descriptors: &mut BTreeSet<u64>,
 ) -> SensorResult<bool> {
     let name = fields[0]
@@ -81,17 +82,22 @@ fn record_matches(
         }
     }
     let kind = kind.ok_or("descriptor lacks type")?;
-    if kind == "REG" {
+    if kind == expected_kind {
         let observed = (
-            dev.ok_or("REG lacks device")?,
-            inode.ok_or("REG lacks inode")?,
+            dev.ok_or("selected object lacks device")?,
+            inode.ok_or("selected object lacks inode")?,
         );
         return Ok(number.is_some() && observed == identity);
     }
     Ok(false)
 }
 
-fn parse_count(pid: u32, identity: (u64, u64), bytes: &[u8]) -> SensorResult<usize> {
+fn parse_object_count(
+    pid: u32,
+    identity: (u64, u64),
+    expected_kind: &str,
+    bytes: &[u8],
+) -> SensorResult<usize> {
     if bytes.is_empty() || !bytes.ends_with(b"\0\n") {
         return Err("empty or truncated census");
     }
@@ -117,7 +123,12 @@ fn parse_count(pid: u32, identity: (u64, u64), bytes: &[u8]) -> SensorResult<usi
             }
             process_seen = true;
         } else if process_seen {
-            count += usize::from(record_matches(&fields, identity, &mut descriptors)?);
+            count += usize::from(record_matches(
+                &fields,
+                identity,
+                expected_kind,
+                &mut descriptors,
+            )?);
         } else {
             return Err("file set precedes own process");
         }
@@ -128,6 +139,12 @@ fn parse_count(pid: u32, identity: (u64, u64), bytes: &[u8]) -> SensorResult<usi
     Ok(count)
 }
 
+#[cfg(not(keld_core_native_renderer_main))]
+fn parse_count(pid: u32, identity: (u64, u64), bytes: &[u8]) -> SensorResult<usize> {
+    parse_object_count(pid, identity, "REG", bytes)
+}
+
+#[cfg(not(keld_core_native_renderer_main))]
 fn reported_count(
     success: bool,
     stderr: &[u8],
@@ -142,7 +159,16 @@ fn reported_count(
 }
 
 /// Reports numeric REG descriptors for the exact target device and inode.
-pub(super) fn object_handle_count(target: &Path) -> usize {
+pub(in crate::app_session) fn object_handle_count(target: &Path) -> usize {
+    census_object(target, "REG")
+}
+
+pub(in crate::app_session) fn directory_handle_count(target: &Path) -> usize {
+    assert!(fs::metadata(target).expect("directory identity").is_dir());
+    census_object(target, "DIR")
+}
+
+fn census_object(target: &Path, expected_kind: &str) -> usize {
     let identity = fs::metadata(target).expect("target object identity");
     let pid = std::process::id();
     // The existing exact-self45s owned-group watchdog bounds query and capture.
@@ -151,18 +177,21 @@ pub(super) fn object_handle_count(target: &Path) -> usize {
         .args(["-n", "-P", "-a", "-p", &pid.to_string(), "-F0pftDi"])
         .output()
         .expect("own-process lsof census unavailable");
-    reported_count(
-        output.status.success(),
-        &output.stderr,
-        &output.stdout,
+    assert!(
+        output.status.success() && output.stderr.is_empty(),
+        "own object census unavailable: output={output:?}"
+    );
+    parse_object_count(
         pid,
         (identity.dev(), identity.ino()),
+        expected_kind,
+        &output.stdout,
     )
     .unwrap_or_else(|fault| panic!("own object census unavailable: {fault}; output={output:?}"))
 }
 
 /// Calibrates distinct READ and WRITE controls; closes both before native entry.
-pub(super) fn calibrate_object_sensor(target: &Path) {
+pub(in crate::app_session) fn calibrate_object_sensor(target: &Path) {
     for write_only in [false, true] {
         assert_eq!(object_handle_count(target), 0, "pre-call target handle");
         let deliberate = OpenOptions::new()
@@ -181,9 +210,55 @@ pub(super) fn calibrate_object_sensor(target: &Path) {
     }
 }
 
+/// Closes every calibration handle before the broker prepares this object.
+pub(in crate::app_session) fn calibrate_directory_sensor(target: &Path) {
+    assert_eq!(
+        directory_handle_count(target),
+        0,
+        "pre-prepare root baseline"
+    );
+    let first = File::open(target).expect("deliberate directory control");
+    assert_eq!(
+        directory_handle_count(target),
+        1,
+        "one numeric directory descriptor"
+    );
+    let duplicate = first
+        .try_clone()
+        .expect("distinct calibration directory duplicate");
+    assert_eq!(
+        directory_handle_count(target),
+        2,
+        "two numeric directory descriptors"
+    );
+    drop(first);
+    assert_eq!(
+        directory_handle_count(target),
+        1,
+        "one directory descriptor remains"
+    );
+    drop(duplicate);
+    assert_eq!(
+        directory_handle_count(target),
+        0,
+        "all directory controls closed"
+    );
+}
+
+#[cfg(not(keld_core_native_renderer_main))]
 #[cfg(test)]
 mod tests {
-    use super::{parse_count, reported_count};
+    use super::{parse_count, parse_object_count, reported_count};
+
+    #[test]
+    fn directory_parser_requires_numeric_matching_object_identity() {
+        let bytes =
+            b"p4008\0\nf7\0tDIR\0D0x10\0i42\0\nf8\0tREG\0D0x10\0i42\0\nfcwd\0tDIR\0D0x10\0i42\0\n";
+        assert_eq!(parse_object_count(4008, (16, 42), "DIR", bytes), Ok(1));
+        assert_eq!(parse_count(4008, (16, 42), bytes), Ok(1));
+        assert_eq!(parse_object_count(4008, (16, 43), "DIR", bytes), Ok(0));
+        assert!(parse_object_count(4008, (16, 42), "DIR", b"p4008\0\nf7\0tDIR\0\n").is_err());
+    }
 
     const PID: u32 = 4008;
     const IDENTITY: (u64, u64) = (16_777_230, 228_942_197);

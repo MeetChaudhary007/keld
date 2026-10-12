@@ -5245,9 +5245,9 @@ CI: `crates/keld-cli/tests/error_registry.rs` (runs with workspace nextest).
 - Duplicate `## KELD-…` headings fail the test.
 - A `KELD-*` code in `keld-ipc` / `keld-wv` / `keld-cli` / `keld-guard` /
   `keld-runtime` / `keld-native` / `keld-compat` / `keld-core` / `keld-update` /
-  `keld-pack` / `keld-updater-helper` `src`, `keld-cli` templates, the
-  `@keld/kipc` TypeScript transport `src`, or workspace `tools/` that has no
-  heading here fails the test.
+  `keld-pack` / `keld-host` / `keld-updater-helper` `src`, `keld-cli` templates, the
+  `@keld/kipc` TypeScript transport `src`, the `@keld/api` public API `src`, or
+  workspace `tools/` that has no heading here fails the test.
 - A heading here that is not emitted in those trees fails the test.
 - Every entry MUST have non-empty `crate`, `message`, and `fix` lines.
 
@@ -5261,6 +5261,12 @@ match the crate that already emits the code. Do not invent a third spelling.
 3. Emit the same code from `Display` / `KeldErrorObject`, with the `fix` in the
    message.
 4. Run `cargo nextest run -p keld-cli -- error_registry`.
+
+## KELD-API-001
+
+- crate: @keld/api
+- message: Application channel call failed or the declared channel configuration is invalid
+- fix: Check the declared application channel, handler registration, request/reply codecs and kipc frame-size bounds; diagnose handler failures in the application code.
 
 ## KELD-IPC-001
 

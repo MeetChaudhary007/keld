@@ -4,6 +4,9 @@
 //! (`packages/@keld/kipc/test/worker-link-role.ts`) against the guarded
 //! primary router on a real authenticated app link. macOS only, like the T1
 //! harness; T5 qualifies Linux and Windows.
+//! The colocated host lifecycle receipt case uses the parent
+//! framed socket-pair fixture without a Bun WorkerLink role or HELLO. It qualifies
+//! core reservation/acceptance only; OS acknowledgment remains separate.
 //!
 //! KEL-140 owns the added public-index retirement and reply-wins consumers.
 //! Keep them with this existing authenticated router/process owner; review the module's layout
@@ -17,7 +20,7 @@ mod public_fs_ring_e2e;
 #[cfg(feature = "fs-acceptance-observer")]
 keld_native::keld_native_fs_observer_items! {
     #[path = "native_observer_e2e.rs"]
-    mod native_observer_e2e;
+    pub(in crate::app_session) mod native_observer_e2e;
 }
 
 /// One Bun role running the GH-527 `WorkerLink` fixture
@@ -435,6 +438,20 @@ fn bun_worker_death_is_link_loss_that_fails_the_generation() {
         "{report:?}"
     );
     t.release.send(()).expect("release FS worker");
+    // This fixture owns the primary command receiver. Let the entered FS call
+    // take its terminal-write failure path, then acknowledge its retirement
+    // before joining the worker which still owns that pending receipt.
+    let TestPrimaryOwnerCommand::FailRetiredGeneration(retired, receipt) = t
+        .guardian
+        .recv_timeout(Duration::from_secs(20))
+        .expect("failed FS terminal write reports its retired generation")
+    else {
+        panic!("failed FS terminal write skipped retired-generation recovery");
+    };
+    assert_eq!(retired, 1);
+    receipt
+        .send(Ok(Instant::now()))
+        .expect("acknowledge the retired FS generation");
     t.router.shutdown().expect("router shutdown");
 }
 
@@ -802,5 +819,72 @@ fn fresh_public_fs_session_reads_its_write() {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound
         ),
         "fresh public caller acquired an unused target effect"
+    );
+}
+
+/// Core acceptance is distinct from the owner request and local reservation.
+/// The actor reply is controlled here; real Q/guardian proof is a separate atom.
+#[test]
+#[cfg(target_os = "macos")]
+fn lifecycle_quit_reserves_without_accepting_before_owner_receipt() {
+    let (t, mut client) = guarded_test_router();
+    let handle = t.router.handle();
+    handle.signal_ready().expect("initial framed Ready");
+    assert_lifecycle_event(&mut client, LifecycleEvent::Ready);
+    write_quit_call(&mut client, 143);
+
+    let command = t
+        .guardian
+        .recv_timeout(Duration::from_secs(5))
+        .expect("Quit requested its existing owner receipt");
+    let GuardianOwnerCommand::PrepareAcceptedShutdown(receipt) = command else {
+        panic!("Quit used the wrong owner command");
+    };
+    let accepted_before_receipt = handle.shutdown.cause();
+    let tail_before_receipt = handle.shutdown.tail_started.load(Ordering::Acquire);
+    let admission_closed_before_receipt = handle.begin_fs_call(1, CorrelationId(144)).is_err();
+
+    // Finish the actual framed tail before checking the recorded cut so
+    // an expected baseline failure cannot strand the owning router thread.
+    receipt
+        .send(Ok(()))
+        .expect("deliver controlled owner receipt");
+    let (header, payload) =
+        keld_ipc::link::read_frame(&mut client).expect("correlated Quit reply after owner receipt");
+    assert_eq!(header.kind, FrameKind::Reply);
+    assert_eq!(header.channel, LIFECYCLE_CHANNEL);
+    assert_eq!(header.corr, CorrelationId(143));
+    assert_eq!(
+        decode::<LifecycleResponse>(&payload).expect("Quit response"),
+        LifecycleResponse::Quit
+    );
+    drop(client);
+    let command = t
+        .guardian
+        .recv_timeout(Duration::from_secs(5))
+        .expect("ordered guardian shutdown request");
+    let GuardianOwnerCommand::Shutdown(stopped) = command else {
+        panic!("Quit tail used the wrong owner command");
+    };
+    stopped
+        .send(Ok(()))
+        .expect("complete controlled owner shutdown");
+    assert!(matches!(
+        t.window.recv_timeout(Duration::from_secs(5)),
+        Ok(AppWindowCommand::Quit)
+    ));
+    t.router.shutdown().expect("bounded framed router cleanup");
+
+    assert_eq!(
+        accepted_before_receipt, SESSION_RUNNING,
+        "Quit accepted before the existing owner receipt"
+    );
+    assert!(
+        !tail_before_receipt,
+        "Quit tail began before the existing owner receipt"
+    );
+    assert!(
+        admission_closed_before_receipt,
+        "shutdown reservation did not close native admission"
     );
 }
