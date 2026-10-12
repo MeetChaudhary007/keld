@@ -6069,6 +6069,170 @@ foreach ($item in $items) {
 
     #[test]
     #[cfg(unix)]
+    fn mermaid_renderer_bounds_stalled_owned_container_cleanup() {
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::process::{Child, Command, Stdio};
+        use std::time::{Duration, Instant};
+
+        // Specific custody for this regression's real renderer child. Closing
+        // its owned stdin releases only the fake cleanup's builtin read; the
+        // failure backstop never signals a Docker daemon or a cached PID.
+        struct CleanupChild(Option<Child>);
+        impl Drop for CleanupChild {
+            fn drop(&mut self) {
+                if let Some(mut child) = self.0.take() {
+                    drop(child.stdin.take());
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            }
+        }
+
+        let temp = TempDir::new();
+        let checkout = write_msys_renderer_fixture(
+            &temp,
+            r#"#!/usr/bin/env bash
+case "$1" in
+info|image) exit 0 ;;
+context) printf 'unix:///unused-gh705.sock\n' ;;
+run) exit 42 ;;
+rm)
+  printf '%s\n' "$@" >"$KELD_TEST_DOCKER_RM_RECORD"
+  IFS= read -r release || :
+  printf released >"$KELD_TEST_DOCKER_RM_RELEASED"
+  exit 0
+  ;;
+*) exit 99 ;;
+esac
+"#,
+            None,
+            None,
+            None,
+        );
+        let removal_record = temp.path().join("cleanup-request");
+        let fallback_record = temp.path().join("cleanup-released");
+        let stdout_path = temp.path().join("renderer.stdout");
+        let stderr_path = temp.path().join("renderer.stderr");
+        let stdout = fs::File::create(&stdout_path).expect("owned renderer stdout");
+        let stderr = fs::File::create(&stderr_path).expect("owned renderer stderr");
+        let mut paths = vec![temp.path().join("bin")];
+        paths.extend(env::split_paths(&env::var_os("PATH").expect("tool PATH")));
+        let child = Command::new("bash")
+            .arg(temp.path().join("renderer.sh"))
+            .current_dir(&checkout)
+            .env_remove("MSYSTEM")
+            .env("PATH", env::join_paths(paths).expect("fixture PATH"))
+            .env("KELD_TEST_DOCKER_RM_RECORD", &removal_record)
+            .env("KELD_TEST_DOCKER_RM_RELEASED", &fallback_record)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::from(stdout))
+            .stderr(Stdio::from(stderr))
+            .spawn()
+            .expect("spawn actual renderer under fake Docker");
+        let renderer_pid = child.id();
+        let mut custody = CleanupChild(Some(child));
+        let mut deadline = Instant::now() + Duration::from_secs(45);
+        let mut cleanup_entered = false;
+        let mut intervened = false;
+        let status = loop {
+            let child = custody.0.as_mut().expect("owned unreaped renderer");
+            if let Some(status) = child.try_wait().expect("observe renderer exit") {
+                break status;
+            }
+            if !cleanup_entered && removal_record.exists() {
+                cleanup_entered = true;
+                // Arm the completion backstop after the real cleanup entry;
+                // compiling the canonical parser is not cleanup-time evidence.
+                deadline = Instant::now() + Duration::from_secs(15);
+            }
+            if Instant::now() >= deadline {
+                if intervened {
+                    let _ = child.kill();
+                    break child.wait().expect("reap backstop-stopped renderer");
+                }
+                // Record failure before fallback. EOF lets the original
+                // unbounded fake cleanup return, so the baseline cannot hang.
+                intervened = true;
+                drop(child.stdin.take());
+                deadline = Instant::now() + Duration::from_secs(5);
+            }
+            // Poll actual entry/exit conditions; no delay establishes order.
+            std::thread::yield_now();
+        };
+        drop(custody.0.take()); // The exact child was reaped before capture/cleanup.
+        let stdout = fs::read_to_string(&stdout_path).expect("renderer stdout capture");
+        let stderr = fs::read_to_string(&stderr_path).expect("renderer stderr capture");
+        assert!(
+            cleanup_entered,
+            "cleanup was not reached: {stdout}\n{stderr}"
+        );
+        assert_eq!(
+            fs::read_to_string(&removal_record).expect("actual fake cleanup argv"),
+            format!("rm\n--force\nkeld-mermaid-{renderer_pid}-1\n"),
+            "cleanup selected a different container or a broad operation"
+        );
+        assert!(
+            !intervened,
+            "owned Docker cleanup exceeded its completion backstop; original status={status:?}\n{stdout}\n{stderr}"
+        );
+        assert_eq!(
+            status.code(),
+            Some(1),
+            "cleanup replaced the render failure"
+        );
+        assert!(
+            !fallback_record.exists(),
+            "fake cleanup needed an EOF/release rather than its owning deadline"
+        );
+        assert!(stderr.contains("container cleanup incomplete"), "{stderr}");
+        assert!(stderr.contains("exit 124"), "{stderr}");
+        assert!(
+            stderr.contains(&format!("keld-mermaid-{renderer_pid}-1")),
+            "cleanup diagnostic lost its exact owned name: {stderr}"
+        );
+        assert!(stderr.contains("absence is unverified"), "{stderr}");
+        assert!(stderr.contains("pinned Mermaid render failed"), "{stderr}");
+        assert!(stderr.contains("failed-render output retained"), "{stderr}");
+        let retained = retained_render_dirs(&checkout);
+        assert_eq!(retained.len(), 1, "lost failed-render evidence");
+        assert_eq!(
+            fs::metadata(&retained[0])
+                .expect("retained failure mode")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700,
+            "bounded cleanup changed the existing owner-only restore"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn mermaid_renderer_preserves_render_failure_when_container_removal_fails() {
+        let temp = TempDir::new();
+        let checkout = write_msys_renderer_fixture(
+            &temp,
+            "#!/usr/bin/env bash\ncase \"$1\" in\ninfo|image) exit 0 ;;\ncontext) printf 'unix:///unused-gh705.sock\\n' ;;\nrun) exit 42 ;;\nrm) exit 62 ;;\n*) exit 99 ;;\nesac\n",
+            None,
+            None,
+            None,
+        );
+        let output = run_msys_renderer_fixture(&temp, &checkout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "cleanup masked primary status"
+        );
+        assert!(stderr.contains("container cleanup incomplete"), "{stderr}");
+        assert!(stderr.contains("exit 62"), "{stderr}");
+        assert!(stderr.contains("absence is unverified"), "{stderr}");
+        assert!(stderr.contains("failed-render output retained"), "{stderr}");
+        assert_eq!(retained_render_dirs(&checkout).len(), 1);
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn mermaid_renderer_retains_msys_failure_output_with_owner_only_mode() {
         use std::os::unix::fs::PermissionsExt as _;
 
