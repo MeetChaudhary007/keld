@@ -1662,7 +1662,7 @@ fn recover_windows_profile(profile: &mut SelectedWindowsProfile) -> Result<(), W
         return Err(profile_failure(ProfileErrorKind::LifecycleUnproven));
     }
 
-    match prove_exclusive_udf_released(profile, PROFILE_LAUNCH_DEADLINE)? {
+    match prove_exclusive_udf_released(profile, PROFILE_LAUNCH_DEADLINE) {
         ExclusiveUdfRelease::Released => {}
         ExclusiveUdfRelease::Busy => {
             return Err(profile_failure(ProfileErrorKind::LifecycleUnproven));
@@ -1698,7 +1698,10 @@ fn prove_exclusive_udf_released_on_cleanup_sta(
         scope
             .spawn(|| {
                 let _com = initialize_com_sta()?;
-                prove_exclusive_udf_released(profile, PROFILE_LAUNCH_DEADLINE)
+                Ok(prove_exclusive_udf_released(
+                    profile,
+                    PROFILE_LAUNCH_DEADLINE,
+                ))
             })
             .join()
             .map_err(|_| profile_failure(ProfileErrorKind::LifecycleUnproven))?
@@ -1708,20 +1711,18 @@ fn prove_exclusive_udf_released_on_cleanup_sta(
 /// Runs one hidden exclusive-UDF probe with `launch_budget` for environment
 /// and controller creation ([`PROFILE_LAUNCH_DEADLINE`] in production).
 ///
-/// Only the host-side recovery window can fail the caller. Every probe step
-/// that cannot prove release is an [`ExclusiveUdfRelease::Unproven`] outcome
-/// (architecture 05): the scavenger retains the leaf for a later pass,
-/// while recovery and purge still fail on it.
+/// Every probe step, including hidden-window setup, that cannot prove release
+/// is an [`ExclusiveUdfRelease::Unproven`] outcome (architecture 05). The
+/// scavenger retains the leaf; recovery and purge still fail on the carried error.
 fn prove_exclusive_udf_released(
     profile: &SelectedWindowsProfile,
     launch_budget: Duration,
-) -> Result<ExclusiveUdfRelease, WvError> {
-    let window = RecoveryWindow::new()?;
-    Ok(prove_exclusive_udf_released_on_hwnd(
-        profile,
-        window.0,
-        launch_budget,
-    ))
+) -> ExclusiveUdfRelease {
+    let window = match RecoveryWindow::new() {
+        Ok(window) => window,
+        Err(error) => return ExclusiveUdfRelease::Unproven(error),
+    };
+    prove_exclusive_udf_released_on_hwnd(profile, window.0, launch_budget)
 }
 
 fn prove_exclusive_udf_released_on_hwnd(
@@ -1927,7 +1928,7 @@ fn try_scavenge_ephemeral_profile(
         lifecycle: None,
         recovery_required: false,
     };
-    match prove_exclusive_udf_released(&candidate, launch_budget)? {
+    match prove_exclusive_udf_released(&candidate, launch_budget) {
         ExclusiveUdfRelease::Released => {}
         // Architecture 05: a still-busy leaf stays quarantined for a later
         // pass. The same holds when this pass could not prove release: the
@@ -4626,9 +4627,7 @@ mod tests {
         let selection = WebProfileSelection::ephemeral_dev(profile);
         let predecessor = prepare_windows_profile_at(&root, selection).expect("predecessor leaf");
         let plan = predecessor.plan.clone();
-        match prove_exclusive_udf_released(&predecessor, std::time::Duration::ZERO)
-            .expect("a probe step that cannot prove release never fails the caller")
-        {
+        match prove_exclusive_udf_released(&predecessor, std::time::Duration::ZERO) {
             ExclusiveUdfRelease::Unproven(error) => assert!(
                 error.to_string().contains("launch deadline expired"),
                 "the retention must name the launch deadline: {error}"
