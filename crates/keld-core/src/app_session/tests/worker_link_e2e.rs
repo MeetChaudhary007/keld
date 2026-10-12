@@ -438,6 +438,20 @@ fn bun_worker_death_is_link_loss_that_fails_the_generation() {
         "{report:?}"
     );
     t.release.send(()).expect("release FS worker");
+    // This fixture owns the primary command receiver. Let the entered FS call
+    // take its terminal-write failure path, then acknowledge its retirement
+    // before joining the worker which still owns that pending receipt.
+    let TestPrimaryOwnerCommand::FailRetiredGeneration(retired, receipt) = t
+        .guardian
+        .recv_timeout(Duration::from_secs(20))
+        .expect("failed FS terminal write reports its retired generation")
+    else {
+        panic!("failed FS terminal write skipped retired-generation recovery");
+    };
+    assert_eq!(retired, 1);
+    receipt
+        .send(Ok(Instant::now()))
+        .expect("acknowledge the retired FS generation");
     t.router.shutdown().expect("router shutdown");
 }
 
