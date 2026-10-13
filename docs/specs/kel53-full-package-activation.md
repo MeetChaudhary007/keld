@@ -2409,9 +2409,10 @@ both clears. To make that witness a proof, `WindowsExitCensus` loses its public 
 because a value with public fields is constructible by any caller, and it loses
 `Clone` and `Copy` (keeping `Debug`, `PartialEq` and `Eq`), so one census admits one
 detach; its only constructor is inside `exit_census` (`windows_job.rs:3679`), and its
-only readers today are the two S6b3 tests that print its fields
-(`windows_job.rs:5543`, `:5584`), which move to the accessors; no other code copies or
-stores it. The detach refuses a child that was never resumed and terminates it as
+only readers are tests: the two S6b3 tests that print its fields
+(`windows_job.rs:5543`, `:5584`) and the KEL-270 F54 census test
+`a_snapshot_whose_count_and_list_disagree_is_retaken_not_refused` (#715). All three move
+to the accessors; no other code copies or stores it. The detach refuses a child that was never resumed and terminates it as
 today; that refusal is a run-time check of the spent resume (`is_resumed`,
 `crates/keld-runtime/src/windows_lpac.rs:646-649`), not a type-level one. The
 Machine-UAC helper (S11) releases only the attempt Job and has no host-death census, so
@@ -2905,8 +2906,10 @@ Implement in:
   `WindowsDetachedLaunch` are added, and `WindowsExitCensus`
   (`crates/keld-runtime/src/windows_job.rs:3558-3572`) loses its public fields for
   accessors and its `Clone` and `Copy`, a breaking change whose scope is the struct,
-  its one constructor (`windows_job.rs:3679`) and the two S6b3 test readers
-  (`windows_job.rs:5543`, `:5584`). No call, `unsafe` block, scope or crate is added:
+  its one constructor (`windows_job.rs:3679`) and its test readers (the two S6b3 prints,
+  `windows_job.rs:5543`, `:5584`, and the F54 census test from #715). No production
+  call, `unsafe` block, scope or crate is added. The §7 d5 handle-census cell adds one
+  test-only `GetProcessHandleCount` read under the test module's existing allowance:
   the detach marks the child so that its Drop skips the existing `TerminateProcess`
   (`windows_lpac.rs:819-826`), and that block's `SAFETY` proof (`windows_lpac.rs:824-826`)
   is amended, so the unsafe gate is proof-only with independent review evidence on the
@@ -3324,7 +3327,8 @@ Must not touch in Slice A:
       unlanded slice. Gates: public API (breaking: the `WindowsExitCensus` fields and
       derives; new: `detach` and `WindowsDetachedLaunch`); unsafe: proof-only (the Drop
       `SAFETY` proof at `crates/keld-runtime/src/windows_lpac.rs:824-826` is amended; no
-      call, block, scope or crate is added), with independent unsafe-gate review
+      production call, block, scope or crate is added; the d5 cell's test-only
+      `GetProcessHandleCount` read is disclosed), with independent unsafe-gate review
       evidence on S6b4's final diff; permission model, dependency and wire: none (no
       principal, grant, crate or byte is added). Evidence: the "8, 9 (launch-record
       detach)" row in child processes that stand in for the host and the candidate, and
@@ -3613,8 +3617,9 @@ source SHA, package/signature identity and raw crash cuts. Other OS results are 
   S6b4: proof-only. The detach skips an existing `TerminateProcess` on a Drop path, and
   that block's `SAFETY` proof (`crates/keld-runtime/src/windows_lpac.rs:824-826`, "this
   owner never detaches") is amended to admit the census-bound detach of a resumed
-  child; no call, block, scope or crate is added, and S6b4's final diff needs
-  independent unsafe-gate review evidence. S6c adds none: the handover reuses the
+  child; no production call, block, scope or crate is added. The only new `unsafe` is
+  one test-only `GetProcessHandleCount` read for the §7 d5 handle census. S6b4's final
+  diff needs independent unsafe-gate review evidence. S6c adds none: the handover reuses the
   landed session tails, barrier and profile recovery, and no FFI call or `unsafe`
   block is added or changed (coordinator decisions under the owner's delegation of
   2026-10-08).
