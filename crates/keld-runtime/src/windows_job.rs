@@ -5637,6 +5637,22 @@ mod tests {
                 // holds only while this host is alive: wait for the go-ahead.
                 await_go(&mut report);
             }
+            "orderly-exit" => {
+                // §7 "8, 9 (launch-record detach)": the §4 order through both
+                // clears, then step 9 as a return, not `process::exit`: every
+                // local of this fixture drops, the launch record included.
+                let released = attempt.release_family().expect("release the attempt Job");
+                let census = host_job
+                    .release_for_exit(&released, Instant::now() + RELEASE_WAIT)
+                    .expect("release the host-death Job after the census");
+                writeln!(
+                    report,
+                    "CENSUS family={} terminated={} snapshots={}",
+                    census.family, census.terminated, census.snapshots
+                )
+                .expect("report the census");
+                writeln!(report, "{}", flags("FLAGS")).expect("report flags");
+            }
             _ => {
                 let released = attempt.release_family().expect("release the attempt Job");
                 writeln!(report, "{}", flags("RELEASED_ATTEMPT")).expect("report flags");
@@ -5658,6 +5674,11 @@ mod tests {
         let _ = report.shutdown(std::net::Shutdown::Both);
         drop(report);
         drop(reaped_primary);
+        if mode == "orderly-exit" {
+            // The exit in order: the remaining locals drop here, and the test
+            // harness ends the process as any orderly host would end.
+            return;
+        }
         std::process::exit(0);
     }
 
@@ -6087,6 +6108,33 @@ mod tests {
             "the last candidate must be alive after ten releases"
         );
         drop(candidate);
+    }
+
+    // KEL-270 T4d S6b4: the launch-record detach (KEL-53 §4 "Candidate release
+    // after commit", *Launch-record detach*; §7 row "8, 9 (launch-record
+    // detach)"), in the same stand-in processes.
+
+    #[test]
+    fn a_released_candidate_survives_the_launcher_dropping_its_record_in_an_orderly_exit() {
+        // §7 d1: after both clears the host exits in order, every local dropped,
+        // the launch record included, and the released candidate's handle stays
+        // unsignaled. Regression for S6b3 review P2-2 (design item F50): the
+        // record's drop terminated the candidate the two clears had released.
+        let (mut host, candidate, mut candidate_report) = start_release_cell("orderly-exit");
+        let census = host.report.next("CENSUS ");
+        assert!(report_count(&census, "family") >= 1, "{census}");
+        let flags = host.report.next("FLAGS ");
+        assert_eq!(report_flags(&flags, "attempt"), 0, "{flags}");
+        assert_eq!(report_flags(&flags, "host"), 0, "{flags}");
+        host.wait();
+        assert!(
+            candidate_report.ping(),
+            "the released candidate must answer after the launcher's orderly exit"
+        );
+        assert!(
+            !candidate.exited_now(),
+            "the released candidate's handle is signaled: the launcher's exit in order ended it"
+        );
     }
 
     #[test]
