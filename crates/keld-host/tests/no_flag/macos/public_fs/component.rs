@@ -19,8 +19,8 @@ fn public_app_fs_component_runs_without_synthetic_input_and_relaunches() {
         .expect("healthy relaunch document identity");
     for document in [first_document, second_document] {
         assert_eq!(
-            document["button"],
-            serde_json::Value::Null,
+            document.get("button"),
+            Some(&serde_json::Value::Null),
             "public-main-only page must not expose renderer activation"
         );
     }
