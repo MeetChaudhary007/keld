@@ -586,6 +586,12 @@ AuthRequest::Token { account_id, scopes? }
 
 AuthResponse::Begin { account_id, granted_scopes }
 AuthResponse::Token { access_token, expires_at, token_type }  // no refresh_token field exists
+//   expires_at: u64 — whole UTC seconds since the UNIX epoch (T3 implementation
+//   decision recorded on KEL-89, 2026-10-13). Compute by checked addition of the
+//   provider's expires_in seconds to successful token-receipt wall time. Reject
+//   overflow or an invalid clock; never infer JWT exp or saturate/default to zero.
+//   Cache freshness uses a separate monotonic deadline; account-session liveness
+//   remains bounded by host exit or terminal invalid_grant, not access expiry.
 
 // Deferred, names reserved (non-goals in v0; field sketches non-normative):
 //   AuthRequest::Accounts / AuthResponse::Accounts
@@ -1223,6 +1229,36 @@ compact `KELD-AUTH001`; that spelling is withdrawn.
 | `KELD-AUTH-013` | The authorization-code → token exchange failed | Rung 3, `auth.begin` completion; also `auth.token` when the IdP refuses a requested scope set (D17) | Whether the failure was transport or IdP-rejection, and that no automatic retry occurs. Any provider text carried here is **sanitised per D18(a)** |
 | `KELD-AUTH-014` | Silent acquisition needs interaction (`UserInteractionRequired` / `0xCAA10001` / `interaction_required`) | Windows rung 1, `auth.token`; 241 §4.3/§4.4 `[fact]` | That the caller must run a fresh interactive `auth.begin`; MUST NOT auto-escalate to a UI |
 | `KELD-AUTH-015` | The resolved provider profile has no `clientId` configured for this application in `keld.config.ts` (D14). **Post-Allow**, so it is not a pre-Allow discriminator | §4 profile table, AC14(c) | The profile key and the `keld.config.ts` `auth` section to add; **no** account or session detail |
+| `KELD-AUTH-016` | Local authentication processing failed in entropy, encoding, a checked processing bound/conversion, clock, or internal flow state, without an existing `KELD-AUTH-001`–`015` condition | T3 implementation extension; the finite Native producer union has independent source review under §8 recorded delegated approval and is recorded with the Native source and canonical registry in the same PR. Runtime qualification is predicate-specific | A static resource-free local-processing condition and its corrective action, with no automatic retry; no raw OS/provider text, credential, account id, issuer or request value; never an unresolved-account discriminator |
+
+**T3 implementation decision — local-processing error (reviewed source; runtime qualification scoped).**
+The AUTH016 row is a bounded implementation extension to AUTH001–015. The same
+T3 PR records its finite reviewed Native producer union: the five
+`PrimitiveError` local conditions, seven `StateFault` local conditions,
+loopback I/O/consumed-flow and browser lifecycle conditions covered by the
+delegated source reviews. This records source/API approval under §8; it does
+not ratify D1–D18 retroactively or prove reachability, platform delivery or
+completed-flow acceptance. All following restrictions and review gates remain
+binding.
+
+AUTH016 is post-Allow local processing only: entropy acquisition, encoding,
+checked internal processing bounds/conversions, clock arithmetic, or internal
+flow state. Existing provider/network/cancel/deadline/client/redirect conditions
+retain their AUTH001–015 codes and D18(a) sanitization. This row authorizes no new
+OAuth-scope filtering, caller validation limit or permission rule. The local
+message and fix are static and resource-free; no raw error or protected input
+is interpolated. The account-resolution invariant is expressly excluded:
+an unresolved/stale account still follows AC13(a–c), and actual Allow with no
+resolved session still replies with the identical granted-level GUARD002
+constant and surfaces its Native fault host-side under AC13(d), never AUTH016.
+
+The exact-source review must identify each AUTH016 emission site and its
+primitive, verify that named AUTH001–015 conditions retain their mapping, and
+exercise fault controls for the local code/constant and for AC13’s unchanged
+wire equality. Registry headings for all declared codes land only with the
+reviewed Native error-contract source required by the bidirectional registry
+gate; do not add inert code comments to manufacture scan coverage. Platform or
+unreachable target rows stay unqualified until their own route is exercised.
 
 Obligations that hold for every row: the code is the first token of the
 `Display` string; the message states the condition and then an imperative fix
@@ -1573,7 +1609,7 @@ Bind port 0; await conditions; no fixed ports; no wall-clock sleeps
 | Gate | This note / promote PR | Implement PRs |
 | --- | --- | --- |
 | Permission model | **Yes — owner sign-off or the recorded delegated-approval mode** (kel102 form), covering: new `auth.*` grants; exact-literal scope semantics; AC9b's load-time rejection of malformed auth grants on the shared load path — `**` **and, per D13, control characters**, which changes which manifests load at all; **(D14) an operator-authored `keld.config.ts` section and a boot-descriptor field becoming load-bearing for an auth flow**; **(D12) the change to what a denied principal observes**, which is a permission-model observable and not merely a public-API one; **and (D11 errata) AC13/AC14's resource derived from host state — a profile table for `begin`, the session registry for `token` — plus their resolve-then-authorize ordering and the recorded existence-oracle non-claim** — the largest permission-model delta in this note; **and (errata pass 4) the enumerated provider-profile table contents, which fix exactly which issuer literals an operator can grant, together with §4's recorded "no manifest bound on requested OAuth scopes" position**; **and (D17) `Token.scopes` reaching the IdP unchanged with no host-side check against the establishing session's `granted_scopes`, which fixes how far a `token` grant reaches at an authorized issuer** | re-reviewed per diff |
-| Public API | **Yes — owner sign-off or the recorded delegated-approval mode** (CALL/REPLY shapes and their normative wire names, the typed error contract — now the enumerated `KELD-AUTH-001`–`015` table in §4 plus its `docs/engineering/keld-error-codes.md` registry entries; **(D12) the narrowing of `call_error.rs`'s "message is the error's full `Display` text" for `auth.token` denials**; **(D12, boundary 2) the auth module re-deriving the guard-denial → wire mapping that `impl From<&DenyReason> for CallError` documents itself as the single owner of** — AC13 calls this the heavier of D12's two; **(AC13(d), boundary 3) the auth module synthesizing a `KELD-GUARD002` reply with no `DenyReason` behind it**, against `call_error.rs`'s and `crates/keld-ipc/AGENTS.md`'s rule that `code` is "owned by the crate that produced the failure" — the T3 PR MUST reconcile that nested crate invariant in the same commit or state the blocker; **(D14) the new `keld.config.ts` `auth` section, the optional `auth` field on the boot descriptor, and the new public `keld-core` surface needed to carry it past `ParsedBoot`** — three contracts, not one; **and `keld-guard`'s public surface**: AC9b needs a new `ManifestError` variant, which is a breaking change to a public non-`#[non_exhaustive]` enum and also forces an arm in `crates/keld-cli/src/mcp/permissions.rs`, whose `match` has no wildcard (errata pass 7 added boundaries 2 and 3, the two extra D14 contracts and the `permissions.rs` consequence; AC13's "all three are listed in §8" was false until it did) | re-reviewed per diff |
+| Public API | **Yes — owner sign-off or the recorded delegated-approval mode** (CALL/REPLY shapes and their normative wire names, the typed error contract — now the enumerated `KELD-AUTH-001`–`016` table in §4 plus its `docs/engineering/keld-error-codes.md` registry entries; **(D12) the narrowing of `call_error.rs`'s "message is the error's full `Display` text" for `auth.token` denials**; **(D12, boundary 2) the auth module re-deriving the guard-denial → wire mapping that `impl From<&DenyReason> for CallError` documents itself as the single owner of** — AC13 calls this the heavier of D12's two; **(AC13(d), boundary 3) the auth module synthesizing a `KELD-GUARD002` reply with no `DenyReason` behind it**, against `call_error.rs`'s and `crates/keld-ipc/AGENTS.md`'s rule that `code` is "owned by the crate that produced the failure" — the T3 PR MUST reconcile that nested crate invariant in the same commit or state the blocker; **(D14) the new `keld.config.ts` `auth` section, the optional `auth` field on the boot descriptor, and the new public `keld-core` surface needed to carry it past `ParsedBoot`** — three contracts, not one; **and `keld-guard`'s public surface**: AC9b needs a new `ManifestError` variant, which is a breaking change to a public non-`#[non_exhaustive]` enum and also forces an arm in `crates/keld-cli/src/mcp/permissions.rs`, whose `match` has no wildcard (errata pass 7 added boundaries 2 and 3, the two extra D14 contracts and the `permissions.rs` consequence; AC13's "all three are listed in §8" was false until it did) | re-reviewed per diff |
 | Dependency | none (prose only) | named gates: `windows` WAM features (T5), `objc2-authentication-services` (T4), `zbus`/`ashpd` (T6) |
 | Wire protocol | none (new channel payload only; frame untouched) | bump only if `02-ipc.md` §2 constants change |
 | unsafe | none (D8 clause) | owner decision executed in the first FFI PR (§4 gate-deferral clause) |

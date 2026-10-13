@@ -523,8 +523,23 @@ pub(crate) fn validate_primary_app_header_with_privileged_call(
     privileged_call: Option<&'static ChannelEntry>,
     header: FrameHeader,
 ) -> Result<ValidatedFrameHeader, IpcError> {
-    match (header.kind, privileged_call) {
-        (FrameKind::Reply | FrameKind::Err, _) => {
+    match privileged_call {
+        Some(entry) => {
+            validate_primary_app_header_with_privileged_calls(pending_echo_reply, &[entry], header)
+        }
+        None => validate_primary_app_header_with_privileged_calls(pending_echo_reply, &[], header),
+    }
+}
+
+// The same KEL-133 owner and policy constructors for every trusted guarded entry.
+// The host chooses this slice; a raw incoming channel id cannot construct it.
+pub(crate) fn validate_primary_app_header_with_privileged_calls(
+    pending_echo_reply: Option<CorrelationId>,
+    privileged_calls: &[&'static ChannelEntry],
+    header: FrameHeader,
+) -> Result<ValidatedFrameHeader, IpcError> {
+    match header.kind {
+        FrameKind::Reply | FrameKind::Err => {
             let Some(corr) = pending_echo_reply else {
                 return Err(IpcError::Protocol {
                     detail: "frame kind is not declared by the session policy",
@@ -532,8 +547,16 @@ pub(crate) fn validate_primary_app_header_with_privileged_call(
             };
             validate_received_header(&ReceivePolicy::primary_echo_reply_waiter(corr), header)
         }
-        (FrameKind::Call, Some(entry)) if header.channel == entry.id() => {
-            validate_received_header(&ReceivePolicy::privileged_call_receiver(entry)?, header)
+        FrameKind::Call => {
+            if let Some(entry) = privileged_calls
+                .iter()
+                .copied()
+                .find(|entry| header.channel == entry.id())
+            {
+                validate_received_header(&ReceivePolicy::privileged_call_receiver(entry)?, header)
+            } else {
+                validate_received_header(&ReceivePolicy::primary_app_receiver(), header)
+            }
         }
         _ => validate_received_header(&ReceivePolicy::primary_app_receiver(), header),
     }

@@ -230,7 +230,11 @@ pub(crate) fn process_exists(pid: u32) -> bool {
 pub(crate) fn await_process_gone(pid: u32) {
     let deadline = Instant::now() + PROCESS_DEADLINE;
     while process_exists(pid) {
-        assert!(Instant::now() < deadline, "process {pid} survived cleanup");
+        assert!(
+            Instant::now() < deadline,
+            "process {pid} survived cleanup; observed_state={}",
+            process_state(pid)
+        );
         thread::yield_now();
     }
 }

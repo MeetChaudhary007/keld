@@ -13,7 +13,7 @@ use crate::channel_table::{ChannelEntry, HANDSHAKE_CHANNEL};
 use crate::frame::{ChannelId, CorrelationId, FrameHeader, FrameKind};
 use crate::receive::{
     AbsoluteDeadline, ReceivePolicy, ValidatedFrameHeader, validate_primary_app_header,
-    validate_primary_app_header_with_privileged_call, validate_received_header,
+    validate_primary_app_header_with_privileged_calls, validate_received_header,
 };
 use crate::token::SessionToken;
 use crate::{APP_LINK_IO_DEADLINE, HEADER_LEN, IpcError, MAX_FRAME_LEN};
@@ -460,6 +460,40 @@ pub fn read_primary_app_frame_interruptible_with_privileged_call<S: Read>(
     privileged_call: &'static ChannelEntry,
     pending_privileged_call: impl Fn() -> bool,
 ) -> Result<Option<(ValidatedFrameHeader, Vec<u8>)>, IpcError> {
+    read_primary_app_frame_interruptible_with_privileged_calls(
+        stream,
+        stop,
+        pending_echo_reply,
+        &[privileged_call],
+        |_, _| pending_privileged_call(),
+    )
+}
+
+/// Interruptible primary reader with independently admitted guarded CALL channels.
+///
+/// The host selects table entries before reading any frame. The existing KEL-133
+/// validator admits only a matching `GuardedCall` with the canonical kind, flags
+/// and nonzero correlation. After validation, `call_unavailable` samples trusted
+/// admission state for that matched entry and correlation, before any payload is
+/// allocated or consumed. A `true` result rejects this CALL as `KELD-IPC-005`.
+///
+/// The callback can reject a duplicate correlation or a full bounded owner queue;
+/// it does not grant authority. Guard dispatch still runs after exact payload
+/// decode. Each channel owner supplies its own admission state: FS keeps its
+/// one-outstanding rule, while auth can admit concurrent callers under a separate
+/// bound. Echo reply matching, lifecycle and PING stay unchanged.
+///
+/// # Errors
+///
+/// As [`read_primary_app_frame_interruptible`]. A selected entry outside the
+/// guarded policy class, or an unavailable CALL, is [`IpcError::Protocol`].
+pub fn read_primary_app_frame_interruptible_with_privileged_calls<S: Read>(
+    stream: &mut S,
+    stop: &AtomicBool,
+    pending_echo_reply: impl Fn() -> Option<CorrelationId>,
+    privileged_calls: &[&'static ChannelEntry],
+    call_unavailable: impl Fn(&'static ChannelEntry, CorrelationId) -> bool,
+) -> Result<Option<(ValidatedFrameHeader, Vec<u8>)>, IpcError> {
     read_frame_interruptible_validated_with(
         stream,
         stop,
@@ -467,16 +501,20 @@ pub fn read_primary_app_frame_interruptible_with_privileged_call<S: Read>(
         None,
         APP_LINK_IO_DEADLINE,
         |header| {
-            let validated = validate_primary_app_header_with_privileged_call(
+            let validated = validate_primary_app_header_with_privileged_calls(
                 pending_echo_reply(),
-                Some(privileged_call),
+                privileged_calls,
                 header,
             )?;
             if header.kind == FrameKind::Call
-                && header.channel == privileged_call.id()
-                && pending_privileged_call()
+                && let Some(entry) = privileged_calls
+                    .iter()
+                    .copied()
+                    .find(|entry| header.channel == entry.id())
+                && call_unavailable(entry, header.corr)
             {
                 return Err(IpcError::Protocol {
+                    // Preserve the singular FS wrapper's public diagnostic.
                     detail: "privileged Call is already outstanding for this session",
                 });
             }
@@ -507,6 +545,35 @@ pub fn read_quit_drain_frame<S: Read>(
     idle_deadline: Instant,
     hard_deadline: Instant,
 ) -> Result<Option<(ValidatedFrameHeader, Vec<u8>)>, IpcError> {
+    match privileged_call {
+        Some(entry) => read_quit_drain_frame_with_privileged_calls(
+            stream,
+            &[entry],
+            idle_deadline,
+            hard_deadline,
+        ),
+        None => {
+            read_quit_drain_frame_with_privileged_calls(stream, &[], idle_deadline, hard_deadline)
+        }
+    }
+}
+
+/// Accepted-Quit drain over the same host-selected guarded CALL entries.
+///
+/// As [`read_quit_drain_frame`], with no pending-call admission predicate because
+/// the session has quiesced. This validates frames only; the existing session
+/// owner sends `CallError::quit_drained` for each admitted declared CALL and never
+/// enters a privileged handler.
+///
+/// # Errors
+///
+/// As [`read_quit_drain_frame`].
+pub fn read_quit_drain_frame_with_privileged_calls<S: Read>(
+    stream: &mut S,
+    privileged_calls: &[&'static ChannelEntry],
+    idle_deadline: Instant,
+    hard_deadline: Instant,
+) -> Result<Option<(ValidatedFrameHeader, Vec<u8>)>, IpcError> {
     let never = AtomicBool::new(false);
     read_frame_interruptible_validated_with(
         stream,
@@ -514,7 +581,7 @@ pub fn read_quit_drain_frame<S: Read>(
         Some(hard_deadline),
         Some(idle_deadline),
         APP_LINK_IO_DEADLINE,
-        |header| validate_primary_app_header_with_privileged_call(None, privileged_call, header),
+        |header| validate_primary_app_header_with_privileged_calls(None, privileged_calls, header),
     )
 }
 
@@ -2000,6 +2067,257 @@ mod validated_read_tests {
             (HEADER_LEN * 2) as u64,
             "second privileged payload must remain unread"
         );
+    }
+
+    #[test]
+    fn primary_guarded_channels_keep_independent_admission_before_payload() {
+        let stop = AtomicBool::new(false);
+        for (entry, blocked_entry) in [
+            (&crate::channel_table::AUTH, &crate::channel_table::FS),
+            (&crate::channel_table::FS, &crate::channel_table::AUTH),
+        ] {
+            let payload = [0x11, 0x22];
+            let mut cursor = std::io::Cursor::new(frame_bytes(
+                FrameKind::Call,
+                0,
+                entry.wire_id(),
+                7,
+                &payload,
+            ));
+            let (header, got) = read_primary_app_frame_interruptible_with_privileged_calls(
+                &mut cursor,
+                &stop,
+                || None,
+                &[&crate::channel_table::FS, &crate::channel_table::AUTH],
+                |matched, corr| {
+                    assert_eq!(matched.id(), entry.id());
+                    assert_eq!(corr, CorrelationId(7));
+                    matched.id() == blocked_entry.id()
+                },
+            )
+            .expect("the other channel's occupied owner cannot block this CALL")
+            .expect("active reader");
+            assert_eq!(header.channel(), entry.id());
+            assert_eq!(got, payload);
+        }
+        // Framing does not collapse broker single-flight into one pending CALL.
+        for corr in [7, 8] {
+            let mut cursor = std::io::Cursor::new(frame_bytes(
+                FrameKind::Call,
+                0,
+                crate::channel_table::AUTH.wire_id(),
+                corr,
+                &[],
+            ));
+            read_primary_app_frame_interruptible_with_privileged_calls(
+                &mut cursor,
+                &stop,
+                || None,
+                &[&crate::channel_table::AUTH],
+                |_, _| false,
+            )
+            .expect("available auth capacity admits both nonzero ids")
+            .expect("active reader");
+        }
+        for rejected_corr in [7, 8] {
+            let mut cursor = std::io::Cursor::new(frame_bytes(
+                FrameKind::Call,
+                0,
+                crate::channel_table::AUTH.wire_id(),
+                rejected_corr,
+                &[0xAA; 64],
+            ));
+            let error = read_primary_app_frame_interruptible_with_privileged_calls(
+                &mut cursor,
+                &stop,
+                || None,
+                &[&crate::channel_table::AUTH],
+                |entry, corr| {
+                    entry.id() == crate::channel_table::AUTH.id()
+                        && corr == CorrelationId(rejected_corr)
+                },
+            )
+            .expect_err("trusted unavailable correlation or capacity rejects");
+            assert!(matches!(error, IpcError::Protocol { .. }));
+            assert_eq!(cursor.position(), HEADER_LEN as u64);
+        }
+    }
+
+    #[test]
+    fn primary_auth_selection_cannot_widen_canonical_header_rules() {
+        let stop = AtomicBool::new(false);
+        let auth = crate::channel_table::AUTH.wire_id();
+        for selected in [&[][..], &[&crate::channel_table::FS][..]] {
+            let mut cursor =
+                std::io::Cursor::new(frame_bytes(FrameKind::Call, 0, auth, 7, &[0xAA; 64]));
+            read_primary_app_frame_interruptible_with_privileged_calls(
+                &mut cursor,
+                &stop,
+                || None,
+                selected,
+                |_, _| false,
+            )
+            .expect_err("unselected auth cannot select its own policy");
+            assert_eq!(cursor.position(), HEADER_LEN as u64);
+        }
+        for (kind, flags, channel, corr) in [
+            (FrameKind::Call, 0, auth, 0),
+            (FrameKind::Call, crate::frame::FLAG_RAW, auth, 7),
+            (FrameKind::Call, 0x8000, auth, 7),
+            (FrameKind::Call, 0, auth + 1, 7),
+            (FrameKind::Call, 0, u16::MAX, 7),
+            (FrameKind::Event, 0, auth, 0),
+            (FrameKind::Reply, 0, auth, 7),
+            (FrameKind::Err, 0, auth, 7),
+            (FrameKind::StreamOpen, 0, auth, 7),
+            (FrameKind::StreamChunk, 0, auth, 7),
+            (FrameKind::StreamClose, 0, auth, 7),
+            (FrameKind::Cancel, 0, auth, 7),
+            (FrameKind::Grant, 0, auth, 7),
+        ] {
+            let mut cursor =
+                std::io::Cursor::new(frame_bytes(kind, flags, channel, corr, &[0xAA; 64]));
+            let error = read_primary_app_frame_interruptible_with_privileged_calls(
+                &mut cursor,
+                &stop,
+                || None,
+                &[&crate::channel_table::FS, &crate::channel_table::AUTH],
+                |_, _| false,
+            )
+            .expect_err("bad or future structured header remains rejected");
+            assert!(matches!(error, IpcError::Protocol { .. }));
+            assert_eq!(cursor.position(), HEADER_LEN as u64);
+        }
+        let mut cursor = std::io::Cursor::new(frame_bytes(
+            FrameKind::Call,
+            0,
+            crate::channel_table::ECHO.wire_id(),
+            7,
+            &[0xAA; 64],
+        ));
+        read_primary_app_frame_interruptible_with_privileged_calls(
+            &mut cursor,
+            &stop,
+            || None,
+            &[&crate::channel_table::ECHO],
+            |_, _| false,
+        )
+        .expect_err("host-internal entry cannot become a guarded policy");
+        assert_eq!(cursor.position(), HEADER_LEN as u64);
+    }
+
+    #[test]
+    fn primary_multi_guarded_selection_preserves_echo_lifecycle_and_ping() {
+        let stop = AtomicBool::new(false);
+        for entry in [
+            &crate::channel_table::ECHO,
+            &crate::channel_table::LIFECYCLE,
+        ] {
+            let mut cursor =
+                std::io::Cursor::new(frame_bytes(FrameKind::Call, 0, entry.wire_id(), 7, &[1]));
+            let (_, payload) = read_primary_app_frame_interruptible_with_privileged_calls(
+                &mut cursor,
+                &stop,
+                || Some(CorrelationId(17)),
+                &[&crate::channel_table::FS, &crate::channel_table::AUTH],
+                |_, _| panic!("guarded callback must not gate internal calls"),
+            )
+            .expect("legacy internal call admits")
+            .expect("active reader");
+            assert_eq!(payload, [1]);
+        }
+        for kind in [FrameKind::Reply, FrameKind::Err] {
+            for corr in [16, 18] {
+                let mut cursor = std::io::Cursor::new(frame_bytes(
+                    kind,
+                    0,
+                    crate::channel_table::ECHO.wire_id(),
+                    corr,
+                    &[0xAA; 64],
+                ));
+                read_primary_app_frame_interruptible_with_privileged_calls(
+                    &mut cursor,
+                    &stop,
+                    || Some(CorrelationId(17)),
+                    &[&crate::channel_table::FS, &crate::channel_table::AUTH],
+                    |_, _| false,
+                )
+                .expect_err("stale or future echo reply remains rejected");
+                assert_eq!(cursor.position(), HEADER_LEN as u64);
+            }
+            let mut cursor = std::io::Cursor::new(frame_bytes(
+                kind,
+                0,
+                crate::channel_table::ECHO.wire_id(),
+                17,
+                &[1],
+            ));
+            read_primary_app_frame_interruptible_with_privileged_calls(
+                &mut cursor,
+                &stop,
+                || Some(CorrelationId(17)),
+                &[&crate::channel_table::FS, &crate::channel_table::AUTH],
+                |_, _| false,
+            )
+            .expect("exact pending echo terminal admits")
+            .expect("active reader");
+        }
+        for (flags, payload, accepted) in [
+            (0, &[][..], true),
+            (crate::frame::FLAG_RAW, &[][..], false),
+            (0, &[1][..], false),
+        ] {
+            let mut cursor =
+                std::io::Cursor::new(frame_bytes(FrameKind::Ping, flags, u16::MAX, 0, payload));
+            let result = read_primary_app_frame_interruptible_with_privileged_calls(
+                &mut cursor,
+                &stop,
+                || None,
+                &[&crate::channel_table::FS, &crate::channel_table::AUTH],
+                |_, _| panic!("PING must not inspect guarded slots"),
+            );
+            assert_eq!(result.is_ok(), accepted);
+            if !accepted {
+                assert_eq!(cursor.position(), HEADER_LEN as u64);
+            }
+        }
+    }
+
+    #[test]
+    fn primary_multi_guarded_envelope_cap_and_quit_drain_stay_canonical() {
+        let stop = AtomicBool::new(false);
+        let header = FrameHeader {
+            kind: FrameKind::Call,
+            flags: crate::frame::FLAG_RAW,
+            channel: crate::channel_table::AUTH.id(),
+            corr: CorrelationId(0),
+            len: u32::try_from(MAX_FRAME_LEN).expect("frame cap fits") + 1,
+        };
+        let mut cursor = std::io::Cursor::new(header.encode());
+        let error = read_primary_app_frame_interruptible_with_privileged_calls(
+            &mut cursor,
+            &stop,
+            || None,
+            &[&crate::channel_table::AUTH],
+            |_, _| false,
+        )
+        .expect_err("envelope cap precedes semantic error before allocation");
+        assert!(matches!(error, IpcError::PayloadTooLarge));
+        assert_eq!(cursor.position(), HEADER_LEN as u64);
+        for entry in [&crate::channel_table::FS, &crate::channel_table::AUTH] {
+            let mut cursor =
+                std::io::Cursor::new(frame_bytes(FrameKind::Call, 0, entry.wire_id(), 7, &[1]));
+            let (header, got) = read_quit_drain_frame_with_privileged_calls(
+                &mut cursor,
+                &[&crate::channel_table::FS, &crate::channel_table::AUTH],
+                Instant::now() + APP_LINK_IO_DEADLINE,
+                Instant::now() + APP_LINK_IO_DEADLINE,
+            )
+            .expect("quiesced declared guarded CALL admits for terminal024")
+            .expect("frame");
+            assert_eq!(header.channel(), entry.id());
+            assert_eq!(got, [1]);
+        }
     }
 
     /// Syntax stays first: a bad header byte is `KELD-IPC-002`, not 005.

@@ -17,6 +17,8 @@ use std::path::Path;
 use std::process::{Command, Output, Stdio};
 use std::time::Instant;
 
+#[path = "public_fs/actual_auth_app.rs"]
+mod actual_auth_app;
 #[path = "public_fs/application_link.rs"]
 mod application_link;
 #[path = "public_fs/component.rs"]

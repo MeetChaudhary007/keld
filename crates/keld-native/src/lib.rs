@@ -6,6 +6,8 @@
 //! `docs/engineering/product-status.tsv` for current coverage and evidence. Normative
 //! spec: `docs/architecture/05-webview-and-native.md` §3.
 
+/// Authentication contracts; the guarded runtime broker is being implemented.
+pub mod auth;
 pub mod fs;
 
 #[cfg(test)]

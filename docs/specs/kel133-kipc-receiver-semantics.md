@@ -231,9 +231,21 @@ work; `FLAG_RAW` is invalid for every row below.
 | host lifecycle receiver | `CALL` | `0` | `LIFECYCLE_CHANNEL=3` | nonzero | exact `LifecycleRequest` | `005`; close; zero lifecycle effect |
 | app lifecycle event receiver | `EVENT` | `0` | `3` | `0` | exact `LifecycleEvent` | `005`; close |
 | app lifecycle reply waiter | `REPLY` or `ERR` | `0` | `3` | exact outstanding id | exact response or `CallError` | `005`; close; waiter fails |
-| privileged FS receiver (future T3 consumer) | `CALL` | `0` | host-declared FS channel | nonzero | exact request, no trailing bytes | `005`; close; zero guard/broker effect |
+| privileged receiver | `CALL` | `0` | host-selected guarded table entry (`fs`, or KEL-89 `auth`) | nonzero | exact per-channel request, no trailing bytes | `005`; close; zero guard/broker effect |
 | host primary app receiver (the live multiplexed link: rows 3 and 5 on one stream) | `CALL` | `0` | `ECHO_CHANNEL=1` or `LIFECYCLE_CHANNEL=3` | nonzero | per-channel codec | `005`; close; zero handler effect |
 | v0 `PING` liveness probe (rows 3, 5, 6 and the primary session only; never pre-auth, waiters, or the privileged receiver) | `PING` | `0` | any (echoed) | any (echoed) | exactly empty | `005` for flags or payload; close |
+
+A primary receiver may also select a host-owned slice of guarded table entries
+through the same privileged row. The shared validator keeps each structured
+header's rules; the host's admission callback sees only the matched entry and
+nonzero correlation after semantic validation and before payload allocation.
+The singular FS reader retains its existing one-outstanding behavior. Other
+selected channels use their own bounded owner state; an outstanding FS call
+cannot silently occupy an auth slot, and auth pending-call capacity is distinct
+from the broker's account/scope single-flight key. No selection mints authority:
+exact channel payload decoding and the sole guard-before-handler dispatch follow.
+The accepted-Quit drain uses the same selected entries and existing deadlines,
+with no new admission or handler entry after quiescence.
 
 `PING` is admissible only where the table declares it (it is a positive pre-KEL-133
 vector on the echo, lifecycle, and primary sessions; criterion 11 forbids changing

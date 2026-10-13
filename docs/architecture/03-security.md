@@ -195,8 +195,11 @@ manifest decoder.
   denial's full `Display` (`02-ipc.md` §2), because the requested resource is the thing
   being protected — on denials, and on the host-internal invariant path where the guard
   Allows but no session resolved, so the two cannot be told apart.
-  Owner: `docs/specs/keld-auth.md` (KEL-89). No auth channel, handler, or load-time
-  entry rejection exists in the workspace yet.
+  Owner: `docs/specs/keld-auth.md` (KEL-89). Shared manifest loading rejects the
+  malformed `auth.begin`/`auth.token` issuer entries above. Direct public serde
+  deserialization is not that load path; AC13(d) separately owns its defense.
+  The T3 macOS implementation supplies the auth channel, Core admission and
+  Native runtime handler. Other OS-broker paths remain targets.
 - **CSP injection** by default on every webview (`default` = self + keld:// + declared
   net hosts; `static-only` = no script eval, no net). Opt-out is a named, linted grant.
 

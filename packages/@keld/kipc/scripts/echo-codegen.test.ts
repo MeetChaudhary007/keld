@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "n
 import { tmpdir } from "node:os";
 import { relative, resolve } from "node:path";
 
-import { assertEchoArtifactFresh, assertFsArtifactFresh, renderEchoDeclarations, renderFsBinding } from "./echo-codegen.ts";
+import { assertEchoArtifactFresh, assertFsArtifactFresh, renderAuthBinding, renderEchoDeclarations, renderFsBinding } from "./echo-codegen.ts";
 import { decodeFsResponse, encodeFsRequest, type FsRequest } from "../../api/src/fs.generated.ts";
 import { MAX_FRAME_LEN } from "../src/transport.ts";
 import { pathToFileURL } from "node:url";
@@ -466,5 +466,36 @@ describe("bounded native filesystem binding", () => {
       if (!vector) throw new Error("read result vector absent");
       expect(() => binding.decodeFsResponse(vector.wire)).toThrow("KELD-IPC-003");
     });
+  });
+});
+
+describe("native auth derive grammar", () => {
+  const authSource = readFileSync(
+    resolve(repositoryRoot, "crates/keld-native/src/auth/mod.rs"),
+    "utf8",
+  );
+  const responseDeclaration = "#[derive(Clone, Serialize, Deserialize)]\npub enum AuthResponse {";
+
+  test("actual Native Clone response renders the same wire binding as existing admitted derives", () => {
+    expect(authSource).toContain(responseDeclaration);
+    const rendered = renderAuthBinding(authSource);
+    expect(rendered).toContain("expires_at: bigint");
+    for (const derive of ["Serialize, Deserialize", "Debug, Serialize, Deserialize"]) {
+      const source = authSource.replace(responseDeclaration, `#[derive(${derive})]\npub enum AuthResponse {`);
+      expect(renderAuthBinding(source)).toBe(rendered);
+    }
+  });
+
+  test("Clone admission still rejects serde attributes and unsupported derive lists", () => {
+    expect(authSource).toContain(responseDeclaration);
+    const mutations = [
+      authSource.replace("pub enum AuthResponse {", '#[serde(tag = "kind")]\npub enum AuthResponse {'),
+      authSource.replace("pub enum AuthResponse {", '#[serde(\n    tag = "kind"\n)]\npub enum AuthResponse {'),
+      authSource.replace("        expires_at: u64,", '        #[serde(skip)]\n        expires_at: u64,'),
+      authSource.replace(responseDeclaration, "#[derive(Clone, Serialize, Deserialize, Default)]\npub enum AuthResponse {"),
+      authSource.replace(responseDeclaration, "#[derive(Clone, Deserialize, Serialize)]\npub enum AuthResponse {"),
+      authSource.replace(responseDeclaration, "#[derive(Clone, Serialize)]\npub enum AuthResponse {"),
+    ];
+    for (const source of mutations) expect(() => renderAuthBinding(source)).toThrow(/echo codegen:/);
   });
 });

@@ -1654,7 +1654,8 @@ schema language, ship `@keld/schema` or live `keld gen`, or replace runtime vali
 static, append-only table owned by `keld-ipc` (name, `u16` id, receive-policy class,
 guard reference); id `0` stays reserved for `HELLO`, and ids are never renumbered or
 reused. TypeScript constants are generated from it by the KEL-98 generator. It is live
-since X05-T4 (#597): `keld_ipc::channel_table` holds echo = 1, fs = 2 and lifecycle = 3,
+since X05-T4 (#597): `keld_ipc::channel_table` holds echo = 1, fs = 2, lifecycle = 3
+and the KEL-89 auth allocation = 4,
 every production id derives from it, the TypeScript ids are a generated, drift-checked
 region of `transport.ts`, and the wire is unchanged. Handshake-time name resolution and
 full `keld gen` emission remain destination work that needs a `HELLO` change, a protocol
@@ -1960,8 +1961,11 @@ manifest decoder.
   denial's full `Display` (`02-ipc.md` §2), because the requested resource is the thing
   being protected — on denials, and on the host-internal invariant path where the guard
   Allows but no session resolved, so the two cannot be told apart.
-  Owner: `docs/specs/keld-auth.md` (KEL-89). No auth channel, handler, or load-time
-  entry rejection exists in the workspace yet.
+  Owner: `docs/specs/keld-auth.md` (KEL-89). Shared manifest loading rejects the
+  malformed `auth.begin`/`auth.token` issuer entries above. Direct public serde
+  deserialization is not that load path; AC13(d) separately owns its defense.
+  The T3 macOS implementation supplies the auth channel, Core admission and
+  Native runtime handler. Other OS-broker paths remain targets.
 - **CSP injection** by default on every webview (`default` = self + keld:// + declared
   net hosts; `static-only` = no script eval, no net). Opt-out is a named, linted grant.
 
@@ -5709,8 +5713,8 @@ match the crate that already emits the code. Do not invent a third spelling.
 ## KELD-GUARD005
 
 - crate: keld-guard
-- message: Permissions manifest is not UTF-8, is ambiguous, or is not valid JSONC
-- fix: Write UTF-8, remove duplicate object keys, or fix the JSON (comments are allowed; trailing commas are not).
+- message: Permissions manifest is not UTF-8, is ambiguous, is not valid JSONC, or contains a malformed auth issuer grant
+- fix: Write UTF-8, remove duplicate object keys, fix the JSON, or remove `**` and control characters from `app.auth.begin`/`app.auth.token` issuer literals (comments are allowed; trailing commas are not).
 
 ## KELD-GUARD006
 
@@ -6365,6 +6369,108 @@ match the crate that already emits the code. Do not invent a third spelling.
 - crate: keld-updater-helper
 - message: The updater helper's recovery-only role is disabled in this release (RecoveryDisabled); it refused after anchoring itself, before the writer lease and any write
 - fix: No supported resolution exists other than administrator action; any activation journal, the pointers and the versions are preserved, and no ordinary process repairs them.
+
+## KELD-AUTH-002
+
+- crate: keld-native
+- module: auth
+- message: The provider names no key in the closed v0 provider-profile table; AC14(a) is the only pre-Allow auth refusal.
+- fix: Correct the quoted/escaped unknown provider key to one of the closed valid profile keys named by the auth diagnostic.
+- status: Declared target; actual provider-resolution route unqualified by this documentation proposal.
+
+
+## KELD-AUTH-003
+
+- crate: keld-native
+- module: auth
+- message: Exact-literal redirect mode is selected with a dynamic port before any socket attempt.
+- fix: Configure the one registered fixed redirect port; bind-0 is not a fallback. If a socket was attempted and bind failed, use KELD-AUTH-004 instead.
+- status: Declared target; request-construction-only boundary unqualified here.
+
+
+## KELD-AUTH-010
+
+- crate: keld-native
+- module: auth
+- message: The child-supplied login_hint exceeds its byte bound or contains a control character.
+- fix: Correct only the named length or character-class constraint; never include the offending login_hint value in the diagnostic.
+- status: Declared target; post-Allow validation ordering and PII suppression unqualified here.
+
+
+## KELD-AUTH-011
+
+- crate: keld-native
+- module: auth
+- message: Loopback/scheme callback correlation failed because state is unknown/mismatched or the PKCE verifier does not match.
+- fix: Discard the callback and restart the flow; never echo the received state.
+- status: Declared target; actual correlation/PKCE behavior unqualified here.
+
+
+## KELD-AUTH-012
+
+- crate: keld-native
+- module: auth
+- message: The IdP returned an OAuth callback error such as access_denied, invalid_scope or interaction_required.
+- fix: Treat the sanitized provider error code as the IdP decision, not Keld policy. Bound provider text to 256 bytes with truncation marked, strip controls and quote it in a delimited position after Keld’s code; never parse it to select a Keld code path.
+- status: Declared target; callback and D18(a) provider-text behavior unqualified here.
+
+
+## KELD-AUTH-013
+
+- crate: keld-native
+- module: auth
+- message: Authorization-code-to-token exchange failed, or the IdP refused the scope set requested by auth.token.
+- fix: Name transport failure versus IdP rejection and start only a new user-initiated operation; no automatic retry occurs. Sanitize any provider text under D18(a): bounded 256-byte quoted text, controls stripped and truncation marked, after Keld’s own code.
+- status: Declared contract; a transport source currently emits this code, but this registry proposal proves neither complete exchange behavior nor T3 flow acceptance.
+
+
+## KELD-AUTH-016
+
+- crate: keld-native
+- module: auth
+- message: Authentication failed in local entropy, encoding, processing-bound, clock or internal-state processing; no existing AUTH001–015 condition applies.
+- fix: Start a new user-initiated auth.begin; if the failure persists, report the static Keld diagnostic. Keep message/fix resource-free and constant; do not include credentials, account ids, issuer/request values, provider text or raw OS errors.
+- status: Reviewed T3 local source contract, recorded in the same PR under §8 delegated approval. Runtime evidence is predicate-specific; unreachable/target conditions remain unqualified. Never use for unresolved/stale account or AC13(d).
+
+## KELD-AUTH-004
+
+- crate: keld-native
+- module: auth
+- message: Rung-3 loopback listener bind or system-browser launch failed.
+- fix: For a bind failure, free the configured port or correct its registration; for a browser-launch failure, configure a working default browser. Name which operation failed.
+- status: Declared target; real listener/browser behavior unqualified here.
+
+## KELD-AUTH-007
+
+- crate: keld-native
+- module: auth
+- message: The user cancelled the broker or external-user-agent dialog (canceledLogin class); the failure is non-terminal.
+- fix: Retry only when initiated by the user. A defect-neutral default-browser hint is permitted; do not assert an Apple defect or retry automatically.
+- status: Declared target; cancel classification and lifecycle unqualified here.
+
+## KELD-AUTH-008
+
+- crate: keld-native
+- module: auth
+- message: The authorization step did not complete within the host bound.
+- fix: Start a new user-initiated auth.begin; never retry automatically.
+- status: Declared target; actual deadline behavior unqualified here.
+
+## KELD-AUTH-009
+
+- crate: keld-native
+- module: auth
+- message: Terminal invalid_grant refresh failure evicts the session and ends its liveness.
+- fix: Sign in again through auth.begin; the host holds no durable credential.
+- status: Declared target; refresh eviction and live-session behavior unqualified here.
+
+## KELD-AUTH-015
+
+- crate: keld-native
+- module: auth
+- message: The resolved provider profile has no clientId configured for this application; this is refused only after guard Allow.
+- fix: Add clientId under the named profile in the keld.config.ts auth section. Name the profile/configuration location without account or session detail.
+- status: Declared target; post-Allow missing-client refusal and configured/unconfigured deny equality unqualified here.
 
 ---
 
