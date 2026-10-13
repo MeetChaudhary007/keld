@@ -962,7 +962,7 @@ fn a_stage_recording_a_different_candidate_refuses_before_the_journal() {
     );
     commit(&trust, "3.0.0");
     assert_resolved(&trust, "3.0.0", Some("2.0.0"), "3.0.0", &["2.0.0", "3.0.0"]);
-    assert!(incomplete_stages(&trust).is_empty());
+    assert_eq!(incomplete_stages(&trust).len(), 0);
 }
 
 #[test]
@@ -1215,7 +1215,7 @@ fn recovery_replaces_a_damaged_copy_with_the_next_exact_stage() {
         WindowsActivationOutcome::Committed
     );
     assert_resolved(&trust, "3.0.0", Some("2.0.0"), "3.0.0", &["2.0.0", "3.0.0"]);
-    assert!(incomplete_stages(&trust).is_empty());
+    assert_eq!(incomplete_stages(&trust).len(), 0);
 }
 
 #[test]

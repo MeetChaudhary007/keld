@@ -103,6 +103,18 @@ const ATOMIC_PROTOCOL_COMMANDS: &[&str] = &[
     "target/atomic-protocol/atomic-protocol check .",
 ];
 
+/// The doc-placeholders recipe pair, run by the hosted hygiene job (#650).
+const DOC_PLACEHOLDER_COMMANDS: &[&str] = &[
+    "mkdir -p target/doc-placeholders",
+    "rustc --edition=2024 -D warnings --test tools/doc_placeholders.rs -o target/doc-placeholders/doc-placeholders-test",
+    "target/doc-placeholders/doc-placeholders-test",
+    "rustc --edition=2024 -D warnings tools/doc_placeholders.rs -o target/doc-placeholders/doc-placeholders",
+    "target/doc-placeholders/doc-placeholders check .",
+];
+
+/// The `hygiene` recipe's hello-command regression, run by the hosted hygiene job (#650).
+const HELLO_COMMAND_COMMANDS: &[&str] = &["python3 -B tools/test_hello_command.py"];
+
 const AUDIT_DOC_COMMANDS: &[&str] = &[
     "python3 -B docs/audits/verify.py",
     "python3 -B docs/audits/test_verify.py",
@@ -891,33 +903,37 @@ fn workflow_has_checkout_fetch_depth_zero(text: &str) -> bool {
     false
 }
 
+/// The named step's whole block must carry exactly `run: <command>` and no
+/// `if` key at any position: a condition after `run:` skips the step just as
+/// one before it does (#650 review).
 fn workflow_has_unconditional_named_step(text: &str, step_name: &str, command: &str) -> bool {
     let expected_name = format!("- name: {step_name}");
     let expected_command = format!("run: {command}");
     let mut step_indent = None;
+    let mut found_command = false;
 
     for line in text.lines() {
         let Some((indent, content)) = yaml_content(line) else {
             continue;
         };
-        if content == expected_name {
-            step_indent = Some(indent);
-            continue;
-        }
         let Some(step) = step_indent else {
+            if content == expected_name {
+                step_indent = Some(indent);
+            }
             continue;
         };
         if indent <= step {
-            return false;
+            break;
         }
-        if content.starts_with("if:") || content.starts_with("- if:") {
-            return false;
-        }
-        if content == expected_command {
-            return true;
+        if indent == step + 2 {
+            if content == expected_command {
+                found_command = true;
+            } else if yaml_mapping_key(content).is_some_and(|(key, _)| key == "if") {
+                return false;
+            }
         }
     }
-    false
+    found_command
 }
 
 fn workflow_named_step_has_property(text: &str, step_name: &str, property: &str) -> bool {
@@ -1260,6 +1276,12 @@ fn check_change_router_job(text: &str) -> Result<(), String> {
         (
             "Classify changed-path ownership",
             "tools/ci_changes.sh github",
+        ),
+        // agents-md reads crates/*.rs as well as AGENTS and .agents files, so
+        // it runs in the always-created router job (#650).
+        (
+            "Agent instruction inventory (agents-md)",
+            "tools/agents_md.sh",
         ),
     ] {
         if !workflow_has_unconditional_named_step(&block, step_name, command) {
@@ -2043,6 +2065,17 @@ fn check_atomic_protocol_step(text: &str) -> Result<(), String> {
         "Atomic problem-solving protocol contract",
         ATOMIC_PROTOCOL_COMMANDS,
     )
+}
+
+/// doc-placeholders runs whenever the hygiene job runs (docs or hygiene
+/// selected); every input it scans selects one of them (#650).
+fn check_doc_placeholders_step(text: &str) -> Result<(), String> {
+    check_hygiene_contract_step(text, "Documentation placeholder contracts", DOC_PLACEHOLDER_COMMANDS)
+}
+
+/// The hello-command regression reads the justfile and onboarding docs (#650).
+fn check_hello_command_step(text: &str) -> Result<(), String> {
+    check_hygiene_contract_step(text, "Hello command contract", HELLO_COMMAND_COMMANDS)
 }
 
 fn check_agent_context_step(text: &str) -> Result<(), String> {
@@ -2873,6 +2906,8 @@ fn check_workflow(root: &Path) -> Result<(), String> {
     check_release_updater_helper_step(&text)?;
     check_updater_helper_deny_step(&text)?;
     check_atomic_protocol_step(&text)?;
+    check_doc_placeholders_step(&text)?;
+    check_hello_command_step(&text)?;
     check_agent_context_step(&text)?;
     check_public_audit_step(&text)?;
     for needle in WORKFLOW_RUN_NEEDLES {
@@ -3252,6 +3287,8 @@ mod tests {
             "        run: tools/ci_changes_test.sh",
             "      - name: Classify changed-path ownership",
             "        run: tools/ci_changes.sh github",
+            "      - name: Agent instruction inventory (agents-md)",
+            "        run: tools/agents_md.sh",
             "      - name: Product status contract",
             "        run: |",
             "          mkdir -p target/product-status",
@@ -3348,6 +3385,16 @@ mod tests {
             "      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0",
             "        with:",
             "          bun-version: \"1.4.2\"",
+            "      - name: Documentation placeholder contracts",
+            "        run: |",
+            "          mkdir -p target/doc-placeholders",
+            "          rustc --edition=2024 -D warnings --test tools/doc_placeholders.rs -o target/doc-placeholders/doc-placeholders-test",
+            "          target/doc-placeholders/doc-placeholders-test",
+            "          rustc --edition=2024 -D warnings tools/doc_placeholders.rs -o target/doc-placeholders/doc-placeholders",
+            "          target/doc-placeholders/doc-placeholders check .",
+            "      - name: Hello command contract",
+            "        run: |",
+            "          python3 -B tools/test_hello_command.py",
             "      - name: Atomic problem-solving protocol contract",
             "        run: |",
             "          mkdir -p target/atomic-protocol",
@@ -3910,6 +3957,93 @@ mod tests {
         );
         let error = check(temp.path()).expect_err("non-always required result must fail");
         assert!(error.contains("always"), "{error}");
+    }
+
+    #[test]
+    fn doc_placeholder_and_hello_steps_run_whenever_the_hygiene_job_runs() {
+        check_doc_placeholders_step(&valid_workflow()).expect("fixture placeholder step passes");
+        check_hello_command_step(&valid_workflow()).expect("fixture hello step passes");
+        for (old, new, label, needle) in [
+            (
+                "      - name: Documentation placeholder contracts\n",
+                "      - name: Removed placeholder step\n",
+                "missing placeholder step",
+                "Documentation placeholder contracts",
+            ),
+            (
+                "      - name: Documentation placeholder contracts\n        run:",
+                "      - name: Documentation placeholder contracts\n        if: needs.changes.outputs.rust == 'true'\n        run:",
+                "placeholder step gated off the docs lane",
+                "only its `run` key",
+            ),
+            (
+                "          target/doc-placeholders/doc-placeholders check .",
+                "          target/doc-placeholders/doc-placeholders check . || true",
+                "suppressed placeholder check",
+                "without wrappers",
+            ),
+            (
+                "          target/doc-placeholders/doc-placeholders-test\n",
+                "",
+                "placeholder self-tests dropped",
+                "without wrappers",
+            ),
+            (
+                "      - name: Hello command contract\n",
+                "      - name: Removed hello step\n",
+                "missing hello step",
+                "Hello command contract",
+            ),
+            (
+                "          python3 -B tools/test_hello_command.py\n",
+                "          echo python3 -B tools/test_hello_command.py\n",
+                "echoed hello contract",
+                "without wrappers",
+            ),
+        ] {
+            assert!(valid_workflow().contains(old), "{label}");
+            let temp = complete_fixture();
+            temp.write(WORKFLOW, &valid_workflow().replacen(old, new, 1));
+            let error = check(temp.path()).expect_err(label);
+            assert!(error.contains(needle), "{label}: {error}");
+        }
+    }
+
+    #[test]
+    fn agents_md_runs_unconditionally_in_the_router_job() {
+        for (old, new, label) in [
+            (
+                "      - name: Agent instruction inventory (agents-md)\n        run: tools/agents_md.sh\n",
+                "",
+                "missing agents-md step",
+            ),
+            (
+                "      - name: Agent instruction inventory (agents-md)\n        run: tools/agents_md.sh\n",
+                "      - name: Agent instruction inventory (agents-md)\n        if: needs.changes.outputs.hygiene == 'true'\n        run: tools/agents_md.sh\n",
+                "agents-md gated off crates changes",
+            ),
+            (
+                "        run: tools/agents_md.sh\n",
+                "        run: echo tools/agents_md.sh\n",
+                "echoed agents-md",
+            ),
+            (
+                "      - name: Agent instruction inventory (agents-md)\n        run: tools/agents_md.sh\n",
+                "      - name: Agent instruction inventory (agents-md)\n        run: tools/agents_md.sh\n        if: ${{ false }}\n",
+                "condition after run",
+            ),
+            (
+                "      - name: Agent instruction inventory (agents-md)\n        run: tools/agents_md.sh\n",
+                "      - name: Agent instruction inventory (agents-md)\n        run: tools/agents_md.sh\n        \"if\": false\n",
+                "quoted condition after run",
+            ),
+        ] {
+            assert!(valid_workflow().contains(old), "{label}");
+            let temp = complete_fixture();
+            temp.write(WORKFLOW, &valid_workflow().replacen(old, new, 1));
+            let error = check(temp.path()).expect_err(label);
+            assert!(error.contains("Agent instruction inventory"), "{label}: {error}");
+        }
     }
 
     #[test]
@@ -5931,6 +6065,170 @@ foreach ($item in $items) {
                     .is_some_and(|name| name.starts_with("keld-mermaid-render."))
             })
             .collect()
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn mermaid_renderer_bounds_stalled_owned_container_cleanup() {
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::process::{Child, Command, Stdio};
+        use std::time::{Duration, Instant};
+
+        // Specific custody for this regression's real renderer child. Closing
+        // its owned stdin releases only the fake cleanup's builtin read; the
+        // failure backstop never signals a Docker daemon or a cached PID.
+        struct CleanupChild(Option<Child>);
+        impl Drop for CleanupChild {
+            fn drop(&mut self) {
+                if let Some(mut child) = self.0.take() {
+                    drop(child.stdin.take());
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            }
+        }
+
+        let temp = TempDir::new();
+        let checkout = write_msys_renderer_fixture(
+            &temp,
+            r#"#!/usr/bin/env bash
+case "$1" in
+info|image) exit 0 ;;
+context) printf 'unix:///unused-gh705.sock\n' ;;
+run) exit 42 ;;
+rm)
+  printf '%s\n' "$@" >"$KELD_TEST_DOCKER_RM_RECORD"
+  IFS= read -r release || :
+  printf released >"$KELD_TEST_DOCKER_RM_RELEASED"
+  exit 0
+  ;;
+*) exit 99 ;;
+esac
+"#,
+            None,
+            None,
+            None,
+        );
+        let removal_record = temp.path().join("cleanup-request");
+        let fallback_record = temp.path().join("cleanup-released");
+        let stdout_path = temp.path().join("renderer.stdout");
+        let stderr_path = temp.path().join("renderer.stderr");
+        let stdout = fs::File::create(&stdout_path).expect("owned renderer stdout");
+        let stderr = fs::File::create(&stderr_path).expect("owned renderer stderr");
+        let mut paths = vec![temp.path().join("bin")];
+        paths.extend(env::split_paths(&env::var_os("PATH").expect("tool PATH")));
+        let child = Command::new("bash")
+            .arg(temp.path().join("renderer.sh"))
+            .current_dir(&checkout)
+            .env_remove("MSYSTEM")
+            .env("PATH", env::join_paths(paths).expect("fixture PATH"))
+            .env("KELD_TEST_DOCKER_RM_RECORD", &removal_record)
+            .env("KELD_TEST_DOCKER_RM_RELEASED", &fallback_record)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::from(stdout))
+            .stderr(Stdio::from(stderr))
+            .spawn()
+            .expect("spawn actual renderer under fake Docker");
+        let renderer_pid = child.id();
+        let mut custody = CleanupChild(Some(child));
+        let mut deadline = Instant::now() + Duration::from_secs(45);
+        let mut cleanup_entered = false;
+        let mut intervened = false;
+        let status = loop {
+            let child = custody.0.as_mut().expect("owned unreaped renderer");
+            if let Some(status) = child.try_wait().expect("observe renderer exit") {
+                break status;
+            }
+            if !cleanup_entered && removal_record.exists() {
+                cleanup_entered = true;
+                // Arm the completion backstop after the real cleanup entry;
+                // compiling the canonical parser is not cleanup-time evidence.
+                deadline = Instant::now() + Duration::from_secs(15);
+            }
+            if Instant::now() >= deadline {
+                if intervened {
+                    let _ = child.kill();
+                    break child.wait().expect("reap backstop-stopped renderer");
+                }
+                // Record failure before fallback. EOF lets the original
+                // unbounded fake cleanup return, so the baseline cannot hang.
+                intervened = true;
+                drop(child.stdin.take());
+                deadline = Instant::now() + Duration::from_secs(5);
+            }
+            // Poll actual entry/exit conditions; no delay establishes order.
+            std::thread::yield_now();
+        };
+        drop(custody.0.take()); // The exact child was reaped before capture/cleanup.
+        let stdout = fs::read_to_string(&stdout_path).expect("renderer stdout capture");
+        let stderr = fs::read_to_string(&stderr_path).expect("renderer stderr capture");
+        assert!(
+            cleanup_entered,
+            "cleanup was not reached: {stdout}\n{stderr}"
+        );
+        assert_eq!(
+            fs::read_to_string(&removal_record).expect("actual fake cleanup argv"),
+            format!("rm\n--force\nkeld-mermaid-{renderer_pid}-1\n"),
+            "cleanup selected a different container or a broad operation"
+        );
+        assert!(
+            !intervened,
+            "owned Docker cleanup exceeded its completion backstop; original status={status:?}\n{stdout}\n{stderr}"
+        );
+        assert_eq!(
+            status.code(),
+            Some(1),
+            "cleanup replaced the render failure"
+        );
+        assert!(
+            !fallback_record.exists(),
+            "fake cleanup needed an EOF/release rather than its owning deadline"
+        );
+        assert!(stderr.contains("container cleanup incomplete"), "{stderr}");
+        assert!(stderr.contains("exit 124"), "{stderr}");
+        assert!(
+            stderr.contains(&format!("keld-mermaid-{renderer_pid}-1")),
+            "cleanup diagnostic lost its exact owned name: {stderr}"
+        );
+        assert!(stderr.contains("absence is unverified"), "{stderr}");
+        assert!(stderr.contains("pinned Mermaid render failed"), "{stderr}");
+        assert!(stderr.contains("failed-render output retained"), "{stderr}");
+        let retained = retained_render_dirs(&checkout);
+        assert_eq!(retained.len(), 1, "lost failed-render evidence");
+        assert_eq!(
+            fs::metadata(&retained[0])
+                .expect("retained failure mode")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700,
+            "bounded cleanup changed the existing owner-only restore"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn mermaid_renderer_preserves_render_failure_when_container_removal_fails() {
+        let temp = TempDir::new();
+        let checkout = write_msys_renderer_fixture(
+            &temp,
+            "#!/usr/bin/env bash\ncase \"$1\" in\ninfo|image) exit 0 ;;\ncontext) printf 'unix:///unused-gh705.sock\\n' ;;\nrun) exit 42 ;;\nrm) exit 62 ;;\n*) exit 99 ;;\nesac\n",
+            None,
+            None,
+            None,
+        );
+        let output = run_msys_renderer_fixture(&temp, &checkout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "cleanup masked primary status"
+        );
+        assert!(stderr.contains("container cleanup incomplete"), "{stderr}");
+        assert!(stderr.contains("exit 62"), "{stderr}");
+        assert!(stderr.contains("absence is unverified"), "{stderr}");
+        assert!(stderr.contains("failed-render output retained"), "{stderr}");
+        assert_eq!(retained_render_dirs(&checkout).len(), 1);
     }
 
     #[test]

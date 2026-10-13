@@ -802,7 +802,7 @@ fn created_template_quits_after_last_window_closed_on_the_same_link() {
             Err(mpsc::RecvTimeoutError::Timeout)
         ));
 
-        let ping_channel = ChannelId(91);
+        let ping_channel = ChannelId::for_test(91);
         let ping_corr = CorrelationId(0x185);
         write_frame(
             &mut stream,
@@ -818,7 +818,7 @@ fn created_template_quits_after_last_window_closed_on_the_same_link() {
         assert_eq!(ping_header.flags, 0);
         assert_eq!(ping_header.channel, ping_channel);
         assert_eq!(ping_header.corr, ping_corr);
-        assert!(ping_payload.is_empty());
+        assert_eq!(ping_payload, [] as [u8; 0]);
 
         let closed =
             keld_ipc::codec::encode(&LifecycleEvent::LastWindowClosed).expect("encode close");
