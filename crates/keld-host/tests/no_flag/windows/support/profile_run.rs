@@ -301,8 +301,8 @@ $ErrorActionPreference = 'Stop'
 $hostPid = [int]$env:KELD_PROFILE_HOST_PID
 $expected = [IO.Path]::GetFullPath($env:KELD_EXPECTED_UDF).TrimEnd('\')
 $all = @(Get-CimInstance Win32_Process)
-$host = $all | Where-Object { [int]$_.ProcessId -eq $hostPid } | Select-Object -First 1
-if ($null -eq $host) { [Console]::WriteLine('{}'); exit 0 }
+$observedHost = $all | Where-Object { [int]$_.ProcessId -eq $hostPid } | Select-Object -First 1
+if ($null -eq $observedHost) { [Console]::WriteLine('{}'); exit 0 }
 $candidates = @()
 foreach ($process in $all) {
   if ($process.Name -ne 'msedgewebview2.exe' -or [string]::IsNullOrEmpty($process.CommandLine)) { continue }
@@ -313,10 +313,10 @@ foreach ($process in $all) {
   $folder = if ([string]::IsNullOrEmpty($actual)) { '' } else { [IO.Path]::GetFullPath($actual).TrimEnd('\') }
   $nested = [IO.Path]::GetFullPath((Join-Path $expected 'EBWebView')).TrimEnd('\')
   if ([string]::IsNullOrEmpty($folder) -or ($folder -ine $expected -and $folder -ine $nested)) { continue }
-  [Console]::WriteLine((@{ host_image = $host.ExecutablePath; browser_pid = [int]$process.ProcessId; parent_pid = [int]$process.ParentProcessId; user_data_folder = $actual; candidates = $candidates } | ConvertTo-Json -Compress))
+  [Console]::WriteLine((@{ host_image = $observedHost.ExecutablePath; browser_pid = [int]$process.ProcessId; parent_pid = [int]$process.ParentProcessId; user_data_folder = $actual; candidates = $candidates } | ConvertTo-Json -Compress))
   exit 0
 }
-[Console]::WriteLine((@{ host_image = $host.ExecutablePath; candidates = $candidates } | ConvertTo-Json -Compress))
+[Console]::WriteLine((@{ host_image = $observedHost.ExecutablePath; candidates = $candidates } | ConvertTo-Json -Compress))
 "#;
     loop {
         let output = Command::new("powershell.exe")
