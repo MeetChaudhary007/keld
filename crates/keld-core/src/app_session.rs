@@ -86,13 +86,11 @@ use keld_runtime::linux_strict::LinuxStrictProfile;
 #[cfg(target_os = "macos")]
 use keld_runtime::macos_guardian::{GuardedPrimary, GuardedPrimaryUpdate, GuardianBootstrap};
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
-use keld_runtime::primary::{BoundPrimaryGeneration, PrimaryRoleEvent};
+use keld_runtime::primary::{BoundPrimaryGeneration, PrimaryRoleEvent, RoleOwner, RolePrincipal};
 #[cfg(windows)]
 use keld_runtime::primary::{PrimaryRecoveryGate, PrimaryRoleConfig, PrimaryRoleSupervisor};
 #[cfg(target_os = "linux")]
 use keld_runtime::primary::{PrimaryRecoveryGate, PrimaryRoleConfig, PrimaryRoleSupervisor};
-#[cfg(any(target_os = "macos", target_os = "linux", windows))]
-use keld_runtime::registry::{RoleOwner, RolePrincipal};
 #[cfg(target_os = "macos")]
 use keld_wv::profile::EphemeralProfile;
 #[cfg(target_os = "linux")]

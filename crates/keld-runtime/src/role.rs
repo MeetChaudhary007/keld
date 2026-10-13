@@ -25,7 +25,6 @@ use keld_ipc::{
 use crate::PreparedCommand;
 #[cfg(target_os = "linux")]
 use crate::linux_strict::LinuxStrictProfile;
-use crate::virtual_port::RolePrincipal;
 use crate::{
     CapturedOutput, ChildPreparer, CrashLedger, GenerationLease, PreparedChild, RestartPolicy,
     RevocationCause, RuntimeError, Supervisor, SupervisorOutcome,
@@ -201,6 +200,35 @@ impl RoleGeneration {
 impl std::fmt::Debug for RoleGeneration {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("RoleGeneration(..)")
+    }
+}
+
+/// Host-minted principal for one authenticated role generation.
+///
+/// A generation is not a PID, socket path, token, or wire field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RolePrincipal {
+    owner: RoleOwner,
+    generation: RoleGeneration,
+}
+
+impl RolePrincipal {
+    /// Creates a principal for one live role generation.
+    #[must_use]
+    pub const fn new(owner: RoleOwner, generation: RoleGeneration) -> Self {
+        Self { owner, generation }
+    }
+
+    /// Lifecycle owner category.
+    #[must_use]
+    pub const fn owner(self) -> RoleOwner {
+        self.owner
+    }
+
+    /// Host-minted generation for this coordinator instance.
+    #[must_use]
+    pub const fn generation(self) -> RoleGeneration {
+        self.generation
     }
 }
 
