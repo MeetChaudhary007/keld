@@ -342,9 +342,15 @@ impl WkWebViewEngine {
         let code = event_loop.run_return(move |event, _, control_flow| {
             let terminal =
                 is_terminal_app_event(&event) || terminal_intent_in_loop.load(Ordering::Acquire);
-            if navigation_finished(&startup_in_loop) {
+            if navigation_finished(&startup_in_loop) || views.is_empty() {
                 *control_flow = ControlFlow::Wait;
-            } else if navigation_deadline_expired(&startup_in_loop, navigation_deadline, terminal) {
+            } else if crate::navigation_deadline_expired(
+                false,
+                !views.is_empty(),
+                terminal,
+                Instant::now(),
+                navigation_deadline,
+            ) {
                 navigation_timed_out_in_loop.store(true, Ordering::Release);
                 destroy_renderer_bridges(&mut renderer_bridges);
                 views.clear();
@@ -682,14 +688,6 @@ fn mark_terminal_intent(intent: &AtomicBool, command: AppWindowCommand) -> bool 
     terminal
 }
 
-fn navigation_deadline_expired(
-    startup: &Mutex<StartupTrace>,
-    deadline: Instant,
-    terminal_command: bool,
-) -> bool {
-    !terminal_command && !navigation_finished(startup) && Instant::now() >= deadline
-}
-
 /// wry `PageLoadEvent::Finished` → navigation completion (`nav_finished`).
 fn page_load_trace_handler(
     startup: Arc<Mutex<StartupTrace>>,
@@ -830,17 +828,25 @@ mod startup_tests {
         let expired = Instant::now()
             .checked_sub(Duration::from_millis(1))
             .expect("one millisecond before now");
-        assert!(super::navigation_deadline_expired(&startup, expired, false));
+        assert!(crate::navigation_deadline_expired(
+            super::navigation_finished(&startup),
+            true,
+            false,
+            Instant::now(),
+            expired,
+        ));
         let terminal_intent = std::sync::atomic::AtomicBool::new(false);
         assert!(super::mark_terminal_intent(
             &terminal_intent,
             super::AppWindowCommand::Quit
         ));
         assert!(
-            !super::navigation_deadline_expired(
-                &startup,
+            !crate::navigation_deadline_expired(
+                super::navigation_finished(&startup),
+                true,
+                terminal_intent.load(std::sync::atomic::Ordering::Acquire),
+                Instant::now(),
                 expired,
-                terminal_intent.load(std::sync::atomic::Ordering::Acquire)
             ),
             "a queued terminal UI command must win at the navigation deadline"
         );
@@ -848,8 +854,12 @@ mod startup_tests {
             .lock()
             .expect("startup lock")
             .on_page_load(PageLoad::Finished);
-        assert!(!super::navigation_deadline_expired(
-            &startup, expired, false
+        assert!(!crate::navigation_deadline_expired(
+            super::navigation_finished(&startup),
+            true,
+            false,
+            Instant::now(),
+            expired,
         ));
     }
 
