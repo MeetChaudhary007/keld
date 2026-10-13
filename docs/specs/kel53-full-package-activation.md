@@ -2234,7 +2234,9 @@ only H cleared the candidate dies with the host; with both cleared it survives t
 host's exit; `JobObjectBasicProcessIdList` on H lists every member, and per-member
 `IsProcessInJob(A)` tells the family from the rest; a console child's `conhost.exe` is
 created asynchronously after the child resumes and inherits its creator's Jobs; a
-member's removal from the list can lag its termination; and 64 nested levels and 10
+member's removal from the list can lag its termination, and the Job's assigned count can
+lag that removal by a further scheduling delay (build 26300, KEL-270 finding F54
+measurement); and 64 nested levels and 10
 update generations assigned without failure. Both clears are necessary, and together
 they are sufficient.
 
@@ -2313,9 +2315,18 @@ which no owner can compose while that family runs, so recovery would halt for as
 as the candidate lived.
 
 *Census and policy.* The census takes a snapshot of H's process IDs with
-`QueryInformationJobObject(JobObjectBasicProcessIdList)`; a list shorter than the
-assigned count is retaken with a larger buffer. For every ID other than the host's own
-it opens the process with `PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE |
+`QueryInformationJobObject(JobObjectBasicProcessIdList)`; a query that fails with
+`ERROR_MORE_DATA` is retaken with a larger buffer, and a successful list is complete. A
+snapshot whose assigned count differs from its list length (a member still leaving, or
+joining) is not clean and is retaken under the deadline, never refused. The rule rests on
+two facts measured on Windows 11 build 26300 (KEL-270 finding F54, Linear comment
+`ea4c3fbf-ac8d-45e4-bc37-2613db807459`): a too-small buffer is reported as
+`ERROR_MORE_DATA` with the header written, never as a success with a truncated list; and
+the assigned count can exceed the list for one lock release while a member leaves, and
+never drops before the list omits the member. Microsoft does not document that
+count-versus-list ordering, so the cross-check is defence in depth, not a reading of a
+documented contract. For every ID other than the host's own it opens the process with
+`PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE |
 PROCESS_SYNCHRONIZE`, one handle per member, through which it classifies, waits and, if
 needed, terminates; a second open for termination would be a second lookup of a
 reusable ID. An open that fails because no live process has that ID
