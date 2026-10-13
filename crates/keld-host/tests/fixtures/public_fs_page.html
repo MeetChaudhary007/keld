@@ -173,6 +173,6 @@ if (nativeJoint) {
   runRecoveryConsumer().catch(error => report("error", { error: String(error) }));
 } else {
   // The parent sees this only after the actual listener is installed.
-  report("page-ready", { button: go.id }).catch(error => { result.textContent = String(error); });
+  report("page-ready", { button: go?.id ?? null }).catch(error => { result.textContent = String(error); });
 }
 </script></body></html>

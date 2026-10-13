@@ -472,10 +472,16 @@ impl PublicFsProject {
             )
             .replace(
                 "__JOINT_BUTTON__",
-                if exercise == Exercise::RendererNativeJoint {
-                    ""
-                } else {
-                    "<button id=\"go\">Write, read and verify scope denial</button>"
+                match exercise {
+                    Exercise::RendererNativeJoint
+                    | Exercise::PublicAppComponent
+                    | Exercise::PublicAppNaturalCases
+                    | Exercise::PublicAppRetirement => "",
+                    Exercise::RendererPointer
+                    | Exercise::RendererRecovery
+                    | Exercise::RendererPendingRecovery => {
+                        "<button id=\"go\">Write, read and verify scope denial</button>"
+                    }
                 },
             );
         fs::write(self.project.join("index.html"), page).expect("public FS renderer");
