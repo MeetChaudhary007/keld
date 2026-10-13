@@ -5306,8 +5306,10 @@ mod tests {
     /// §7 d5, taken on each side of the one detach.
     fn own_handle_count() -> u32 {
         let mut count = 0_u32;
-        // SAFETY: the current-process pseudo-handle needs no rights and is
-        // always valid; the count is writable storage for the call.
+        // SAFETY: the pseudo-handle from `GetCurrentProcess` is always valid and
+        // carries full access, which covers the `PROCESS_QUERY_INFORMATION`
+        // right `GetProcessHandleCount` needs; the count is writable storage
+        // for the call.
         assert_ne!(
             unsafe { GetProcessHandleCount(GetCurrentProcess(), &raw mut count) },
             0,
@@ -5593,7 +5595,9 @@ mod tests {
     /// suspended and assigned before its first instruction, then takes the §4
     /// release path or one of the row's controls, reporting every flag read-back
     /// over the test's listener. It exits through `process::exit`, as no
-    /// destructor may terminate a released candidate.
+    /// destructor may terminate a released candidate, except in the two
+    /// `orderly-exit` modes, which `return` so that every local, the launch
+    /// record included, drops.
     #[test]
     #[ignore = "private subprocess entry point"]
     #[allow(clippy::too_many_lines)] // one host fixture whose modes share launch and reporting
@@ -6329,12 +6333,12 @@ mod tests {
         assert_eq!(report_count(&detached, "pid"), candidate.pid, "{detached}");
         host.wait();
         assert!(
-            candidate_report.ping(),
-            "the released candidate must answer after the launcher's orderly exit"
-        );
-        assert!(
             !candidate.exited_now(),
             "the released candidate's handle is signaled: the launcher's exit in order ended it"
+        );
+        assert!(
+            candidate_report.ping(),
+            "the released candidate must answer after the launcher's orderly exit"
         );
     }
 
