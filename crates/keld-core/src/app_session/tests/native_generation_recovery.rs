@@ -3,7 +3,7 @@
 use super::super::super::{
     AppWindowCommand, FsRecoveryAttempt, FsWorkerCommand, GuardSnapshot, GuardianOwnerCommand,
     GuardianOwnerHandle, PERMISSIONS_FILE, PrimaryRouter, PrimaryRouterHandle, RecoveryArm,
-    SessionShutdownState, apply_guardian_recovery_arm,
+    PrimaryCallerContext, SessionShutdownState, apply_guardian_recovery_arm,
 };
 use super::{OBSERVATION_BOUND, sensor, support};
 use crate::app_session::native_generation_fixture::{
@@ -709,16 +709,18 @@ fn cli_acceptance_publication_preserves_acknowledged_shutdown() {
     let mut fixture = Fixture::start();
     fixture.ready();
     let handle = fixture.handle();
-    let mut reader = handle
-        .current
-        .lock()
-        .expect("retained current generation")
-        .as_ref()
-        .expect("real G1")
-        .writer
-        .try_clone()
-        .expect("actual authenticated reader clone");
-    let stop = Arc::clone(&handle.shutdown.reader_stop);
+    let (mut reader, caller) = {
+        let current = handle.current.lock().expect("retained current generation");
+        let generation = current.as_ref().expect("real G1");
+        (
+            generation.writer.try_clone().expect("actual authenticated reader clone"),
+            PrimaryCallerContext {
+                attempt: generation.attempt,
+                identity: generation.identity,
+                reader_stop: Arc::clone(&generation.reader_stop),
+            },
+        )
+    };
     let (published, publication) = mpsc::sync_channel(1);
     let (resume, release) = mpsc::channel();
     let mut resume = Some(resume);
@@ -763,7 +765,7 @@ fn cli_acceptance_publication_preserves_acknowledged_shutdown() {
         .expect("actual accepted CLI publication cut");
     let primary_handle = handle.clone();
     let primary = thread::spawn(move || {
-        super::super::super::read_primary_frames(&mut reader, &primary_handle, 1, &stop)
+        super::super::super::read_primary_frames(&mut reader, &primary_handle, &caller)
     });
     let deadline = Instant::now() + OBSERVATION_BOUND;
     let mut facts = CliOwnerFacts::default();
