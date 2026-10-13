@@ -201,11 +201,21 @@ impl SignedProfileStateRun {
 
     pub(crate) fn finish(self) {
         let deadline = self.deadline;
-        self.finish_by(deadline);
+        self.finish_with_deadlines(deadline, None);
     }
 
-    /// Finish a deliberately retained live run within its caller-owned shutdown budget.
-    pub(crate) fn finish_by(mut self, deadline: Instant) {
+    /// Finish a retained concurrent run without censoring the browser release barrier.
+    pub(crate) fn finish_after_retention(self) {
+        // The window and each control read retain the existing product deadline.
+        // The separate outer host-reap watchdog starts after LINK_EOF and covers
+        // the approved KEL-135 240 s live-browser guard plus its post-exit grace.
+        self.finish_with_deadlines(
+            Instant::now() + PRODUCT_DEADLINE,
+            Some(Duration::from_mins(5)),
+        );
+    }
+
+    fn finish_with_deadlines(mut self, deadline: Instant, reap_budget: Option<Duration>) {
         let host_pid = self.process.host_pid();
         let _window = wait_for_host_window(host_pid, deadline);
         self.reader
@@ -218,7 +228,8 @@ impl SignedProfileStateRun {
             .expect("flush state host Quit");
         assert_eq!(read_control_line(&mut self.reader), "QUIT_REPLY");
         assert_eq!(read_control_line(&mut self.reader), "LINK_EOF");
-        let status = self.process.wait(deadline);
+        let reap_deadline = reap_budget.map_or(deadline, |budget| Instant::now() + budget);
+        let status = self.process.wait(reap_deadline);
         assert!(
             status.success(),
             "{} host exited with {status}",
