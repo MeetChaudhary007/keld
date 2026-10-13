@@ -1100,7 +1100,8 @@ impl keld_ipc::WindowsLifecyclePeerPin for WindowsProcessPeer {
 /// connect-back", *Acceptance*): only the exact process object that the owner
 /// launched and still retains may claim. A process ID identifies a process only
 /// until that process exits, so the binding compares kernel objects. Dropping
-/// this value drops the child, which terminates a process it has not reaped.
+/// this value drops the child, which terminates a process it has neither reaped
+/// nor detached ([`Self::detach`]).
 ///
 /// The record pairs the child with its creation time, so the child is never lent
 /// mutably: [`Self::child`] is a shared borrow of a type without interior
@@ -1195,6 +1196,52 @@ impl WindowsLaunchedProcess {
         self.child.terminate(exit_code)
     }
 
+    /// Keeps the released candidate: step 8 of the `PerUserDirect` accept order
+    /// (KEL-53 §4 "Candidate release after commit", *Order* and *Launch-record
+    /// detach*). Closes the record's process handle without terminating the
+    /// child and returns its identity for the exit log; the record and the
+    /// census are consumed.
+    ///
+    /// `census` is the witness that [`WindowsHostDeathJob::release_for_exit`]
+    /// returned, which is callable only with a [`WindowsReleasedAttempt`]: by
+    /// type the detach follows both clears, and because the census is neither
+    /// `Clone` nor `Copy` nor constructible outside this crate, one census
+    /// admits one detach. The witness is consumed, not read: its proof is the
+    /// two clears that produced it. Only the host's census is accepted; the
+    /// Machine-UAC helper, which releases the attempt Job alone, has no detach
+    /// here.
+    ///
+    /// # Errors
+    ///
+    /// Refuses, at run time, a child that was never resumed: it is not a
+    /// released candidate but a suspended process this record still owns, so
+    /// the record drops with the refusal and terminates it, as it does on every
+    /// other unwind today. That check reads the spent resume, not the type.
+    #[allow(clippy::needless_pass_by_value)] // the witness is spent by the move: through a reference one census would admit any number of detaches
+    pub fn detach(
+        self,
+        census: WindowsExitCensus,
+    ) -> Result<WindowsDetachedLaunch, WindowsHostJobError> {
+        // Spent, not read: the witness proves the two clears that produced it.
+        let WindowsExitCensus { .. } = census;
+        if !self.child.is_resumed() {
+            return Err(WindowsHostJobError::contract(
+                "launch record detach",
+                "the child was never resumed, so it is a suspended process this record owns, not a released candidate; terminated",
+            ));
+        }
+        let Self {
+            child,
+            creation_time,
+        } = self;
+        let process_id = child.id();
+        child.detach();
+        Ok(WindowsDetachedLaunch {
+            process_id,
+            creation_time,
+        })
+    }
+
     /// Binds a connected claimant to this exact launch.
     ///
     /// `claimant` is the process that the connected pipe's client process ID
@@ -1237,6 +1284,41 @@ impl WindowsLaunchedProcess {
                 source,
             }
         })
+    }
+}
+
+/// The released candidate by identity only, after
+/// [`WindowsLaunchedProcess::detach`] (KEL-53 §4 "Candidate release after
+/// commit", *Launch-record detach*): the process ID and creation time for the
+/// exit log. It holds no handle, so dropping it ends nothing, and nothing can
+/// wait on, bind or terminate the candidate through it:
+///
+/// ```compile_fail,E0599
+/// use std::os::windows::io::AsRawHandle as _;
+/// fn raw(detached: &keld_runtime::windows_job::WindowsDetachedLaunch) {
+///     let _ = detached.as_raw_handle();
+/// }
+/// ```
+#[derive(Debug, PartialEq, Eq)]
+pub struct WindowsDetachedLaunch {
+    process_id: u32,
+    creation_time: u64,
+}
+
+impl WindowsDetachedLaunch {
+    /// The process ID that process creation reported for the candidate. It
+    /// names the candidate only until it exits (see
+    /// [`WindowsSuspendedChild::id`]); the host holds no handle to pin it.
+    #[must_use]
+    pub const fn process_id(&self) -> u32 {
+        self.process_id
+    }
+
+    /// The creation time read from the launch handle when the candidate was
+    /// recorded, which with the process ID identifies the exact process.
+    #[must_use]
+    pub const fn creation_time(&self) -> u64 {
+        self.creation_time
     }
 }
 
@@ -3615,18 +3697,88 @@ impl WindowsHostDeathJob {
 /// Witness of one host-death census (KEL-53 §4 "Candidate release after
 /// commit", *Census and policy*): what the final clean snapshot showed and what
 /// the census did on the way there.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// It is also the proof that [`WindowsLaunchedProcess::detach`] takes by value
+/// (*Launch-record detach*). Only [`WindowsHostDeathJob::release_for_exit`]
+/// constructs it, after the attempt-Job clear its argument witnesses and the
+/// host-death clear it performs, and it is neither `Clone` nor `Copy`, so one
+/// census admits one detach. Outside this crate it cannot be built:
+///
+/// ```compile_fail,E0451
+/// let forged = keld_runtime::windows_job::WindowsExitCensus {
+///     family: 1,
+///     terminated: 0,
+///     snapshots: 1,
+/// };
+/// ```
+///
+/// nor cloned:
+///
+/// ```compile_fail,E0277
+/// fn twice(census: &keld_runtime::windows_job::WindowsExitCensus) {
+///     let _copy: keld_runtime::windows_job::WindowsExitCensus = Clone::clone(census);
+/// }
+/// ```
+///
+/// nor spent twice. The example that compiles detaches one record with one
+/// census; the one below it differs only in the second `detach` of the same
+/// census, which pins every other part of the snippet, and rustdoc checks the
+/// error code on nightly builds only:
+///
+/// ```no_run
+/// use keld_runtime::windows_job::{WindowsExitCensus, WindowsLaunchedProcess};
+/// fn detach(record: WindowsLaunchedProcess, census: WindowsExitCensus) {
+///     let _ = record.detach(census);
+/// }
+/// ```
+///
+/// ```compile_fail,E0382
+/// use keld_runtime::windows_job::{WindowsExitCensus, WindowsLaunchedProcess};
+/// fn detach(
+///     first: WindowsLaunchedProcess,
+///     second: WindowsLaunchedProcess,
+///     census: WindowsExitCensus,
+/// ) {
+///     let _ = first.detach(census);
+///     let _ = second.detach(census);
+/// }
+/// ```
+#[derive(Debug, PartialEq, Eq)]
 pub struct WindowsExitCensus {
     /// Members of the released family in the final snapshot: processes in both
     /// the host-death Job and the released attempt Job, the host excluded.
-    pub family: u32,
+    family: u32,
     /// Members outside the family that the census terminated through the handles
     /// it opened, over every snapshot. A member found already exited is not
     /// counted; the next snapshot no longer lists it.
-    pub terminated: u32,
+    terminated: u32,
     /// Snapshots of the host-death Job's process-ID list, the final clean one
     /// included.
-    pub snapshots: u32,
+    snapshots: u32,
+}
+
+impl WindowsExitCensus {
+    /// Members of the released family in the final snapshot: processes in both
+    /// the host-death Job and the released attempt Job, the host excluded.
+    #[must_use]
+    pub const fn family(&self) -> u32 {
+        self.family
+    }
+
+    /// Members outside the family that the census terminated through the handles
+    /// it opened, over every snapshot. A member found already exited is not
+    /// counted; the next snapshot no longer lists it.
+    #[must_use]
+    pub const fn terminated(&self) -> u32 {
+        self.terminated
+    }
+
+    /// Snapshots of the host-death Job's process-ID list, the final clean one
+    /// included.
+    #[must_use]
+    pub const fn snapshots(&self) -> u32 {
+        self.snapshots
+    }
 }
 
 /// The rights the census needs on one listed member: classification through
@@ -4516,7 +4668,9 @@ mod tests {
     use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_INVALID_HANDLE};
     use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
     use windows_sys::Win32::System::RemoteDesktop::ProcessIdToSessionId;
-    use windows_sys::Win32::System::Threading::{DETACHED_PROCESS, PROCESS_CREATE_PROCESS};
+    use windows_sys::Win32::System::Threading::{
+        DETACHED_PROCESS, GetProcessHandleCount, PROCESS_CREATE_PROCESS,
+    };
 
     const HELPER_ENV: &str = "KELD_WINDOWS_JOB_ASSIGNMENT_HELPER";
     const QF1_HELPER_ENDPOINT_ENV: &str = "KELD_TEST_QF1_ENDPOINT";
@@ -5148,6 +5302,21 @@ mod tests {
         query_job_limit_flags(query.as_raw_handle().cast()).expect("read Job limit flags back")
     }
 
+    /// The number of handles in this process's own table: the handle census of
+    /// §7 d5, taken on each side of the one detach.
+    fn own_handle_count() -> u32 {
+        let mut count = 0_u32;
+        // SAFETY: the current-process pseudo-handle needs no rights and is
+        // always valid; the count is writable storage for the call.
+        assert_ne!(
+            unsafe { GetProcessHandleCount(GetCurrentProcess(), &raw mut count) },
+            0,
+            "count this process's handles: {}",
+            io::Error::last_os_error()
+        );
+        count
+    }
+
     /// Opens one process as the census does but without `PROCESS_TERMINATE`: the
     /// straggler seam of §7 r5, a member whose termination is denied and whose
     /// handle therefore stays unsignaled.
@@ -5605,7 +5774,9 @@ mod tests {
                 writeln!(
                     report,
                     "CENSUS family={} terminated={} snapshots={}",
-                    census.family, census.terminated, census.snapshots
+                    census.family(),
+                    census.terminated(),
+                    census.snapshots()
                 )
                 .expect("report the census");
                 writeln!(report, "{}", flags("FLAGS")).expect("report flags");
@@ -5637,10 +5808,12 @@ mod tests {
                 // holds only while this host is alive: wait for the go-ahead.
                 await_go(&mut report);
             }
-            "orderly-exit" => {
+            "orderly-exit" | "orderly-exit-undetached" => {
                 // §7 "8, 9 (launch-record detach)": the §4 order through both
-                // clears, then step 9 as a return, not `process::exit`: every
-                // local of this fixture drops, the launch record included.
+                // clears, then step 8, the detach, and step 9 as a return, not
+                // `process::exit`: every local of this fixture drops. The
+                // undetached variant is the row's d2 control: it skips step 8,
+                // so the record's drop terminates the released candidate.
                 let released = attempt.release_family().expect("release the attempt Job");
                 let census = host_job
                     .release_for_exit(&released, Instant::now() + RELEASE_WAIT)
@@ -5648,10 +5821,34 @@ mod tests {
                 writeln!(
                     report,
                     "CENSUS family={} terminated={} snapshots={}",
-                    census.family, census.terminated, census.snapshots
+                    census.family(),
+                    census.terminated(),
+                    census.snapshots()
                 )
                 .expect("report the census");
                 writeln!(report, "{}", flags("FLAGS")).expect("report flags");
+                if mode == "orderly-exit" {
+                    let creation_time = launched.creation_time;
+                    // §7 d5: the handle census of this host's own table on each
+                    // side of the one detach; nothing else opens or closes a
+                    // handle between the two counts.
+                    let handles_before = own_handle_count();
+                    let detached = launched
+                        .detach(census)
+                        .expect("detach the released candidate");
+                    let handles_after = own_handle_count();
+                    assert_eq!(
+                        detached.creation_time(),
+                        creation_time,
+                        "the detached identity is the launch record's"
+                    );
+                    writeln!(
+                        report,
+                        "DETACHED pid={} handles_before={handles_before} handles_after={handles_after}",
+                        detached.process_id()
+                    )
+                    .expect("report the detach");
+                }
             }
             _ => {
                 let released = attempt.release_family().expect("release the attempt Job");
@@ -5662,7 +5859,9 @@ mod tests {
                 writeln!(
                     report,
                     "CENSUS family={} terminated={} snapshots={}",
-                    census.family, census.terminated, census.snapshots
+                    census.family(),
+                    census.terminated(),
+                    census.snapshots()
                 )
                 .expect("report the census");
                 writeln!(report, "{}", flags("FLAGS")).expect("report flags");
@@ -5674,7 +5873,7 @@ mod tests {
         let _ = report.shutdown(std::net::Shutdown::Both);
         drop(report);
         drop(reaped_primary);
-        if mode == "orderly-exit" {
+        if mode.starts_with("orderly-exit") {
             // The exit in order: the remaining locals drop here, and the test
             // harness ends the process as any orderly host would end.
             return;
@@ -6126,6 +6325,8 @@ mod tests {
         let flags = host.report.next("FLAGS ");
         assert_eq!(report_flags(&flags, "attempt"), 0, "{flags}");
         assert_eq!(report_flags(&flags, "host"), 0, "{flags}");
+        let detached = host.report.next("DETACHED ");
+        assert_eq!(report_count(&detached, "pid"), candidate.pid, "{detached}");
         host.wait();
         assert!(
             candidate_report.ping(),
@@ -6134,6 +6335,78 @@ mod tests {
         assert!(
             !candidate.exited_now(),
             "the released candidate's handle is signaled: the launcher's exit in order ended it"
+        );
+    }
+
+    #[test]
+    fn dropping_an_undetached_record_after_both_clears_still_ends_the_candidate() {
+        // §7 d2, negative control: the same orderly exit without step 8 leaves
+        // the candidate's handle signaled, so the row detects a build that drops
+        // the record without `detach`, and the undetached Drop still terminates.
+        let (mut host, candidate, _report) = start_release_cell("orderly-exit-undetached");
+        let flags = host.report.next("FLAGS ");
+        assert_eq!(report_flags(&flags, "attempt"), 0, "{flags}");
+        assert_eq!(report_flags(&flags, "host"), 0, "{flags}");
+        host.wait();
+        candidate.assert_exited_within(
+            RELEASE_WAIT,
+            "candidate whose record was dropped undetached after both clears",
+        );
+    }
+
+    #[test]
+    fn detach_refuses_a_never_resumed_child_and_terminates_it_as_today() {
+        // §7 d3: the refusal is a run-time check of the spent resume, not of the
+        // witness, which this module can forge and which nothing outside the
+        // crate can (d4). A suspended process ends only by termination, so its
+        // signaled handle is the refusal's termination: the record's drop, as
+        // today.
+        let launched =
+            WindowsLaunchedProcess::record(same_token_exit_command()).expect("record the launch");
+        let child = ObservedProcess::open(launched.child().id());
+        assert!(
+            !child.exited_now(),
+            "the suspended child is alive before the refusal"
+        );
+        let refusal = launched
+            .detach(WindowsExitCensus {
+                family: 1,
+                terminated: 0,
+                snapshots: 1,
+            })
+            .expect_err("a never-resumed child has no detach");
+        let text = refusal.to_string();
+        assert!(
+            text.contains("KELD-RUNTIME-014")
+                && text.contains("launch record detach")
+                && text.contains("never resumed"),
+            "{text}"
+        );
+        child.assert_exited_within(RELEASE_WAIT, "the refused never-resumed child");
+    }
+
+    #[test]
+    fn after_the_detach_the_host_holds_no_handle_to_the_candidate() {
+        // §7 d5: a handle census of the host's own table on each side of the one
+        // detach shows exactly one handle fewer, the record's process handle
+        // (the thread handle closed at the resume), and the detached identity
+        // names the candidate. The type supplies the rest: `WindowsDetachedLaunch`
+        // has no handle to yield (its `compile_fail` doctest), so after this
+        // point nothing in the host can wait on, bind or terminate the candidate.
+        let (mut host, candidate, mut candidate_report) = start_release_cell("orderly-exit");
+        let detached = host.report.next("DETACHED ");
+        assert_eq!(report_count(&detached, "pid"), candidate.pid, "{detached}");
+        let before = report_count(&detached, "handles_before");
+        let after = report_count(&detached, "handles_after");
+        assert_eq!(
+            after + 1,
+            before,
+            "the detach must close exactly the record's process handle: {detached}"
+        );
+        host.wait();
+        assert!(
+            candidate_report.ping(),
+            "the candidate must outlive the host that detached it"
         );
     }
 
@@ -6389,9 +6662,9 @@ mod tests {
             open_census_member,
         )
         .expect("a member in transition must not refuse the census");
-        assert_eq!(census.snapshots, 2, "{census:?}");
-        assert_eq!(census.family, 2, "{census:?}");
-        assert_eq!(census.terminated, 0, "{census:?}");
+        assert_eq!(census.snapshots(), 2, "{census:?}");
+        assert_eq!(census.family(), 2, "{census:?}");
+        assert_eq!(census.terminated(), 0, "{census:?}");
         for occupant in &mut occupants {
             occupant.kill().expect("end an occupant");
             occupant.wait().expect("reap an occupant");
