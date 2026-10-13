@@ -3141,9 +3141,15 @@ impl WebView2Engine {
                 release_in_loop.schedule(control_flow);
                 return;
             }
-            if navigation_ready.load(Ordering::Acquire) {
+            if navigation_ready.load(Ordering::Acquire) || views.is_empty() {
                 *control_flow = ControlFlow::Wait;
-            } else if !terminal && Instant::now() >= navigation_deadline {
+            } else if crate::navigation_deadline_expired(
+                false,
+                !views.is_empty(),
+                terminal,
+                Instant::now(),
+                navigation_deadline,
+            ) {
                 navigation_timed_out_in_loop.store(true, Ordering::Release);
                 commit_profile_stop(stop_in_loop.as_ref());
                 views.clear();

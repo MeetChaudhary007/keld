@@ -39,6 +39,56 @@ mod view_drop_order;
 pub(crate) const INITIAL_NAVIGATION_DEADLINE: std::time::Duration =
     std::time::Duration::from_secs(15);
 
+/// A user closing the last view leaves no renderer whose startup can time out.
+/// Terminal app intent also wins over the initial navigation hang guard.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+pub(crate) fn navigation_deadline_expired(
+    ready: bool,
+    has_views: bool,
+    terminal: bool,
+    now: std::time::Instant,
+    deadline: std::time::Instant,
+) -> bool {
+    !ready && has_views && !terminal && now >= deadline
+}
+
+#[cfg(all(
+    test,
+    any(target_os = "linux", target_os = "macos", target_os = "windows")
+))]
+mod navigation_deadline_tests {
+    use std::time::{Duration, Instant};
+
+    use super::navigation_deadline_expired;
+
+    #[test]
+    fn initial_navigation_deadline_requires_a_pending_live_nonterminal_view() {
+        let deadline = Instant::now();
+        let before = deadline
+            .checked_sub(Duration::from_nanos(1))
+            .expect("prior instant");
+        let after = deadline + Duration::from_nanos(1);
+        // Only a live, pending, nonterminal renderer owns a startup timeout.
+        // The inclusive boundary is the independent deadline oracle.
+        for (now, expired) in [(before, false), (deadline, true), (after, true)] {
+            assert_eq!(
+                navigation_deadline_expired(false, true, false, now, deadline),
+                expired
+            );
+            for (ready, has_views, terminal) in [
+                (false, false, false), // Last view closed before navigation.
+                (true, true, false),   // Initial navigation already completed.
+                (false, true, true),   // Queued Quit/Fatal must win.
+                (true, false, true),
+            ] {
+                assert!(!navigation_deadline_expired(
+                    ready, has_views, terminal, now, deadline
+                ));
+            }
+        }
+    }
+}
+
 #[cfg(target_os = "linux")]
 pub mod webkitgtk;
 #[cfg(target_os = "windows")]
