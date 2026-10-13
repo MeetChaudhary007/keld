@@ -44,6 +44,15 @@ use crate::{LogicalSize, media::manifest_fingerprint};
 use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2;
 
 const FIXTURE_DEADLINE: Duration = Duration::from_mins(1);
+/// Kill switch for the two swallowed-event children (host site and probe
+/// site) alone. Each waits out the full production post-exit grace on
+/// purpose, and the host child asserts its failure within twice that grace,
+/// so the watchdog is the normal fixture budget plus that ceiling. A literal
+/// here would silently censor both cases the next time the grace is
+/// re-measured (KEL-270 F55: the 60 s fixture budget cut the probe case at
+/// an 85 s grace).
+const SWALLOWED_EXIT_FIXTURE_DEADLINE: Duration =
+    Duration::from_secs(FIXTURE_DEADLINE.as_secs() + 2 * super::BROWSER_EXIT_GRACE.as_secs());
 const WATCHDOG_PROBE_DEADLINE: Duration = Duration::from_millis(100);
 const PARENT_DEADLINE_MARGIN: Duration = Duration::from_secs(30);
 
@@ -176,7 +185,9 @@ static GRACE_ARMED_AT: std::sync::OnceLock<Instant> = std::sync::OnceLock::new()
 /// event and the arming poll are ordered only by the OS, so a swallow-relative
 /// lower bound held by timer overshoot alone. `shutdown` is the healthy
 /// shutdown this barrier observed, from `Close` to the signaled handle: the
-/// measurement behind `BROWSER_SHUTDOWN_HANG_GUARD`.
+/// measurement behind `BROWSER_SHUTDOWN_HANG_GUARD`. Paired with the release
+/// line of the same site and run, the difference is the termination-to-event
+/// latency behind `BROWSER_EXIT_GRACE`.
 pub(super) fn observe_grace_armed(
     grace_armed_at: Instant,
     site: super::ReleaseSite,
@@ -1842,9 +1853,12 @@ chrome.webview.postMessage('{nonce}:{phase}:'+prior+':resolved:{track}:'+matchin
     /// the browser really exits. The release must fail `KELD-WV-009`, name the
     /// host post-exit grace, and do so at that grace measured from its own
     /// arming instant — never before it, never at an unrelated wall-clock
-    /// bound, and never by hanging until the watchdog. The swallow instant is
-    /// printed as evidence only: the swallowed event and the arming poll are
-    /// ordered by the OS, not by this test.
+    /// bound, and never by hanging until the watchdog. The ceiling is twice
+    /// the grace: a kill-switch-sized bound on the loop's wake and the
+    /// engine's teardown after the fault, derived from the constant so a
+    /// re-measured grace moves it. The swallow instant is printed as evidence
+    /// only: the swallowed event and the arming poll are ordered by the OS,
+    /// not by this test.
     fn swallowed_host_browser_exit_child() -> Result<(), WvError> {
         let grace = super::super::BROWSER_EXIT_GRACE;
         let root = profile_fixture_root("swallowed-host-exit");
@@ -1885,7 +1899,7 @@ chrome.webview.postMessage('{nonce}:{phase}:'+prior+':resolved:{track}:'+matchin
                 "the host release failed before the post-exit grace",
             ));
         }
-        if since_arming > grace + Duration::from_secs(5) {
+        if since_arming > grace * 2 {
             return Err(failure(
                 "the host release failure was not bounded by the post-exit grace",
             ));
@@ -1900,7 +1914,10 @@ chrome.webview.postMessage('{nonce}:{phase}:'+prior+':resolved:{track}:'+matchin
     #[ignore = "real Windows WebView2 swallowed BrowserProcessExited fault injection"]
     fn windows_swallowed_browser_exit_fails_bounded_subprocess() -> Result<(), WvError> {
         if std::env::var_os(SWALLOW_BROWSER_EXIT_ENV).is_some() {
-            return run_with_watchdog(FIXTURE_DEADLINE, swallowed_host_browser_exit_child);
+            return run_with_watchdog(
+                SWALLOWED_EXIT_FIXTURE_DEADLINE,
+                swallowed_host_browser_exit_child,
+            );
         }
         let output = spawn_browser_exit_fault_child(
             "windows_swallowed_browser_exit_fails_bounded_subprocess",
@@ -1960,7 +1977,12 @@ chrome.webview.postMessage('{nonce}:{phase}:'+prior+':resolved:{track}:'+matchin
     #[ignore = "real Windows WebView2 unproven exclusive-UDF probe retains the predecessor"]
     fn windows_unproven_probe_retains_predecessor_subprocess() -> Result<(), WvError> {
         if std::env::var_os(SWALLOW_BROWSER_EXIT_ENV).is_some() {
-            return run_with_watchdog(FIXTURE_DEADLINE, unproven_probe_retains_predecessor_child);
+            // The swallowed probe event makes this child wait out the full
+            // post-exit grace before the host's own release proceeds.
+            return run_with_watchdog(
+                SWALLOWED_EXIT_FIXTURE_DEADLINE,
+                unproven_probe_retains_predecessor_child,
+            );
         }
         let output = spawn_browser_exit_fault_child(
             "windows_unproven_probe_retains_predecessor_subprocess",

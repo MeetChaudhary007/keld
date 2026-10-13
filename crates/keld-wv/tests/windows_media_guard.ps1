@@ -140,6 +140,16 @@ function Invoke-ProfileRegressionCases {
         'windows_unproven_probe_retains_predecessor_subprocess',
         'windows_unproven_probe_window_retains_predecessor_subprocess'
     )
+    # Outer kill switches only; every child bounds itself with its own watchdog.
+    # The two swallowed-event cases (host site, probe site) wait out the full
+    # production post-exit grace (BROWSER_EXIT_GRACE, 85 s) on purpose, and their
+    # child watchdog is FIXTURE_DEADLINE + 2 x that grace (230 s), so their outer
+    # deadline must stay above that child watchdog; every other case keeps the
+    # 90 s kill switch.
+    $outerDeadlines = @{
+        'windows_swallowed_browser_exit_fails_bounded_subprocess' = 300000
+        'windows_unproven_probe_retains_predecessor_subprocess' = 300000
+    }
     foreach ($case in $cases) {
         $stdoutPath = Join-Path $EvidenceRoot "profile-$case.log"
         $stderrPath = Join-Path $EvidenceRoot "profile-$case.stderr.log"
@@ -150,7 +160,8 @@ function Invoke-ProfileRegressionCases {
         $start.CreateNoWindow = $true
         $start.RedirectStandardOutput = $true
         $start.RedirectStandardError = $true
-        $execution = Invoke-MediaProcess -Start $start -StdoutPath $stdoutPath -StderrPath $stderrPath -DeadlineMilliseconds 90000
+        $deadlineMilliseconds = if ($outerDeadlines.ContainsKey($case)) { $outerDeadlines[$case] } else { 90000 }
+        $execution = Invoke-MediaProcess -Start $start -StdoutPath $stdoutPath -StderrPath $stderrPath -DeadlineMilliseconds $deadlineMilliseconds
         if ($execution.outer_timed_out -or $execution.exit_code -ne 0 -or
             -not $execution.stdout_text.Contains("test webview2::media_acceptance::tests::$case") -or
             -not $execution.stdout_text.Contains('test result: ok. 1 passed; 0 failed')) {
