@@ -17,6 +17,13 @@ fn public_app_fs_component_runs_without_synthetic_input_and_relaunches() {
         .iter()
         .find(|report| report["phase"] == "page-ready")
         .expect("healthy relaunch document identity");
+    for document in [first_document, second_document] {
+        assert_eq!(
+            document["button"],
+            serde_json::Value::Null,
+            "public-main-only page must not expose renderer activation"
+        );
+    }
     for key in ["documentNonce", "javascriptToken"] {
         let before = first_document[key].as_str().expect("page-created identity");
         let after = second_document[key]
