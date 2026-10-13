@@ -26,7 +26,19 @@ Principal identity is authenticated **link metadata**, not a frame payload field
 destination supervisor mints a role principal, creates the listener/token, spawns that
 role and binds the accepted link to the principal before dispatch. A frame cannot select,
 forge or upgrade its role. KEL-70's live generic supervisor does not yet perform this
-binding; v0's token proves possession only.
+binding; the `HELLO` token itself proves possession only.
+
+**Current primary app-link identity (KEL-97):** Runtime's authenticated
+`BoundRoleGeneration` retains its canonical owner and generation; Core keeps
+that principal in the accepted primary row and reader context. Primary admission
+rejects another role owner. Before decoding a Bun-to-Host unprivileged Echo
+request, Core requires the current attempt and principal, the same reader-stop
+instance, and a running session and reader. A retired or mismatched context is
+inert before decoding or replying. macOS qualification exercises actual guardian
+retirement and a G2 public-FS successor result, with exact bytes and a scoped
+Guard denial that leaves the outside file unchanged. That successor proof does
+not claim an outbound app Echo result, renderer continuity, OS containment or
+role grants; the full named-role `RoleRegistry` composition remains Target.
 
 **Destination role-instance contract (KEL-75):** a role instance is the host-owned
 pair `(declared role, fresh generation)`. It is never inferred from a PID, listener

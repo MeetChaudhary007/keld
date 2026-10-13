@@ -135,7 +135,10 @@ function Invoke-ProfileRegressionCases {
         'windows_dev_profile_cleanup_subprocess',
         'windows_busy_ephemeral_scavenge_subprocess',
         'windows_persistent_recovery_subprocess',
-        'windows_saved_media_reconciliation_subprocess'
+        'windows_saved_media_reconciliation_subprocess',
+        'windows_swallowed_browser_exit_fails_bounded_subprocess',
+        'windows_unproven_probe_retains_predecessor_subprocess',
+        'windows_unproven_probe_window_retains_predecessor_subprocess'
     )
     foreach ($case in $cases) {
         $stdoutPath = Join-Path $EvidenceRoot "profile-$case.log"
@@ -175,8 +178,8 @@ if ($binaryHash -ne $sourceBinaryHash) {
 $watchdogProbe = Invoke-MediaWatchdogProbe -Binary $binary -EvidenceRoot $evidenceRoot
 $outerDeadlineProbe = Invoke-MediaOuterDeadlineProbe -EvidenceRoot $evidenceRoot
 $profileRegressionCount = Invoke-ProfileRegressionCases -Binary $binary -EvidenceRoot $evidenceRoot
-if ($profileRegressionCount -ne 5) {
-    throw "Expected five Windows profile regressions, observed $profileRegressionCount"
+if ($profileRegressionCount -ne 8) {
+    throw "Expected eight Windows profile regressions, observed $profileRegressionCount"
 }
 $results = @()
 $seenNonces = @{}

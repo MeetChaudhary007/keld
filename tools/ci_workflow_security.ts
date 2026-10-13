@@ -6,7 +6,7 @@ type Mapping = Record<string, unknown>;
 const baseRef = "${{ github.event.pull_request.base.sha || github.event.before }}";
 const headRef = "${{ github.event.pull_request.head.sha || github.sha }}";
 const windowsMediaOracle = "crates/keld-wv/tests/windows_media_guard.ps1";
-const windowsMediaOracleSha256 = "fba6622b6faf56a785f10e5dfbf4da7d0b781faecd0a66e5735e568d028c11aa";
+const windowsMediaOracleSha256 = "a09c2976d33af2d9a3506ad2e4c35b9dbb7bcfa7289b805b0b8dff287050f886";
 
 function fail(message: string): never {
   throw new Error(`CI-HYGIENE: ${message}`);

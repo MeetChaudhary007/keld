@@ -11,7 +11,7 @@ use std::io::{self, Read, Write};
 use std::os::fd::AsFd;
 use std::os::unix::process::CommandExt;
 use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -60,9 +60,85 @@ const CONTROL_REVOKE: u8 = 5;
 const CONTROL_REVOKED: u8 = 6;
 const CONTROL_CLEAR: u8 = 7;
 const CONTROL_CLEARED: u8 = 8;
-const RECOVERY_PENDING: u8 = 0;
-const RECOVERY_ARMED: u8 = 1;
-const RECOVERY_DENIED: u8 = 2;
+
+#[derive(Debug)]
+struct RecoveryState {
+    initial_ready: bool,
+    denied: bool,
+    retired_attempt: Option<u32>,
+    cleared_attempt: Option<u32>,
+    release_attempt: Option<u32>,
+    expected_attempt: u32,
+    shutdown_acknowledged: bool,
+}
+
+impl RecoveryState {
+    const fn new() -> Self {
+        Self {
+            initial_ready: false,
+            denied: false,
+            retired_attempt: None,
+            cleared_attempt: None,
+            release_attempt: None,
+            expected_attempt: 1,
+            shutdown_acknowledged: false,
+        }
+    }
+
+    fn arm(&mut self) {
+        if self.denied {
+            return;
+        }
+        if !self.initial_ready {
+            self.initial_ready = true;
+            return;
+        }
+        self.release_attempt = self
+            .retired_attempt
+            .and_then(|attempt| attempt.checked_add(1));
+    }
+
+    fn deny(&mut self) {
+        self.denied = true;
+        self.release_attempt = None;
+    }
+
+    fn retire(&mut self, attempt: u32) {
+        self.retired_attempt = Some(attempt);
+        self.cleared_attempt = None;
+        self.release_attempt = None;
+    }
+
+    fn cleared(&mut self, attempt: u32) -> Result<(), RuntimeError> {
+        self.expected_attempt = attempt.checked_add(1).ok_or_else(|| {
+            lifecycle_error(
+                "macOS guardian generation host transition",
+                io::Error::other("supervisor attempt counter exhausted"),
+            )
+        })?;
+        self.cleared_attempt = Some(attempt);
+        Ok(())
+    }
+
+    fn permits(&self, attempt: u32) -> bool {
+        !self.denied
+            && self.expected_attempt == attempt
+            && (attempt == 1
+                || (self.initial_ready
+                    && self.release_attempt == Some(attempt)
+                    && self.cleared_attempt == self.retired_attempt
+                    && self
+                        .retired_attempt
+                        .and_then(|retired| retired.checked_add(1))
+                        == Some(attempt)))
+    }
+}
+
+fn lock_recovery(state: &Mutex<RecoveryState>) -> std::sync::MutexGuard<'_, RecoveryState> {
+    state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 #[derive(Debug)]
 struct GenerationControlRecord {
@@ -540,7 +616,7 @@ pub struct GuardedPrimary {
     liveness_writer: Option<ChildStdin>,
     quit_ack_reader: ChildStdout,
     current_generation: Arc<Mutex<Option<RegisteredPrimaryGeneration>>>,
-    recovery_decision: Arc<AtomicU8>,
+    recovery_decision: Arc<Mutex<RecoveryState>>,
     updates_rx: Receiver<GuardedPrimaryUpdate>,
     worker: Option<JoinHandle<Result<(), RuntimeError>>>,
     shutdown_attributed: bool,
@@ -578,7 +654,7 @@ impl GuardedPrimary {
             }
         }
         let current_generation = Arc::new(Mutex::new(None));
-        let recovery_decision = Arc::new(AtomicU8::new(RECOVERY_PENDING));
+        let recovery_decision = Arc::new(Mutex::new(RecoveryState::new()));
         let (updates_tx, updates_rx) = mpsc::channel();
         let generation_for_worker = Arc::clone(&current_generation);
         let recovery_for_worker = Arc::clone(&recovery_decision);
@@ -590,6 +666,8 @@ impl GuardedPrimary {
                     &updates_tx,
                     &generation_for_worker,
                     &recovery_for_worker,
+                    #[cfg(test)]
+                    None,
                 )
             }) {
             Ok(worker) => worker,
@@ -626,16 +704,14 @@ impl GuardedPrimary {
         lock_generation(&self.current_generation).map(|generation| generation.group_pid)
     }
 
-    /// Arms restart only after the initial generation has reached host Ready.
+    /// Arms initial Ready, then releases the current retired successor.
     pub fn arm_recovery(&self) {
-        self.recovery_decision
-            .store(RECOVERY_ARMED, Ordering::Release);
+        lock_recovery(&self.recovery_decision).arm();
     }
 
     /// Permanently rejects successor preparation for a failed startup.
     pub fn deny_recovery(&self) {
-        self.recovery_decision
-            .store(RECOVERY_DENIED, Ordering::Release);
+        lock_recovery(&self.recovery_decision).deny();
     }
 
     /// Reports app-link failure for the named current generation.
@@ -672,6 +748,9 @@ impl GuardedPrimary {
     /// Returns a typed lifecycle error when the guardian cannot acknowledge
     /// attribution while the host still owns the session.
     pub fn accept_shutdown(&mut self) -> Result<(), RuntimeError> {
+        // The same guard covers the actual locator/token mint. Release it
+        // before Q I/O so the generation owner can finish cleanup concurrently.
+        self.deny_recovery();
         let ack_reader = &mut self.quit_ack_reader;
         let writer = self.liveness_writer.as_mut().ok_or_else(|| {
             lifecycle_error(
@@ -679,13 +758,14 @@ impl GuardedPrimary {
                 io::Error::new(io::ErrorKind::NotConnected, "liveness writer is missing"),
             )
         })?;
-        set_liveness_nonblocking(writer)?;
+        set_liveness_nonblocking(writer, true)?;
         writer
             .write_all(&[SUPERVISED_QUIT_ACCEPTED])
             .and_then(|()| writer.flush())
             .map_err(|source| lifecycle_error("macOS guardian supervised-Quit control", source))?;
         read_supervised_quit_ack(ack_reader)?;
         self.shutdown_attributed = true;
+        lock_recovery(&self.recovery_decision).shutdown_acknowledged = true;
         Ok(())
     }
 
@@ -825,6 +905,7 @@ impl GuardedPrimary {
     }
 
     fn prepare_orderly_shutdown(&mut self) -> Result<(), RuntimeError> {
+        self.deny_recovery();
         if self.shutdown_attributed {
             return Ok(());
         }
@@ -835,13 +916,14 @@ impl GuardedPrimary {
             )
         })?;
         let ack_reader = &mut self.quit_ack_reader;
-        set_liveness_nonblocking(writer)?;
+        set_liveness_nonblocking(writer, true)?;
         writer
             .write_all(&[SUPERVISED_ORDERLY_SHUTDOWN])
             .and_then(|()| writer.flush())
             .map_err(|source| lifecycle_error("macOS guardian orderly-shutdown control", source))?;
         read_supervised_orderly_ack(ack_reader)?;
         self.shutdown_attributed = true;
+        lock_recovery(&self.recovery_decision).shutdown_acknowledged = true;
         Ok(())
     }
 
@@ -1053,7 +1135,7 @@ impl HostGuardian {
                 ),
             )
         })?;
-        set_liveness_nonblocking(writer)?;
+        set_liveness_nonblocking(writer, true)?;
         writer
             .write_all(&[SUPERVISED_QUIT_ACCEPTED])
             .and_then(|()| writer.flush())
@@ -1296,6 +1378,7 @@ struct GuardedPrimaryPreparer<C> {
     command_factory: C,
     control: Arc<Mutex<GenerationControlPeer>>,
     host_unavailable: Arc<AtomicBool>,
+    preparation_cancelled: Arc<AtomicBool>,
 }
 
 impl<C> ChildPreparer for GuardedPrimaryPreparer<C>
@@ -1305,11 +1388,12 @@ where
     type Lease = GuardedPrimaryLease;
 
     fn prepare(&mut self, attempt: u32) -> Result<PreparedChild<Self::Lease>, RuntimeError> {
-        let response = control_exchange(
+        let response = control_exchange_with_cancellation(
             &self.control,
             &GenerationControlRecord::new(CONTROL_PREPARE, attempt),
             CONTROL_PREPARED,
             attempt,
+            Some((&self.preparation_cancelled, &self.host_unavailable)),
         )?;
         let app_link = match String::from_utf8(response.payload) {
             Ok(app_link) if !app_link.is_empty() => app_link,
@@ -1488,6 +1572,7 @@ where
         .map_err(|source| lifecycle_error("macOS guardian generation control deadline", source))?;
     validate_liveness_bootstrap(&mut liveness)?;
     let host_unavailable = Arc::new(AtomicBool::new(false));
+    let preparation_cancelled = Arc::new(AtomicBool::new(false));
     let supervisor = Supervisor::start_prepared(
         RestartPolicy::default(),
         GuardedPrimaryPreparer {
@@ -1497,47 +1582,18 @@ where
                 reader: GenerationControlReader::new(),
             })),
             host_unavailable: Arc::clone(&host_unavailable),
+            preparation_cancelled: Arc::clone(&preparation_cancelled),
         },
     )?;
 
-    set_liveness_nonblocking(&liveness)?;
-    let mut liveness_result = Ok(());
-    let mut quit_accepted = false;
-    let mut orderly_requested = false;
-    loop {
-        match observe_guarded_liveness(
-            &mut liveness,
-            &supervisor,
-            &mut quit_accepted,
-            &mut orderly_requested,
-            &mut quit_ack,
-        ) {
-            Ok(true) => {
-                if !quit_accepted && !orderly_requested {
-                    host_unavailable.store(true, Ordering::Release);
-                }
-                supervisor.shutdown();
-                break;
-            }
-            Ok(false) => {}
-            Err(error) => {
-                liveness_result = Err(error);
-                supervisor.shutdown();
-                break;
-            }
-        }
-        if let Some(event) = supervisor.recv_event(GENERATION_CONTROL_POLL)
-            && matches!(
-                event,
-                crate::SupervisorEvent::RespawnFailed
-                    | crate::SupervisorEvent::Failed { .. }
-                    | crate::SupervisorEvent::CrashLoopTripped
-                    | crate::SupervisorEvent::Stopped
-            )
-        {
-            break;
-        }
-    }
+    set_liveness_nonblocking(&liveness, true)?;
+    let (liveness_result, quit_accepted, host_dead) = await_guarded_primary_liveness(
+        &mut liveness,
+        &supervisor,
+        &mut quit_ack,
+        &host_unavailable,
+        &preparation_cancelled,
+    );
 
     let outcome = supervisor.wait_for_outcome();
     let crash_ledger = supervisor.crash_ledger();
@@ -1550,13 +1606,18 @@ where
         SupervisorOutcome::CrashLoop(error) | SupervisorOutcome::Failed(error) => {
             failures.push(error);
         }
-        SupervisorOutcome::Stopped if !quit_accepted => {
+        SupervisorOutcome::Stopped if !quit_accepted && !host_dead => {
             if let Some(termination) = crash_ledger.last_self_termination {
                 failures.push(RuntimeError::ChildCrashed {
                     pid: termination.pid,
                     exit_code: termination.exit_code,
                     stderr_tail: output.stderr_tail(2_000),
                 });
+            } else {
+                failures.push(lifecycle_error(
+                    "macOS guardian generation supervisor stop",
+                    io::Error::other("supervisor stopped without owned shutdown attribution"),
+                ));
             }
         }
         SupervisorOutcome::Stopped => {}
@@ -1566,6 +1627,67 @@ where
     } else {
         Err(collapse_failures(failures))
     }
+}
+
+fn await_guarded_primary_liveness(
+    liveness: &mut (impl Read + AsFd),
+    supervisor: &Supervisor,
+    quit_ack: &mut impl Write,
+    host_unavailable: &AtomicBool,
+    preparation_cancelled: &AtomicBool,
+) -> (Result<(), RuntimeError>, bool, bool) {
+    let mut liveness_result = Ok(());
+    let mut quit_accepted = false;
+    let mut orderly_requested = false;
+    let mut host_dead = false;
+    loop {
+        match observe_guarded_liveness(
+            liveness,
+            supervisor,
+            &mut quit_accepted,
+            &mut orderly_requested,
+            quit_ack,
+            preparation_cancelled,
+        ) {
+            Ok(true) => {
+                host_dead = true;
+                if !quit_accepted && !orderly_requested {
+                    host_unavailable.store(true, Ordering::Release);
+                }
+                supervisor.shutdown();
+                break;
+            }
+            Ok(false) => {}
+            Err(error) => {
+                liveness_result = Err(error);
+                // A liveness fault interrupts a pending read as a fatal error,
+                // never as the privately attributed stop marker.
+                host_unavailable.store(true, Ordering::Release);
+                supervisor.shutdown();
+                break;
+            }
+        }
+        match supervisor.recv_event(GENERATION_CONTROL_POLL) {
+            Some(crate::SupervisorEvent::Stopped) if quit_accepted => {
+                // Supervisor stop does not terminate this persistent guardian.
+                // Core may still own real native retirement before host EOF.
+                if let Err(error) = set_liveness_nonblocking(liveness, false) {
+                    liveness_result = Err(error);
+                    break;
+                }
+            }
+            Some(
+                crate::SupervisorEvent::RespawnFailed
+                | crate::SupervisorEvent::Failed { .. }
+                | crate::SupervisorEvent::CrashLoopTripped
+                | crate::SupervisorEvent::Stopped,
+            ) => break,
+            None => thread::yield_now(),
+            Some(_) => {}
+        }
+    }
+
+    (liveness_result, quit_accepted, host_dead)
 }
 
 fn run_supervised_with_registration<R, W, C, A, S, F>(
@@ -1609,7 +1731,7 @@ where
         )
     })?;
 
-    set_liveness_nonblocking(&liveness)?;
+    set_liveness_nonblocking(&liveness, true)?;
     let mut liveness_result = Ok(());
     let mut quit_accepted = false;
     loop {
@@ -1831,12 +1953,29 @@ fn write_group_registration(writer: &mut impl Write, group_pid: u32) -> Result<(
     })
 }
 
+#[cfg(test)]
+struct GenerationProvisionFence {
+    attempt: u32,
+    entered: mpsc::SyncSender<()>,
+    release: Receiver<()>,
+}
+
+#[derive(Default)]
+struct HostGenerationState {
+    lease: Option<RoleGenerationLease>,
+    current_attempt: Option<u32>,
+    revoked_attempt: Option<u32>,
+    pending_prepare: Option<GenerationControlRecord>,
+    initial_decision_deadline: Option<Instant>,
+}
+
 #[allow(clippy::too_many_lines)] // one owner keeps every private protocol transition contiguous
 fn run_generation_host(
     mut control: std::os::unix::net::UnixStream,
     updates_tx: &Sender<GuardedPrimaryUpdate>,
     current_generation: &Mutex<Option<RegisteredPrimaryGeneration>>,
-    recovery_decision: &AtomicU8,
+    recovery_decision: &Mutex<RecoveryState>,
+    #[cfg(test)] provision_fence: Option<&GenerationProvisionFence>,
 ) -> Result<(), RuntimeError> {
     control
         .set_read_timeout(Some(GENERATION_CONTROL_POLL))
@@ -1855,182 +1994,293 @@ fn run_generation_host(
         #[cfg(unix)]
         None,
     );
-    let mut lease: Option<RoleGenerationLease> = None;
-    let mut current_attempt = None;
-    let mut revoked_attempt = None;
-    let mut expected_attempt = 1_u32;
+    let mut state = HostGenerationState::default();
     let mut control_reader = GenerationControlReader::new();
     loop {
-        if let Some(lease) = lease.as_mut() {
+        if let Some(lease) = state.lease.as_mut() {
             lease.poll()?;
         }
         forward_generation_updates(updates_tx, &bound_rx, &events_rx)?;
         let record = match control_reader.poll(&mut control) {
-            Ok(Some(record)) => record,
-            Ok(None) => continue,
-            Err(error)
-                if runtime_io_kind(&error) == Some(io::ErrorKind::UnexpectedEof)
-                    && lease.is_none()
-                    && lock_generation(current_generation).is_none() =>
-            {
-                return Ok(());
+            Ok(record) => record,
+            Err(error) if runtime_io_kind(&error) == Some(io::ErrorKind::UnexpectedEof) => {
+                let result = finish_generation_control_eof(
+                    error,
+                    control_reader.filled,
+                    &mut state,
+                    current_generation,
+                    recovery_decision,
+                );
+                forward_generation_updates(updates_tx, &bound_rx, &events_rx)?;
+                return result;
             }
             Err(error) => return Err(error),
         };
-        match record.kind {
-            CONTROL_PREPARE => {
-                if record.attempt > 1 {
-                    await_recovery_decision(recovery_decision)?;
-                }
-                if record.attempt != expected_attempt
-                    || current_attempt.is_some()
-                    || lease.is_some()
-                    || revoked_attempt.is_some()
-                    || lock_generation(current_generation).is_some()
-                    || record.pid != 0
-                    || record.cause != 0
-                    || !record.payload.is_empty()
-                {
-                    return Err(invalid_control_transition(
-                        "prepare",
-                        record.attempt,
-                        expected_attempt,
-                    ));
-                }
-                let provisioned = owner.provision(record.attempt)?;
-                let response = GenerationControlRecord::new(CONTROL_PREPARED, record.attempt)
-                    .with_payload(provisioned.app_link.as_bytes().to_vec());
-                lease = Some(provisioned.lease);
-                current_attempt = Some(record.attempt);
-                forward_generation_updates(updates_tx, &bound_rx, &events_rx)?;
-                write_generation_control(&mut control, &response)?;
-            }
-            CONTROL_SPAWNED => {
-                if current_attempt != Some(record.attempt)
-                    || record.pid == 0
-                    || record.cause != 0
-                    || !record.payload.is_empty()
-                    || lock_generation(current_generation).is_some()
-                {
-                    return Err(invalid_control_transition(
-                        "spawned",
-                        record.attempt,
-                        expected_attempt,
-                    ));
-                }
-                let current = lease.as_mut().ok_or_else(|| {
-                    invalid_control_transition("spawned", record.attempt, expected_attempt)
-                })?;
-                current.child_spawned(record.pid, record.attempt)?;
-                *lock_generation(current_generation) = Some(RegisteredPrimaryGeneration {
-                    attempt: record.attempt,
-                    group_pid: record.pid,
-                });
-                forward_generation_updates(updates_tx, &bound_rx, &events_rx)?;
-                write_generation_control(
-                    &mut control,
-                    &GenerationControlRecord::new(CONTROL_REGISTERED, record.attempt)
-                        .with_pid(record.pid),
-                )?;
-            }
-            CONTROL_REVOKE => {
-                if current_attempt != Some(record.attempt)
-                    || revoked_attempt.is_some()
-                    || record.pid != 0
-                    || !record.payload.is_empty()
-                {
-                    return Err(invalid_control_transition(
-                        "revoke",
-                        record.attempt,
-                        expected_attempt,
-                    ));
-                }
-                let cause = decode_revocation_cause(record.cause)?;
-                let current = lease.take().ok_or_else(|| {
-                    invalid_control_transition("revoke", record.attempt, expected_attempt)
-                })?;
-                current.revoke(cause)?;
-                revoked_attempt = Some(record.attempt);
-                forward_generation_updates(updates_tx, &bound_rx, &events_rx)?;
-                write_generation_control(
-                    &mut control,
-                    &GenerationControlRecord::new(CONTROL_REVOKED, record.attempt),
-                )?;
-            }
-            CONTROL_CLEAR => {
-                let registered = lock_generation(current_generation)
-                    .map_or(0, |generation| generation.group_pid);
-                if current_attempt != Some(record.attempt)
-                    || revoked_attempt != Some(record.attempt)
-                    || record.cause != 0
-                    || !record.payload.is_empty()
-                    || record.pid != registered
-                {
-                    return Err(invalid_control_transition(
-                        "clear",
-                        record.attempt,
-                        expected_attempt,
-                    ));
-                }
-                take_generation(current_generation);
-                write_generation_control(
-                    &mut control,
-                    &GenerationControlRecord::new(CONTROL_CLEARED, record.attempt)
-                        .with_pid(record.pid),
-                )?;
-                current_attempt = None;
-                revoked_attempt = None;
-                expected_attempt = expected_attempt.checked_add(1).ok_or_else(|| {
-                    lifecycle_error(
-                        "macOS guardian generation host transition",
-                        io::Error::other("supervisor attempt counter exhausted"),
-                    )
-                })?;
-            }
-            _ => {
-                return Err(lifecycle_error(
-                    "macOS guardian generation host transition",
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("unexpected control kind {}", record.kind),
-                    ),
+        let expected_attempt = lock_recovery(recovery_decision).expected_attempt;
+        if let Some(record) = record {
+            if state.pending_prepare.is_some() {
+                return Err(invalid_control_transition(
+                    "pending prepare",
+                    record.attempt,
+                    expected_attempt,
                 ));
             }
+            match record.kind {
+                CONTROL_PREPARE => {
+                    if record.attempt != expected_attempt
+                        || state.current_attempt.is_some()
+                        || state.lease.is_some()
+                        || state.revoked_attempt.is_some()
+                        || lock_generation(current_generation).is_some()
+                        || record.pid != 0
+                        || record.cause != 0
+                        || !record.payload.is_empty()
+                    {
+                        return Err(invalid_control_transition(
+                            "prepare",
+                            record.attempt,
+                            expected_attempt,
+                        ));
+                    }
+                    if record.attempt > 1 && !lock_recovery(recovery_decision).initial_ready {
+                        state.initial_decision_deadline =
+                            Some(Instant::now() + GUARDIAN_SHUTDOWN_DEADLINE);
+                    }
+                    state.pending_prepare = Some(record);
+                }
+                CONTROL_SPAWNED => {
+                    if state.current_attempt != Some(record.attempt)
+                        || record.pid == 0
+                        || record.cause != 0
+                        || !record.payload.is_empty()
+                        || lock_generation(current_generation).is_some()
+                    {
+                        return Err(invalid_control_transition(
+                            "spawned",
+                            record.attempt,
+                            expected_attempt,
+                        ));
+                    }
+                    let current = state.lease.as_mut().ok_or_else(|| {
+                        invalid_control_transition("spawned", record.attempt, expected_attempt)
+                    })?;
+                    current.child_spawned(record.pid, record.attempt)?;
+                    *lock_generation(current_generation) = Some(RegisteredPrimaryGeneration {
+                        attempt: record.attempt,
+                        group_pid: record.pid,
+                    });
+                    forward_generation_updates(updates_tx, &bound_rx, &events_rx)?;
+                    write_generation_control(
+                        &mut control,
+                        &GenerationControlRecord::new(CONTROL_REGISTERED, record.attempt)
+                            .with_pid(record.pid),
+                    )?;
+                }
+                CONTROL_REVOKE => {
+                    if state.current_attempt != Some(record.attempt)
+                        || state.revoked_attempt.is_some()
+                        || record.pid != 0
+                        || !record.payload.is_empty()
+                    {
+                        return Err(invalid_control_transition(
+                            "revoke",
+                            record.attempt,
+                            expected_attempt,
+                        ));
+                    }
+                    let cause = decode_revocation_cause(record.cause)?;
+                    let current = state.lease.take().ok_or_else(|| {
+                        invalid_control_transition("revoke", record.attempt, expected_attempt)
+                    })?;
+                    // Close native release before the lease emits Revoked.
+                    lock_recovery(recovery_decision).retire(record.attempt);
+                    current.revoke(cause)?;
+                    state.revoked_attempt = Some(record.attempt);
+                    forward_generation_updates(updates_tx, &bound_rx, &events_rx)?;
+                    write_generation_control(
+                        &mut control,
+                        &GenerationControlRecord::new(CONTROL_REVOKED, record.attempt),
+                    )?;
+                }
+                CONTROL_CLEAR => {
+                    let registered = lock_generation(current_generation)
+                        .map_or(0, |generation| generation.group_pid);
+                    if state.current_attempt != Some(record.attempt)
+                        || state.revoked_attempt != Some(record.attempt)
+                        || record.cause != 0
+                        || !record.payload.is_empty()
+                        || record.pid != registered
+                    {
+                        return Err(invalid_control_transition(
+                            "clear",
+                            record.attempt,
+                            expected_attempt,
+                        ));
+                    }
+                    take_generation(current_generation);
+                    write_generation_control(
+                        &mut control,
+                        &GenerationControlRecord::new(CONTROL_CLEARED, record.attempt)
+                            .with_pid(record.pid),
+                    )?;
+                    state.current_attempt = None;
+                    state.revoked_attempt = None;
+                    // None alone is not Clear: only the completed acknowledgment
+                    // advances the attempt and permits a pending release request.
+                    lock_recovery(recovery_decision).cleared(record.attempt)?;
+                }
+                _ => {
+                    return Err(lifecycle_error(
+                        "macOS guardian generation host transition",
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("unexpected control kind {}", record.kind),
+                        ),
+                    ));
+                }
+            }
+        }
+        if control_reader.filled != 0 {
+            continue;
+        }
+        let Some(pending) = state.pending_prepare.as_ref() else {
+            continue;
+        };
+        let provisioned = {
+            let mut recovery = lock_recovery(recovery_decision);
+            check_initial_recovery_decision(&recovery, state.initial_decision_deadline)?;
+            if pending.attempt == 1 && recovery.denied {
+                return Err(rejected_recovery());
+            }
+            if !recovery.permits(pending.attempt) {
+                continue;
+            }
+            recovery.release_attempt = None;
+            // This actual bind/token mint is ordered against permanent denial.
+            // Do not release the recovery guard between the check and provision.
+            #[cfg(test)]
+            if let Some(fence) = provision_fence.filter(|fence| fence.attempt == pending.attempt) {
+                // Scoped unit-test custody only: shipping code has no fence,
+                // callback, global, extra owner, or branch here. The real host
+                // owner retains its recovery guard through the actual mint.
+                fence.entered.send(()).map_err(|_| {
+                    lifecycle_error(
+                        "test generation pre-mint receipt",
+                        io::Error::other("test custodian ended"),
+                    )
+                })?;
+                fence
+                    .release
+                    .recv_timeout(GUARDIAN_SHUTDOWN_DEADLINE)
+                    .map_err(|source| {
+                        lifecycle_error(
+                            "test generation pre-mint release",
+                            io::Error::other(source),
+                        )
+                    })?;
+            }
+            owner.provision(pending.attempt)?
+        };
+        let response = GenerationControlRecord::new(CONTROL_PREPARED, pending.attempt)
+            .with_payload(provisioned.app_link.as_bytes().to_vec());
+        state.current_attempt = Some(pending.attempt);
+        state.lease = Some(provisioned.lease);
+        state.pending_prepare = None;
+        state.initial_decision_deadline = None;
+        forward_generation_updates(updates_tx, &bound_rx, &events_rx)?;
+        if let Err(error) = write_generation_control(&mut control, &response) {
+            if matches!(
+                runtime_io_kind(&error),
+                Some(io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset)
+            ) {
+                let result = finish_generation_control_eof(
+                    error,
+                    control_reader.filled,
+                    &mut state,
+                    current_generation,
+                    recovery_decision,
+                );
+                forward_generation_updates(updates_tx, &bound_rx, &events_rx)?;
+                return result;
+            }
+            return Err(error);
         }
     }
 }
 
-fn await_recovery_decision(decision: &AtomicU8) -> Result<(), RuntimeError> {
-    let deadline = Instant::now() + GUARDIAN_SHUTDOWN_DEADLINE;
-    loop {
-        match decision.load(Ordering::Acquire) {
-            RECOVERY_ARMED => return Ok(()),
-            RECOVERY_DENIED => {
-                return Err(lifecycle_error(
-                    "macOS guardian generation host transition",
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "successor preparation was rejected before initial Ready",
-                    ),
-                ));
-            }
-            RECOVERY_PENDING if Instant::now() < deadline => thread::yield_now(),
-            RECOVERY_PENDING => {
-                return Err(lifecycle_error(
-                    "macOS guardian generation host transition",
-                    io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "initial Ready did not decide recovery before the deadline",
-                    ),
-                ));
-            }
-            _ => {
-                return Err(lifecycle_error(
-                    "macOS guardian generation host transition",
-                    io::Error::new(io::ErrorKind::InvalidData, "invalid recovery decision"),
-                ));
-            }
+fn rejected_recovery() -> RuntimeError {
+    lifecycle_error(
+        "macOS guardian generation host transition",
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "successor preparation was rejected before initial Ready",
+        ),
+    )
+}
+
+fn check_initial_recovery_decision(
+    recovery: &RecoveryState,
+    deadline: Option<Instant>,
+) -> Result<(), RuntimeError> {
+    if recovery.initial_ready || deadline.is_none() {
+        return Ok(());
+    }
+    if recovery.denied {
+        return Err(rejected_recovery());
+    }
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        return Err(lifecycle_error(
+            "macOS guardian generation host transition",
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                "initial Ready did not decide recovery before the deadline",
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn finish_generation_control_eof(
+    primary: RuntimeError,
+    partial_bytes: usize,
+    state: &mut HostGenerationState,
+    current_generation: &Mutex<Option<RegisteredPrimaryGeneration>>,
+    recovery: &Mutex<RecoveryState>,
+) -> Result<(), RuntimeError> {
+    if partial_bytes != 0 || lock_generation(current_generation).is_some() {
+        return Err(primary);
+    }
+    if let Some(lease) = state.lease.take() {
+        let Some(attempt) = state.current_attempt.take() else {
+            return Err(primary);
+        };
+        if state.revoked_attempt.is_some() {
+            return Err(primary);
         }
+        lock_recovery(recovery).retire(attempt);
+        if let Err(cleanup) = lease.revoke(RevocationCause::Shutdown) {
+            return Err(collapse_failures(vec![primary, cleanup]));
+        }
+    }
+    if state.current_attempt.is_some() || state.revoked_attempt.is_some() {
+        return Err(primary);
+    }
+    // EOF can precede the host's Q/S ACK read by one scheduling turn. Retain
+    // the EOF fact and its one existing attribution budget; never reread EOF.
+    let deadline = Instant::now() + SUPERVISED_QUIT_ACK_DEADLINE;
+    loop {
+        let recovery = lock_recovery(recovery);
+        if !recovery.denied {
+            return Err(primary);
+        }
+        if recovery.shutdown_acknowledged {
+            return Ok(());
+        }
+        drop(recovery);
+        if Instant::now() >= deadline {
+            return Err(primary);
+        }
+        thread::yield_now();
     }
 }
 
@@ -2309,18 +2559,46 @@ fn control_exchange(
     expected_kind: u8,
     expected_attempt: u32,
 ) -> Result<GenerationControlRecord, RuntimeError> {
+    control_exchange_with_cancellation(control, request, expected_kind, expected_attempt, None)
+}
+
+fn control_exchange_with_cancellation(
+    control: &Arc<Mutex<GenerationControlPeer>>,
+    request: &GenerationControlRecord,
+    expected_kind: u8,
+    expected_attempt: u32,
+    cancellation: Option<(&AtomicBool, &AtomicBool)>,
+) -> Result<GenerationControlRecord, RuntimeError> {
     let mut control = match control.lock() {
         Ok(control) => control,
         Err(poisoned) => poisoned.into_inner(),
     };
     let GenerationControlPeer { stream, reader } = &mut *control;
     write_generation_control(stream, request)?;
-    let deadline = Instant::now() + GUARDIAN_SHUTDOWN_DEADLINE;
+    let native_wait = request.kind == CONTROL_PREPARE && request.attempt > 1;
+    let deadline = (!native_wait).then(|| Instant::now() + GUARDIAN_SHUTDOWN_DEADLINE);
     let response = loop {
+        if native_wait
+            && reader.filled == 0
+            && let Some((cancelled, host_unavailable)) = cancellation
+        {
+            if cancelled.load(Ordering::Acquire) {
+                return Err(interrupted_successor_preparation(expected_attempt));
+            }
+            if host_unavailable.load(Ordering::Acquire) {
+                return Err(lifecycle_error(
+                    "macOS guardian generation control transition",
+                    io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "host-liveness observation failed",
+                    ),
+                ));
+            }
+        }
         if let Some(response) = reader.poll(stream)? {
             break response;
         }
-        if Instant::now() >= deadline {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             return Err(lifecycle_error(
                 "macOS guardian generation control transition",
                 io::Error::new(
@@ -2344,6 +2622,41 @@ fn control_exchange(
     }
     validate_control_response(request, &response)?;
     Ok(response)
+}
+
+#[derive(Debug)]
+struct OwnedPreparationInterruption {
+    attempt: u32,
+}
+
+impl std::fmt::Display for OwnedPreparationInterruption {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "owned shutdown interrupted successor attempt {}",
+            self.attempt
+        )
+    }
+}
+
+impl std::error::Error for OwnedPreparationInterruption {}
+
+fn interrupted_successor_preparation(attempt: u32) -> RuntimeError {
+    lifecycle_error(
+        "macOS guardian generation control transition",
+        io::Error::new(
+            io::ErrorKind::Interrupted,
+            OwnedPreparationInterruption { attempt },
+        ),
+    )
+}
+
+/// Recognizes only this preparer's private interruption for the exact attempt.
+pub(crate) fn is_owned_preparation_interruption(error: &RuntimeError, attempt: u32) -> bool {
+    matches!(error, RuntimeError::Lifecycle { source, .. }
+        if source.get_ref()
+            .and_then(|source| source.downcast_ref::<OwnedPreparationInterruption>())
+            .is_some_and(|marker| marker.attempt == attempt && attempt > 1))
 }
 
 fn validate_control_response(
@@ -2536,18 +2849,16 @@ enum HostLiveness {
     OrderlyShutdown,
 }
 
-fn set_liveness_nonblocking(reader: &impl AsFd) -> Result<(), RuntimeError> {
+fn set_liveness_nonblocking(reader: &impl AsFd, enabled: bool) -> Result<(), RuntimeError> {
     let raw_flags = fcntl(reader.as_fd(), FcntlArg::F_GETFL).map_err(|source| {
         lifecycle_error(
             "macOS guardian liveness descriptor flags",
             nix_io_error(source),
         )
     })?;
-    fcntl(
-        reader.as_fd(),
-        FcntlArg::F_SETFL(OFlag::from_bits_truncate(raw_flags) | OFlag::O_NONBLOCK),
-    )
-    .map_err(|source| {
+    let mut flags = OFlag::from_bits_truncate(raw_flags);
+    flags.set(OFlag::O_NONBLOCK, enabled);
+    fcntl(reader.as_fd(), FcntlArg::F_SETFL(flags)).map_err(|source| {
         lifecycle_error(
             "macOS guardian liveness descriptor polling",
             nix_io_error(source),
@@ -2627,11 +2938,13 @@ fn observe_guarded_liveness(
     quit_accepted: &mut bool,
     orderly_requested: &mut bool,
     acknowledgment: &mut impl Write,
+    preparation_cancelled: &AtomicBool,
 ) -> Result<bool, RuntimeError> {
     match poll_host_liveness(reader)? {
         HostLiveness::Live => Ok(false),
         HostLiveness::Dead => {
             supervisor.shutdown();
+            preparation_cancelled.store(true, Ordering::Release);
             Ok(true)
         }
         HostLiveness::QuitAccepted if *quit_accepted || *orderly_requested => Err(lifecycle_error(
@@ -2644,6 +2957,7 @@ fn observe_guarded_liveness(
         HostLiveness::QuitAccepted => {
             *quit_accepted = true;
             supervisor.accept_shutdown();
+            preparation_cancelled.store(true, Ordering::Release);
             acknowledgment
                 .write_all(&SUPERVISED_QUIT_ACK)
                 .and_then(|()| acknowledgment.flush())
@@ -3037,6 +3351,178 @@ mod tests {
     }
 
     #[test]
+    fn recovery_release_requires_retired_clear_and_initial_arm_is_not_release() {
+        let mut recovery = RecoveryState::new();
+        assert!(recovery.permits(1));
+        recovery.retire(1);
+        recovery.arm();
+        assert!(recovery.initial_ready);
+        assert!(
+            !recovery.permits(2),
+            "late initial Ready released retirement"
+        );
+        recovery.arm();
+        assert_eq!(recovery.release_attempt, Some(2));
+        assert!(!recovery.permits(2), "None before Cleared released G2");
+        recovery.cleared(1).expect("record completed G1 Clear");
+        assert!(recovery.permits(2));
+        assert!(
+            !recovery.permits(3),
+            "G1 release authorized a wrong attempt"
+        );
+        recovery.retire(2);
+        assert!(!recovery.permits(3), "revocation retained native release");
+        recovery.cleared(2).expect("record completed G2 Clear");
+        assert!(!recovery.permits(3), "new Clear reused old release");
+        recovery.arm();
+        assert!(recovery.permits(3));
+        recovery.deny();
+        recovery.arm();
+        assert!(!recovery.permits(3));
+        assert!(recovery.release_attempt.is_none());
+    }
+
+    #[test]
+    fn unresolved_initial_ready_retains_its_deadline_after_native_wait_is_excluded() {
+        let mut recovery = RecoveryState::new();
+        let expired = Some(
+            Instant::now()
+                .checked_sub(GUARDIAN_SHUTDOWN_DEADLINE)
+                .expect("test clock can represent one expired initial decision budget"),
+        );
+        let error = check_initial_recovery_decision(&recovery, expired)
+            .expect_err("unresolved initial Ready remains bounded");
+        assert_eq!(runtime_io_kind(&error), Some(io::ErrorKind::TimedOut));
+        recovery.arm();
+        check_initial_recovery_decision(&recovery, expired)
+            .expect("decided eligibility does not time out legal native waiting");
+        assert!(
+            !recovery.permits(2),
+            "eligibility alone released native waiting"
+        );
+    }
+
+    #[test]
+    fn unclaimed_control_eof_explicitly_revokes_exact_lease_and_requires_attribution() {
+        for acknowledged in [false, true] {
+            let (events_tx, events_rx) = mpsc::channel();
+            let mut owner = RoleGenerationOwner::new(
+                RoleOwner::Primary,
+                DEFAULT_ADMISSION_TIMEOUT,
+                events_tx,
+                None,
+                None,
+            );
+            let provisioned = owner.provision(7).expect("own one unclaimed attempt");
+            let (endpoint, _) = parse_app_link(&provisioned.app_link).expect("actual locator");
+            let mut state = HostGenerationState {
+                lease: Some(provisioned.lease),
+                current_attempt: Some(7),
+                ..HostGenerationState::default()
+            };
+            let recovery = Mutex::new(RecoveryState::new());
+            if acknowledged {
+                let mut recovery = lock_recovery(&recovery);
+                recovery.deny();
+                recovery.shutdown_acknowledged = true;
+            }
+            let result = finish_generation_control_eof(
+                lifecycle_error("test EOF", io::Error::from(io::ErrorKind::UnexpectedEof)),
+                0,
+                &mut state,
+                &Mutex::new(None),
+                &recovery,
+            );
+            let events: Vec<_> = events_rx.try_iter().collect();
+            let endpoint_closed = std::os::unix::net::UnixStream::connect(endpoint).is_err();
+            assert!(state.lease.is_none() && state.current_attempt.is_none());
+            assert!(
+                endpoint_closed,
+                "unclaimed listener survived explicit revoke"
+            );
+            assert!(
+                events.iter().any(|event| matches!(
+                    event,
+                    RoleEvent::Revoked {
+                        attempt: 7,
+                        cause: crate::role::RoleRevocationCause::Shutdown,
+                        ..
+                    }
+                )),
+                "exact owner emitted no Shutdown revocation: {events:?}"
+            );
+            assert_eq!(
+                result.is_ok(),
+                acknowledged,
+                "denial/EOF fabricated attribution"
+            );
+        }
+    }
+
+    #[test]
+    fn attributed_control_eof_keeps_partial_and_registered_failures_fatal() {
+        for (partial, registered) in [
+            (1, None),
+            (
+                0,
+                Some(RegisteredPrimaryGeneration {
+                    attempt: 2,
+                    group_pid: 42,
+                }),
+            ),
+        ] {
+            let recovery = Mutex::new(RecoveryState::new());
+            {
+                let mut recovery = lock_recovery(&recovery);
+                recovery.deny();
+                recovery.shutdown_acknowledged = true;
+            }
+            let mut state = HostGenerationState::default();
+            let result = finish_generation_control_eof(
+                lifecycle_error("test EOF", io::Error::from(io::ErrorKind::UnexpectedEof)),
+                partial,
+                &mut state,
+                &Mutex::new(registered),
+                &recovery,
+            );
+            assert_eq!(
+                runtime_io_kind(&result.expect_err("partial/active EOF stays fatal")),
+                Some(io::ErrorKind::UnexpectedEof)
+            );
+        }
+    }
+
+    #[test]
+    fn denied_recovery_cannot_be_rearmed_by_late_ready() {
+        let mut child = Command::new("/bin/cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("owned liveness peer");
+        let liveness_writer = child.stdin.take().expect("liveness writer");
+        let quit_ack_reader = child.stdout.take().expect("ack reader");
+        let (_updates_tx, updates_rx) = mpsc::channel();
+        let mut primary = GuardedPrimary {
+            child,
+            liveness_writer: Some(liveness_writer),
+            quit_ack_reader,
+            current_generation: Arc::new(Mutex::new(None)),
+            recovery_decision: Arc::new(Mutex::new(RecoveryState::new())),
+            updates_rx,
+            worker: None,
+            shutdown_attributed: false,
+        };
+        primary.deny_recovery();
+        primary.arm_recovery();
+        primary.arm_recovery();
+        let finally_denied = lock_recovery(&primary.recovery_decision).denied;
+        primary.liveness_writer.take();
+        primary.child.wait().expect("wait owned liveness peer");
+        assert!(finally_denied, "late Ready reopened denial");
+    }
+
+    #[test]
     fn generation_host_rejects_out_of_order_revoke_before_prepare() {
         let (host, mut guardian) = std::os::unix::net::UnixStream::pair().expect("KGC1 pair");
         let (updates_tx, _updates_rx) = mpsc::channel();
@@ -3047,9 +3533,14 @@ mod tests {
                 .with_cause(RevocationCause::ChildExited),
         )
         .expect("write out-of-order revoke");
-        let error =
-            run_generation_host(host, &updates_tx, &current, &AtomicU8::new(RECOVERY_ARMED))
-                .expect_err("revoke before prepare must fail");
+        let error = run_generation_host(
+            host,
+            &updates_tx,
+            &current,
+            &Mutex::new(RecoveryState::new()),
+            None,
+        )
+        .expect_err("revoke before prepare must fail");
         assert!(
             error.to_string().contains("invalid revoke transition"),
             "{error}"
@@ -3066,11 +3557,12 @@ mod tests {
             .expect("guardian control deadline");
         let (updates_tx, updates_rx) = mpsc::channel();
         let current = Arc::new(Mutex::new(None));
-        let recovery_armed = Arc::new(AtomicU8::new(RECOVERY_ARMED));
-        let current_for_host = Arc::clone(&current);
-        let recovery_for_host = Arc::clone(&recovery_armed);
+        let recovery_armed = Arc::new(Mutex::new(RecoveryState::new()));
+        lock_recovery(&recovery_armed).arm();
+        let host_current = Arc::clone(&current);
+        let host_recovery = Arc::clone(&recovery_armed);
         let host_thread = std::thread::spawn(move || {
-            run_generation_host(host, &updates_tx, &current_for_host, &recovery_for_host)
+            run_generation_host(host, &updates_tx, &host_current, &host_recovery, None)
         });
 
         let prepared_one = guardian_exchange(
@@ -3114,6 +3606,7 @@ mod tests {
             &GenerationControlRecord::new(CONTROL_CLEAR, 1).with_pid(child_pid),
             CONTROL_CLEARED,
         );
+        lock_recovery(&recovery_armed).arm();
         guardian_exchange(
             &mut guardian,
             &GenerationControlRecord::new(CONTROL_PREPARE, 2),
@@ -3131,6 +3624,11 @@ mod tests {
             &GenerationControlRecord::new(CONTROL_CLEAR, 2),
             CONTROL_CLEARED,
         );
+        {
+            let mut recovery = lock_recovery(&recovery_armed);
+            recovery.deny();
+            recovery.shutdown_acknowledged = true;
+        }
         drop(guardian);
         host_thread
             .join()
@@ -3153,6 +3651,228 @@ mod tests {
             .position(|event| matches!(event, RoleEvent::Provisioned { attempt: 2, .. }))
             .expect("g2 Provisioned event");
         assert!(revoked < provisioned, "g2 provisioned before g1 revocation");
+    }
+
+    #[test]
+    fn unmarked_successor_preparation_errors_preserve_failed_outcome() {
+        use crate::SupervisorEvent;
+        use PreparationAttribution::{Accepted, Requested, Unattributed};
+        use io::ErrorKind::{Interrupted, InvalidData};
+
+        const DIAGNOSTIC_PHASE: &str = "macOS guardian generation control transition";
+        // Ordinary I/O kinds and public diagnostic phases do not mark an
+        // intentional runtime cancellation, even after a stop fact is set.
+        for attribution in [Accepted, Requested, Unattributed] {
+            for (phase, kind) in [
+                (DIAGNOSTIC_PHASE, Interrupted),
+                (DIAGNOSTIC_PHASE, InvalidData),
+                ("test unrelated preparation I/O", Interrupted),
+                ("test unrelated preparation I/O", InvalidData),
+            ] {
+                let (entered_tx, entered_rx) = mpsc::channel();
+                let (release_tx, release_rx) = mpsc::channel();
+                let mut command = Command::new("/bin/sh");
+                command.args([
+                    "-c",
+                    "printf KEL143_UNMARKED_G1_STDOUT; \
+                 printf KEL143_UNMARKED_G1_STDERR >&2; exit 1",
+                ]);
+                let supervisor = Supervisor::start_prepared(
+                    RestartPolicy::default(),
+                    GatedUnmarkedFailurePreparer {
+                        initial: Some(command),
+                        entered_tx,
+                        release_rx,
+                        phase,
+                        kind,
+                        owned: false,
+                    },
+                )
+                .expect("initial real child must spawn");
+                // Only attempt 2 reaches this fence, after actual G1 retirement.
+                let entered = entered_rx.recv_timeout(Duration::from_secs(5));
+                match attribution {
+                    Accepted => supervisor.accept_shutdown(),
+                    Requested => supervisor.shutdown(),
+                    Unattributed => {}
+                }
+                if entered.is_err() {
+                    supervisor.shutdown();
+                }
+                // Release before asserting so Drop cannot wait on our own gate.
+                let released = release_tx.send(());
+                drop(release_tx);
+                entered.expect("successor preparation must reach the existing trait fence");
+                released.expect("release the controlled preparation error");
+
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let terminal = loop {
+                    let remaining = deadline
+                        .checked_duration_since(Instant::now())
+                        .expect("successor preparation terminal event deadline");
+                    match supervisor.recv_event(remaining) {
+                        Some(SupervisorEvent::Started { attempt: 2, .. }) => {
+                            panic!("failed successor preparation spawned G2");
+                        }
+                        Some(
+                            event @ (SupervisorEvent::Stopped | SupervisorEvent::Failed { .. }),
+                        ) => {
+                            break event;
+                        }
+                        Some(_) => {}
+                        None => panic!("no terminal successor event for {attribution:?}/{kind:?}"),
+                    }
+                };
+                let outcome = supervisor.wait_for_outcome();
+                assert!(
+                    supervisor.current_pid().is_none(),
+                    "G2 must not remain live"
+                );
+                let ledger = supervisor.crash_ledger();
+                assert_eq!(ledger.self_termination_count, 1);
+                assert!(
+                    ledger
+                        .last_self_termination
+                        .is_some_and(|exit| exit.exit_code == Some(1)),
+                    "shutdown must preserve the already-observed G1 exit"
+                );
+                let output = supervisor.output();
+                assert!(output.stdout.contains("KEL143_UNMARKED_G1_STDOUT"));
+                assert!(output.stderr.contains("KEL143_UNMARKED_G1_STDERR"));
+                assert!(
+                    matches!(terminal, SupervisorEvent::Failed { attempt: 2 }),
+                    "unmarked error became a stop: {attribution:?}/{phase}/{kind:?}: {terminal:?}"
+                );
+                match outcome {
+                    SupervisorOutcome::Failed(RuntimeError::Lifecycle {
+                        phase: actual,
+                        source,
+                    }) => {
+                        assert_eq!(actual, phase);
+                        assert_eq!(source.kind(), kind);
+                        assert_eq!(
+                            source.to_string(),
+                            "controlled successor preparation failure"
+                        );
+                    }
+                    other => panic!("unmarked preparation failure was hidden: {other:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn owned_successor_interruption_requires_supervisor_stop_and_exact_attempt() {
+        use crate::SupervisorEvent;
+        for attribution in [
+            PreparationAttribution::Accepted,
+            PreparationAttribution::Requested,
+            PreparationAttribution::Unattributed,
+        ] {
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            let mut command = Command::new("/bin/sh");
+            command.args(["-c", "exit 1"]);
+            let supervisor = Supervisor::start_prepared(
+                RestartPolicy::default(),
+                GatedUnmarkedFailurePreparer {
+                    initial: Some(command),
+                    entered_tx,
+                    release_rx,
+                    phase: "unused marked phase",
+                    kind: io::ErrorKind::Interrupted,
+                    owned: true,
+                },
+            )
+            .expect("initial real child");
+            let entered = entered_rx.recv_timeout(Duration::from_secs(5));
+            match attribution {
+                PreparationAttribution::Accepted => supervisor.accept_shutdown(),
+                PreparationAttribution::Requested => supervisor.shutdown(),
+                PreparationAttribution::Unattributed => {}
+            }
+            if entered.is_err() {
+                supervisor.shutdown();
+            }
+            let released = release_tx.send(());
+            drop(release_tx);
+            entered.expect("actual successor preparation fence");
+            released.expect("release owned interruption");
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let terminal = loop {
+                let remaining = deadline
+                    .checked_duration_since(Instant::now())
+                    .expect("terminal event bound");
+                match supervisor.recv_event(remaining) {
+                    Some(event @ (SupervisorEvent::Stopped | SupervisorEvent::Failed { .. })) => {
+                        break event;
+                    }
+                    Some(SupervisorEvent::Started { attempt: 2, .. }) => {
+                        panic!("cancelled G2 spawned")
+                    }
+                    Some(_) => {}
+                    None => panic!("missing owned preparation terminal"),
+                }
+            };
+            let outcome = supervisor.wait_for_outcome();
+            assert!(supervisor.current_pid().is_none());
+            assert_eq!(supervisor.crash_ledger().self_termination_count, 1);
+            match attribution {
+                PreparationAttribution::Accepted | PreparationAttribution::Requested => {
+                    assert!(matches!(terminal, SupervisorEvent::Stopped));
+                    assert!(matches!(outcome, SupervisorOutcome::Stopped));
+                }
+                PreparationAttribution::Unattributed => {
+                    assert!(matches!(terminal, SupervisorEvent::Failed { attempt: 2 }));
+                    assert!(matches!(outcome, SupervisorOutcome::Failed(_)));
+                }
+            }
+        }
+        let marker = interrupted_successor_preparation(2);
+        assert!(is_owned_preparation_interruption(&marker, 2));
+        assert!(!is_owned_preparation_interruption(&marker, 1));
+        assert!(!is_owned_preparation_interruption(&marker, 3));
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum PreparationAttribution {
+        Accepted,
+        Requested,
+        Unattributed,
+    }
+
+    struct GatedUnmarkedFailurePreparer {
+        initial: Option<Command>,
+        entered_tx: mpsc::Sender<()>,
+        release_rx: mpsc::Receiver<()>,
+        phase: &'static str,
+        kind: io::ErrorKind,
+        owned: bool,
+    }
+
+    impl ChildPreparer for GatedUnmarkedFailurePreparer {
+        type Lease = crate::NoLease;
+
+        fn prepare(&mut self, attempt: u32) -> Result<PreparedChild<Self::Lease>, RuntimeError> {
+            if attempt == 1 {
+                return Ok(PreparedChild {
+                    command: self.initial.take().expect("one initial command").into(),
+                    lease: crate::NoLease,
+                });
+            }
+            assert_eq!(attempt, 2, "the failed preparation must not be retried");
+            self.entered_tx.send(()).expect("observe successor prepare");
+            self.release_rx
+                .recv()
+                .expect("controlled preparation release");
+            if self.owned {
+                return Err(interrupted_successor_preparation(attempt));
+            }
+            Err(RuntimeError::Lifecycle {
+                phase: self.phase,
+                source: io::Error::new(self.kind, "controlled successor preparation failure"),
+            })
+        }
     }
 
     fn guardian_exchange(
@@ -3902,6 +4622,1755 @@ mod tests {
         terminate_registered_group(group_pid).expect("remove writer-rejection test group");
         let group_status = group.wait().expect("wait writer-rejection test group");
         assert_eq!(group_status.signal(), Some(9));
+    }
+
+    // Root supplies an already-built Host artifact. Guardian stdout remains
+    // exclusively the existing Q/S ACK pipe, never a libtest output stream.
+    struct PersistentPrimaryFixture {
+        primary: GuardedPrimary,
+        stderr: File,
+        stage_root: std::path::PathBuf,
+    }
+
+    impl PersistentPrimaryFixture {
+        fn start() -> Self {
+            use std::os::unix::fs::MetadataExt as _;
+            // Host's existing fixture owner stages the public application and
+            // keeps its ordinary HTTP observer alive. Runtime never stages it.
+            let receipt = std::env::var_os("KELD_KEL143_FIXTURE_RECEIPT")
+                .expect("Root supplies the existing Host fixture artifact JSON");
+            let bytes = std::fs::read(receipt).expect("owned staged fixture receipt");
+            assert!(
+                !bytes.is_empty() && bytes.len() <= 8192,
+                "bounded fixture data"
+            );
+            let data: serde_json::Value = serde_json::from_slice(&bytes).expect("fixture JSON");
+            let host = data["stagedHost"]
+                .as_str()
+                .expect("exact staged Host artifact");
+            let stage = std::path::PathBuf::from(data["stageRoot"].as_str().expect("stage root"));
+            let entry = data["entryRelative"]
+                .as_str()
+                .expect("existing public app entry");
+            let retained = File::open(stage.join(entry)).expect("retain exact entry identity");
+            let identity = retained.metadata().expect("retained entry metadata");
+            let stderr = tempfile::tempfile().expect("owned guardian diagnostics");
+            let mut command = Command::new(host);
+            command
+                .arg(SUPERVISED_GUARDIAN_ARG)
+                .arg(&stage)
+                .arg(entry)
+                .arg(identity.dev().to_string())
+                .arg(identity.ino().to_string())
+                .env_remove("KELD_DEV_LEASE")
+                .process_group(0)
+                .stderr(Stdio::from(
+                    stderr.try_clone().expect("diagnostic capture clone"),
+                ));
+            let bootstrap = GuardianBootstrap::spawn_supervised(command)
+                .expect("existing supervised bootstrap");
+            drop(retained);
+            let primary = bootstrap
+                .register_guarded_primary_until(Instant::now() + GUARDIAN_SHUTDOWN_DEADLINE)
+                .expect("real authenticated guardian registration");
+            Self {
+                primary,
+                stderr,
+                stage_root: stage,
+            }
+        }
+
+        fn ready(&mut self) -> u32 {
+            let deadline = Instant::now() + GUARDIAN_SHUTDOWN_DEADLINE;
+            let bound = loop {
+                self.primary
+                    .poll_fatal()
+                    .expect("healthy real guardian before Bound");
+                if let Some(GuardedPrimaryUpdate::Bound(bound)) =
+                    self.primary.recv_update(GENERATION_CONTROL_POLL)
+                {
+                    break bound;
+                }
+                assert!(Instant::now() < deadline, "actual G1 Bound deadline");
+            };
+            assert_eq!(bound.attempt(), 1);
+            let pid = self
+                .primary
+                .group_pid()
+                .expect("actual registered G1 group");
+            let mut app = bound.into_stream();
+            let ready = keld_ipc::codec::encode(&keld_ipc::lifecycle::LifecycleEvent::Ready)
+                .expect("canonical lifecycle Ready payload");
+            self.primary.arm_recovery();
+            keld_ipc::link::write_frame(
+                &mut app,
+                keld_ipc::FrameKind::Event,
+                0,
+                keld_ipc::lifecycle::LIFECYCLE_CHANNEL,
+                keld_ipc::CorrelationId(0),
+                &ready,
+            )
+            .expect("existing actual Ready event");
+            // The host lease also retains its stream; this alias mints no
+            // process authority and no independent child/wait owner.
+            pid
+        }
+
+        fn await_cleared(&mut self) {
+            let deadline = Instant::now() + GUARDIAN_SHUTDOWN_DEADLINE;
+            let mut revoked = false;
+            loop {
+                self.primary
+                    .poll_fatal()
+                    .expect("healthy guardian during real retirement");
+                if let Some(update) = self.primary.recv_update(GENERATION_CONTROL_POLL) {
+                    match update {
+                        GuardedPrimaryUpdate::Role(RoleEvent::Revoked { attempt: 1, .. }) => {
+                            revoked = true;
+                        }
+                        GuardedPrimaryUpdate::Bound(bound) => {
+                            panic!("closed permit bound G{}", bound.attempt())
+                        }
+                        GuardedPrimaryUpdate::Role(_) => {}
+                    }
+                }
+                let recovery = lock_recovery(&self.primary.recovery_decision);
+                if revoked && recovery.cleared_attempt == Some(1) && recovery.expected_attempt == 2
+                {
+                    assert!(recovery.release_attempt.is_none());
+                    break;
+                }
+                drop(recovery);
+                assert!(
+                    Instant::now() < deadline,
+                    "actual G1 revoke/Cleared deadline"
+                );
+            }
+            assert!(self.primary.group_pid().is_none());
+        }
+
+        fn assert_live_for_budget(&mut self, phase: &str) {
+            let guardian = self.primary.guardian_pid();
+            let began = Instant::now();
+            let deadline = Instant::now() + GUARDIAN_SHUTDOWN_DEADLINE + GENERATION_CONTROL_POLL;
+            let mut observations = 0_u64;
+            // This measures survival while an owned release/EOF is withheld;
+            // it is the contract under test, not a synchronization sleep.
+            while Instant::now() < deadline {
+                self.primary
+                    .poll_fatal()
+                    .expect("persistent guardian remains healthy before host EOF");
+                assert!(
+                    self.primary
+                        .child
+                        .try_wait()
+                        .expect("owned guardian status")
+                        .is_none()
+                );
+                assert_eq!(self.primary.guardian_pid(), guardian);
+                assert!(self.primary.group_pid().is_none());
+                observations += 1;
+                if let Some(GuardedPrimaryUpdate::Bound(bound)) =
+                    self.primary.recv_update(Duration::ZERO)
+                {
+                    panic!("closed native permit bound G{}", bound.attempt());
+                }
+                std::thread::yield_now();
+            }
+            println!(
+                "KEL143_RUNTIME_LIVE phase={phase} guardian={guardian} observations={observations} elapsed_ns={} group=None",
+                began.elapsed().as_nanos()
+            );
+        }
+
+        fn diagnostics(&mut self) -> String {
+            use std::io::Seek as _;
+            self.stderr.rewind().expect("rewind owned diagnostics");
+            let mut text = String::new();
+            (&self.stderr)
+                .take(65_536)
+                .read_to_string(&mut text)
+                .expect("bounded diagnostics");
+            text
+        }
+    }
+
+    #[test]
+    #[ignore = "explicit real macOS staged Host guardian shutdown proof"]
+    fn guarded_primary_attributed_stop_keeps_guardian_live_until_host_eof() {
+        let mut fixture = PersistentPrimaryFixture::start();
+        let group = fixture.ready();
+        println!(
+            "KEL143_RUNTIME_OWNED host={} guardian={} g1_group={group}",
+            std::process::id(),
+            fixture.primary.guardian_pid()
+        );
+        fixture
+            .primary
+            .fail_current_generation(1)
+            .expect("only actual registered live G1");
+        fixture.await_cleared();
+        fixture.assert_live_for_budget("runtime-permit-held");
+        fixture
+            .primary
+            .accept_shutdown()
+            .expect("actual Q ACK before host tail");
+        let deadline = Instant::now() + GUARDIAN_SHUTDOWN_DEADLINE;
+        while fixture
+            .primary
+            .worker
+            .as_ref()
+            .is_some_and(|worker| !worker.is_finished())
+        {
+            fixture
+                .primary
+                .poll_fatal()
+                .expect("Q-attributed guardian health");
+            assert!(
+                Instant::now() < deadline,
+                "actual cancelled control EOF deadline"
+            );
+            std::thread::yield_now();
+        }
+        fixture
+            .primary
+            .join_worker()
+            .expect("attributed resource-free control EOF");
+        println!(
+            "KEL143_RUNTIME_CONTROL_EOF guardian={} ack={}",
+            fixture.primary.guardian_pid(),
+            lock_recovery(&fixture.primary.recovery_decision).shutdown_acknowledged
+        );
+        fixture.assert_live_for_budget("q-stopped-before-host-eof");
+        let status = fixture
+            .primary
+            .shutdown()
+            .expect("host EOF and exact guardian reap");
+        let diagnostics = fixture.diagnostics();
+        println!(
+            "KEL143_RUNTIME_REAP guardian={} raw_status={} group={:?}",
+            fixture.primary.guardian_pid(),
+            status.into_raw(),
+            fixture.primary.group_pid()
+        );
+        assert!(
+            status.success(),
+            "attributed guardian final status: {status:?}; {diagnostics}"
+        );
+        assert!(fixture.primary.group_pid().is_none());
+        assert!(
+            fixture
+                .primary
+                .child
+                .try_wait()
+                .expect("retained terminal status")
+                .is_some()
+        );
+        assert!(group > 1);
+        assert!(
+            !fixture.stage_root.exists(),
+            "existing guardian completed its owned stage cleanup"
+        );
+    }
+
+    #[test]
+    fn poll_fatal_rejects_owned_guardian_zero_even_after_shutdown_attribution() {
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("owned zero-status health fixture");
+        let writer = child.stdin.take().expect("owned liveness writer");
+        let ack = child.stdout.take().expect("owned acknowledgment reader");
+        let (_tx, updates_rx) = mpsc::channel();
+        let mut primary = GuardedPrimary {
+            child,
+            liveness_writer: Some(writer),
+            quit_ack_reader: ack,
+            current_generation: Arc::new(Mutex::new(None)),
+            recovery_decision: Arc::new(Mutex::new(RecoveryState::new())),
+            updates_rx,
+            worker: None,
+            shutdown_attributed: true,
+        };
+        let deadline = Instant::now() + GUARDIAN_SHUTDOWN_DEADLINE;
+        let error = loop {
+            if let Err(error) = primary.poll_fatal() {
+                break error;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "owned zero-status inspection deadline"
+            );
+            std::thread::yield_now();
+        };
+        assert!(
+            matches!(
+                error,
+                RuntimeError::GuardianExited {
+                    exit_code: Some(0),
+                    ..
+                }
+            ),
+            "attribution hid unexpected guardian zero: {error}"
+        );
+        assert!(primary.liveness_writer.is_none());
+        assert!(
+            primary
+                .child
+                .try_wait()
+                .expect("already-reaped status retained")
+                .is_some()
+        );
+    }
+
+    fn owned_acknowledgment_primary() -> GuardedPrimary {
+        // This owns a real ACK pipe peer, not a guardian/native mock claim.
+        // The staged-Host case above separately proves the actual guardian.
+        let script = r#"
+const input = Bun.stdin.stream().getReader();
+const first = await input.read();
+if (first.done || first.value.byteLength !== 1 || first.value[0] !== 81) process.exit(2);
+process.stdout.write("KQA");
+while (!(await input.read()).done) {}
+"#;
+        let mut child = Command::new("bun")
+            .args(["-e", script])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("owned Q ACK producer");
+        let writer = child.stdin.take().expect("sole Q/liveness writer");
+        let ack = child.stdout.take().expect("sole actual ACK reader");
+        let (_tx, updates_rx) = mpsc::channel();
+        GuardedPrimary {
+            child,
+            liveness_writer: Some(writer),
+            quit_ack_reader: ack,
+            current_generation: Arc::new(Mutex::new(None)),
+            recovery_decision: Arc::new(Mutex::new(RecoveryState::new())),
+            updates_rx,
+            worker: None,
+            shutdown_attributed: false,
+        }
+    }
+
+    #[test]
+    fn control_eof_acknowledgment_is_order_independent_and_attributed() {
+        for ack_first in [true, false] {
+            let (mut host, peer) = std::os::unix::net::UnixStream::pair().expect("real EOF pair");
+            let mut primary = owned_acknowledgment_primary();
+            primary.deny_recovery();
+            if ack_first {
+                primary.accept_shutdown().expect("actual Q ACK before EOF");
+            }
+            let state_for_reader = Arc::clone(&primary.recovery_decision);
+            let (observed_tx, observed_rx) = mpsc::sync_channel(1);
+            let reader = std::thread::spawn(move || {
+                let mut reader = GenerationControlReader::new();
+                let eof = reader.poll(&mut host).expect_err("actual peer EOF");
+                let ack_at_eof = lock_recovery(&state_for_reader).shutdown_acknowledged;
+                observed_tx
+                    .send(ack_at_eof)
+                    .expect("record EOF before later ACK");
+                finish_generation_control_eof(
+                    eof,
+                    reader.filled,
+                    &mut HostGenerationState::default(),
+                    &Mutex::new(None),
+                    &state_for_reader,
+                )
+            });
+            drop(peer);
+            let observed = observed_rx
+                .recv_timeout(SUPERVISED_QUIT_ACK_DEADLINE)
+                .expect("real EOF receipt");
+            if !ack_first {
+                primary
+                    .accept_shutdown()
+                    .expect("actual Q ACK after observed EOF");
+            }
+            let result = reader.join().expect("one owned EOF reader joins");
+            let status = primary.shutdown().expect("ACK peer EOF and owned reap");
+            println!(
+                "KEL143_RUNTIME_ACK_EOF ack_first={ack_first} ack_at_eof={observed} peer_status={status:?}"
+            );
+            assert_eq!(observed, ack_first);
+            result.expect("either ordered actual EOF/ACK completes cleanly");
+            assert!(status.success());
+        }
+    }
+
+    #[test]
+    fn control_eof_without_ack_cannot_succeed_from_denial() {
+        let (mut host, peer) = std::os::unix::net::UnixStream::pair().expect("real EOF pair");
+        drop(peer);
+        let mut reader = GenerationControlReader::new();
+        let eof = reader.poll(&mut host).expect_err("real peer EOF");
+        let recovery = Mutex::new(RecoveryState::new());
+        lock_recovery(&recovery).deny();
+        let began = Instant::now();
+        let error = finish_generation_control_eof(
+            eof,
+            reader.filled,
+            &mut HostGenerationState::default(),
+            &Mutex::new(None),
+            &recovery,
+        )
+        .expect_err("denial alone cannot fabricate Q ACK");
+        assert!(
+            began.elapsed() >= SUPERVISED_QUIT_ACK_DEADLINE,
+            "existing attribution budget was lost"
+        );
+        assert_eq!(runtime_io_kind(&error), Some(io::ErrorKind::UnexpectedEof));
+    }
+
+    #[test]
+    fn real_control_eof_preserves_partial_and_unattributed_failures() {
+        for partial in [false, true] {
+            let (mut host, mut peer) =
+                std::os::unix::net::UnixStream::pair().expect("real EOF pair");
+            if partial {
+                let mut encoded = Vec::new();
+                write_generation_control(
+                    &mut encoded,
+                    &GenerationControlRecord::new(CONTROL_CLEAR, 1),
+                )
+                .expect("canonical fixed record");
+                peer.write_all(&encoded[..1]).expect("actual partial input");
+            }
+            drop(peer);
+            let mut reader = GenerationControlReader::new();
+            let eof = reader
+                .poll(&mut host)
+                .expect_err("actual partial/unattributed EOF");
+            assert_eq!(reader.filled, usize::from(partial));
+            let recovery = Mutex::new(RecoveryState::new());
+            if partial {
+                let mut recovery = lock_recovery(&recovery);
+                recovery.deny();
+                recovery.shutdown_acknowledged = true;
+            }
+            let error = finish_generation_control_eof(
+                eof,
+                reader.filled,
+                &mut HostGenerationState::default(),
+                &Mutex::new(None),
+                &recovery,
+            )
+            .expect_err("unowned/partial closure remains fatal");
+            assert_eq!(runtime_io_kind(&error), Some(io::ErrorKind::UnexpectedEof));
+        }
+    }
+
+    #[test]
+    fn successor_prepare_zero_byte_reply_wait_outlives_transition_budget() {
+        let (client, mut peer) = std::os::unix::net::UnixStream::pair().expect("real control pair");
+        client
+            .set_read_timeout(Some(GENERATION_CONTROL_POLL))
+            .expect("existing read poll");
+        client
+            .set_write_timeout(Some(GENERATION_CONTROL_POLL))
+            .expect("existing write poll");
+        peer.set_read_timeout(Some(GUARDIAN_SHUTDOWN_DEADLINE))
+            .expect("bounded request receipt");
+        peer.set_write_timeout(Some(GENERATION_CONTROL_POLL))
+            .expect("existing reply write poll");
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let client_thread = std::thread::spawn(move || {
+            let control = Arc::new(Mutex::new(GenerationControlPeer {
+                stream: client,
+                reader: GenerationControlReader::new(),
+            }));
+            let result = control_exchange(
+                &control,
+                &GenerationControlRecord::new(CONTROL_PREPARE, 2),
+                CONTROL_PREPARED,
+                2,
+            );
+            let _ = result_tx.send(result);
+        });
+        let request = read_generation_control(&mut peer);
+        let began = Instant::now();
+        let release_at = began + GUARDIAN_SHUTDOWN_DEADLINE + Duration::from_secs(1);
+        let mut early = None;
+        let mut disconnected = false;
+        if request.is_ok() {
+            // The request receipt, not a guessed startup delay, starts this
+            // independent measured interval. No reply bytes exist before release.
+            while Instant::now() < release_at {
+                match result_rx.try_recv() {
+                    Ok(result) => {
+                        early = Some(result);
+                        break;
+                    }
+                    Err(mpsc::TryRecvError::Empty) => std::thread::yield_now(),
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                }
+            }
+        }
+        let held = began.elapsed();
+        let reply = GenerationControlRecord::new(CONTROL_PREPARED, 2)
+            .with_payload(b"test-prepared-reply".to_vec());
+        let written = if request.is_ok() && early.is_none() && !disconnected {
+            Some(write_generation_control(&mut peer, &reply))
+        } else {
+            None
+        };
+        let terminal = if written.as_ref().is_some_and(Result::is_ok) {
+            Some(result_rx.recv_timeout(GUARDIAN_SHUTDOWN_DEADLINE))
+        } else {
+            None
+        };
+        // Closing the retained peer makes every unfinished read observe real
+        // EOF. Join before the first assertion, including early-error schedules.
+        drop(peer);
+        let joined = client_thread.join();
+        println!(
+            "KEL143_ZERO_BYTE held_ns={} early={early:?} disconnected={disconnected} written={written:?} terminal={terminal:?}",
+            held.as_nanos()
+        );
+        joined.expect("sole control reader joined");
+        let request = request.expect("actual complete Prepare2 receipt");
+        assert_eq!(request.kind, CONTROL_PREPARE);
+        assert_eq!(request.attempt, 2);
+        assert_eq!(request.pid, 0);
+        assert_eq!(request.cause, 0);
+        assert_eq!(request.payload, Vec::<u8>::new());
+        assert!(
+            early.is_none() && !disconnected,
+            "zero-byte successor completed before owned reply release: {early:?}"
+        );
+        assert!(held >= GUARDIAN_SHUTDOWN_DEADLINE + Duration::from_secs(1));
+        written
+            .expect("one owned response release")
+            .expect("complete canonical Prepared2 write");
+        let response = terminal
+            .expect("post-release result")
+            .expect("bounded result collection")
+            .expect("actual successor exchange succeeded");
+        assert_eq!(response.kind, CONTROL_PREPARED);
+        assert_eq!(response.attempt, 2);
+        assert_eq!(response.pid, 0);
+        assert_eq!(response.cause, 0);
+        assert_eq!(response.payload, reply.payload);
+    }
+
+    struct TerminalLivenessReadProbe<'a> {
+        reader: File,
+        supervisor: &'a Supervisor,
+        observed: mpsc::SyncSender<(bool, u32)>,
+        terminal_reads: u32,
+        reported: bool,
+    }
+
+    impl Read for TerminalLivenessReadProbe<'_> {
+        fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+            let flags = fcntl(self.reader.as_fd(), FcntlArg::F_GETFL).map_err(nix_io_error)?;
+            let nonblocking = OFlag::from_bits_truncate(flags).contains(OFlag::O_NONBLOCK);
+            if self
+                .supervisor
+                .thread
+                .as_ref()
+                .is_some_and(JoinHandle::is_finished)
+            {
+                self.terminal_reads = self.terminal_reads.saturating_add(1);
+            }
+            if !self.reported && (!nonblocking || self.terminal_reads >= 64) {
+                let _ = self.observed.send((nonblocking, self.terminal_reads));
+                self.reported = true;
+            }
+            self.reader.read(bytes)
+        }
+    }
+
+    impl AsFd for TerminalLivenessReadProbe<'_> {
+        fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+            self.reader.as_fd()
+        }
+    }
+
+    fn run_terminal_liveness_probe(
+        mut reader: File,
+        mut acknowledgment: std::os::unix::net::UnixStream,
+        entered: mpsc::Sender<()>,
+        release: mpsc::Receiver<()>,
+        observed: mpsc::SyncSender<(bool, u32)>,
+        initialized: &mpsc::SyncSender<()>,
+    ) -> (Result<(), RuntimeError>, bool, bool, SupervisorOutcome, u32) {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "exit 1"]);
+        let supervisor = Supervisor::start_prepared(
+            RestartPolicy::default(),
+            GatedUnmarkedFailurePreparer {
+                initial: Some(command),
+                entered_tx: entered,
+                release_rx: release,
+                phase: "unused marked phase",
+                kind: io::ErrorKind::Interrupted,
+                owned: true,
+            },
+        )
+        .expect("real controlled Supervisor child");
+        validate_liveness_bootstrap(&mut reader).expect("actual live owned pipe");
+        set_liveness_nonblocking(&reader, true).expect("existing active-loop descriptor mode");
+        initialized
+            .send(())
+            .expect("descriptor validation precedes actual Q");
+        let mut probe = TerminalLivenessReadProbe {
+            reader,
+            supervisor: &supervisor,
+            observed,
+            terminal_reads: 0,
+            reported: false,
+        };
+        let (result, accepted, dead) = await_guarded_primary_liveness(
+            &mut probe,
+            &supervisor,
+            &mut acknowledgment,
+            &AtomicBool::new(false),
+            &AtomicBool::new(false),
+        );
+        drop(probe);
+        let outcome = supervisor.wait_for_outcome();
+        let terminations = supervisor.crash_ledger().self_termination_count;
+        (result, accepted, dead, outcome, terminations)
+    }
+
+    #[test]
+    fn attributed_stopped_liveness_wait_blocks_on_owned_descriptor() {
+        let (reader, mut writer) = liveness_pipe();
+        let (acknowledgment, mut ack_reader) =
+            std::os::unix::net::UnixStream::pair().expect("actual Q ACK pair");
+        ack_reader
+            .set_read_timeout(Some(SUPERVISED_QUIT_ACK_DEADLINE))
+            .expect("existing acknowledgment kill switch");
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (observed_tx, observed_rx) = mpsc::sync_channel(1);
+        let (initialized_tx, initialized_rx) = mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            run_terminal_liveness_probe(
+                reader,
+                acknowledgment,
+                entered_tx,
+                release_rx,
+                observed_tx,
+                &initialized_tx,
+            )
+        });
+        let initialized = initialized_rx.recv_timeout(GUARDIAN_SHUTDOWN_DEADLINE);
+        let entered = entered_rx.recv_timeout(GUARDIAN_SHUTDOWN_DEADLINE);
+        let write = if initialized.is_ok() && entered.is_ok() {
+            writer.write_all(&[SUPERVISED_QUIT_ACCEPTED])
+        } else {
+            Err(io::Error::other(
+                "controlled preparation did not reach attempt2",
+            ))
+        };
+        let mut ack = [0_u8; 3];
+        let acknowledged = if write.is_ok() {
+            ack_reader.read_exact(&mut ack)
+        } else {
+            Err(io::Error::other("Q was not written"))
+        };
+        // Release only after the actual ACK cut; always release during failed
+        // collection so no assertion strands the owned preparer or pipe read.
+        let released = release_tx.send(());
+        drop(release_tx);
+        let observation = if acknowledged.is_ok() {
+            observed_rx.recv_timeout(GUARDIAN_SHUTDOWN_DEADLINE)
+        } else {
+            Err(mpsc::RecvTimeoutError::Disconnected)
+        };
+        drop(writer);
+        let joined = worker.join();
+        println!(
+            "KEL143_TERMINAL_WAIT acknowledged={acknowledged:?} ack={ack:?} observation={observation:?}"
+        );
+        initialized.expect("actual descriptor validation/mode setup");
+        entered.expect("actual retired G1/attempt2 fence");
+        write.expect("actual Q byte");
+        acknowledged.expect("actual Q ACK bytes");
+        released.expect("owned interruption release");
+        let (nonblocking, terminal_reads) = observation.expect("bounded terminal wait witness");
+        let (result, accepted, dead, outcome, terminations) = joined.expect("all owners joined");
+        result.expect("actual host EOF completes liveness wait");
+        assert_eq!(ack, SUPERVISED_QUIT_ACK);
+        assert!(accepted && dead);
+        assert!(matches!(outcome, SupervisorOutcome::Stopped));
+        assert_eq!(terminations, 1, "retained actual G1 exit fact");
+        assert!(
+            !nonblocking,
+            "terminal loop remained nonblocking after sender exit; reads={terminal_reads}"
+        );
+        assert!(
+            terminal_reads < 64,
+            "terminal disconnected-event loop repeated reads"
+        );
+    }
+
+    // Existing approved KEL-143 §7 schedules. This test relay copies exact
+    // private records; run_generation_host remains the actual mint/lease owner.
+    mod runtime_race_validation {
+        use super::*;
+        use std::net::Shutdown;
+        use std::os::unix::net::UnixStream;
+        use std::sync::TryLockError;
+
+        const COLLECTION: Duration = Duration::from_secs(7);
+
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        enum DeliveryCut {
+            Zero,
+            Partial,
+            FullBeforeLease,
+            LeaseBeforeSpawn,
+        }
+
+        enum RelayCommand {
+            Full,
+            Prefix,
+            AwaitClosure,
+        }
+
+        #[derive(Debug, PartialEq, Eq)]
+        struct ControlFields {
+            kind: u8,
+            cause: u8,
+            attempt: u32,
+            pid: u32,
+            payload_len: usize,
+        }
+
+        impl ControlFields {
+            fn capture(record: &GenerationControlRecord) -> Self {
+                Self {
+                    kind: record.kind,
+                    cause: record.cause,
+                    attempt: record.attempt,
+                    pid: record.pid,
+                    payload_len: record.payload.len(),
+                }
+            }
+        }
+
+        enum RelayReceipt {
+            ClearedOne,
+            PreparedTwo(GenerationControlRecord),
+            PrefixSent(Instant),
+            NormalRevokeTwo {
+                request: ControlFields,
+                response: ControlFields,
+            },
+            NormalClearTwo {
+                request: ControlFields,
+                response: ControlFields,
+            },
+            GuardianControlEof,
+        }
+
+        struct PhaseGate {
+            entered: Sender<()>,
+            release: Receiver<()>,
+        }
+
+        impl PhaseGate {
+            fn wait(&self) -> Result<(), RuntimeError> {
+                self.entered.send(()).map_err(|_| {
+                    lifecycle_error(
+                        "test Runtime phase receipt",
+                        io::Error::other("custodian ended"),
+                    )
+                })?;
+                self.release.recv_timeout(COLLECTION).map_err(|source| {
+                    lifecycle_error("test Runtime phase release", io::Error::other(source))
+                })
+            }
+        }
+
+        struct ReturnedLeasePreparer<C> {
+            inner: GuardedPrimaryPreparer<C>,
+            gate: Option<PhaseGate>,
+        }
+
+        impl<C> ChildPreparer for ReturnedLeasePreparer<C>
+        where
+            C: FnMut(&str) -> Result<Command, RuntimeError> + Send + 'static,
+        {
+            type Lease = GuardedPrimaryLease;
+
+            fn prepare(
+                &mut self,
+                attempt: u32,
+            ) -> Result<PreparedChild<Self::Lease>, RuntimeError> {
+                let prepared = self.inner.prepare(attempt)?;
+                // This receipt follows actual GuardedPrimaryLease construction.
+                // It does not replace that lease or call another spawn owner.
+                if attempt == 2
+                    && let Some(gate) = &self.gate
+                {
+                    gate.wait()?;
+                }
+                Ok(prepared)
+            }
+        }
+
+        fn timed_pair() -> (UnixStream, UnixStream) {
+            let (one, two) = UnixStream::pair().expect("existing private Unix pair");
+            for stream in [&one, &two] {
+                stream
+                    .set_read_timeout(Some(GENERATION_CONTROL_POLL))
+                    .expect("read poll");
+                stream
+                    .set_write_timeout(Some(GENERATION_CONTROL_POLL))
+                    .expect("write poll");
+            }
+            (one, two)
+        }
+
+        fn receive_record(
+            stream: &mut UnixStream,
+        ) -> Result<GenerationControlRecord, RuntimeError> {
+            let mut reader = GenerationControlReader::new();
+            let deadline = Instant::now() + COLLECTION;
+            loop {
+                if let Some(record) = reader.poll(stream)? {
+                    return Ok(record);
+                }
+                if Instant::now() >= deadline {
+                    return Err(lifecycle_error(
+                        "test Runtime record collection",
+                        io::Error::from(io::ErrorKind::TimedOut),
+                    ));
+                }
+            }
+        }
+
+        fn private_record_relay(
+            mut host: UnixStream,
+            mut guardian: UnixStream,
+            commands: &Receiver<RelayCommand>,
+            receipts: &Sender<RelayReceipt>,
+        ) -> Result<(), RuntimeError> {
+            loop {
+                let request = match receive_record(&mut guardian) {
+                    Ok(record) => record,
+                    Err(error) if runtime_io_kind(&error) == Some(io::ErrorKind::UnexpectedEof) => {
+                        // Actual preparer/Supervisor control closure drives the
+                        // real host owner EOF; the relay fabricates no record.
+                        receipts
+                            .send(RelayReceipt::GuardianControlEof)
+                            .map_err(|_| {
+                                lifecycle_error(
+                                    "test relay actual EOF receipt",
+                                    io::Error::other("custodian ended"),
+                                )
+                            })?;
+                        return host.shutdown(Shutdown::Both).map_err(|source| {
+                            lifecycle_error("test relay observed control closure", source)
+                        });
+                    }
+                    Err(error) => return Err(error),
+                };
+                write_generation_control(&mut host, &request)?;
+                let response = receive_record(&mut host)?;
+                if response.kind == CONTROL_PREPARED && response.attempt == 2 {
+                    let mut encoded = Vec::new();
+                    write_generation_control(&mut encoded, &response)?;
+                    receipts
+                        .send(RelayReceipt::PreparedTwo(response))
+                        .map_err(|_| {
+                            lifecycle_error(
+                                "test relay Prepared receipt",
+                                io::Error::other("custodian ended"),
+                            )
+                        })?;
+                    match commands.recv_timeout(COLLECTION).map_err(|source| {
+                        lifecycle_error("test relay delivery release", io::Error::other(source))
+                    })? {
+                        RelayCommand::Full => guardian.write_all(&encoded).map_err(|source| {
+                            lifecycle_error("test relay complete Prepared write", source)
+                        })?,
+                        RelayCommand::Prefix => {
+                            // One canonical byte is a valid prefix, not a
+                            // malformed substitute response or model timeout.
+                            let began = Instant::now();
+                            guardian.write_all(&encoded[..1]).map_err(|source| {
+                                lifecycle_error("test relay Prepared prefix write", source)
+                            })?;
+                            receipts
+                                .send(RelayReceipt::PrefixSent(began))
+                                .map_err(|_| {
+                                    lifecycle_error(
+                                        "test relay prefix receipt",
+                                        io::Error::other("custodian ended"),
+                                    )
+                                })?;
+                            match commands.recv_timeout(COLLECTION).map_err(|source| {
+                                lifecycle_error(
+                                    "test relay partial outcome collection",
+                                    io::Error::other(source),
+                                )
+                            })? {
+                                RelayCommand::AwaitClosure => {}
+                                RelayCommand::Full | RelayCommand::Prefix => {
+                                    return Err(lifecycle_error(
+                                        "test relay prefix command",
+                                        io::Error::other("unexpected duplicate delivery"),
+                                    ));
+                                }
+                            }
+                        }
+                        RelayCommand::AwaitClosure => {}
+                    }
+                } else {
+                    write_generation_control(&mut guardian, &response)?;
+                    // These facts come from the actual requests and actual
+                    // host replies, not the shared Revoked event that EOF can
+                    // also emit. Normal lease cleanup must earn its own oracle.
+                    let receipt = match (request.kind, request.attempt) {
+                        (CONTROL_REVOKE, 2) => Some(RelayReceipt::NormalRevokeTwo {
+                            request: ControlFields::capture(&request),
+                            response: ControlFields::capture(&response),
+                        }),
+                        (CONTROL_CLEAR, 2) => Some(RelayReceipt::NormalClearTwo {
+                            request: ControlFields::capture(&request),
+                            response: ControlFields::capture(&response),
+                        }),
+                        _ => None,
+                    };
+                    if let Some(receipt) = receipt {
+                        receipts.send(receipt).map_err(|_| {
+                            lifecycle_error(
+                                "test relay normal cleanup receipt",
+                                io::Error::other("custodian ended"),
+                            )
+                        })?;
+                    }
+                    if response.kind == CONTROL_CLEARED && response.attempt == 1 {
+                        receipts.send(RelayReceipt::ClearedOne).map_err(|_| {
+                            lifecycle_error(
+                                "test relay Clear receipt",
+                                io::Error::other("custodian ended"),
+                            )
+                        })?;
+                    }
+                }
+            }
+        }
+
+        // Test control custody only. The actual production host owner remains
+        // run_generation_host; the relay never mints or chooses authority.
+        struct ControlPlane {
+            host: Option<JoinHandle<Result<(), RuntimeError>>>,
+            relay: Option<JoinHandle<Result<(), RuntimeError>>>,
+            commands: Sender<RelayCommand>,
+            receipts: Receiver<RelayReceipt>,
+            recovery: Arc<Mutex<RecoveryState>>,
+            updates: Receiver<GuardedPrimaryUpdate>,
+            consumption_probe: Option<UnixStream>,
+            current: Arc<Mutex<Option<RegisteredPrimaryGeneration>>>,
+            guardian_control: Option<UnixStream>,
+        }
+
+        impl ControlPlane {
+            fn start(cut: DeliveryCut) -> Self {
+                let (host_control, relay_host) = timed_pair();
+                let (guardian_control, relay_guardian) = timed_pair();
+                // This clone observes FIONREAD only, never consumes bytes.
+                // It is dropped before cancellation/EOF to preserve custody.
+                let consumption_probe = (cut == DeliveryCut::Partial).then(|| {
+                    guardian_control
+                        .try_clone()
+                        .expect("sole-consumer observation alias")
+                });
+                let (updates_tx, updates) = mpsc::channel();
+                let current = Arc::new(Mutex::new(None));
+                let recovery = Arc::new(Mutex::new(RecoveryState::new()));
+                lock_recovery(&recovery).arm();
+                let host_current = Arc::clone(&current);
+                let host_recovery = Arc::clone(&recovery);
+                let host = thread::spawn(move || {
+                    run_generation_host(
+                        host_control,
+                        &updates_tx,
+                        &host_current,
+                        &host_recovery,
+                        None,
+                    )
+                });
+                let (commands, commands_rx) = mpsc::channel();
+                let (receipts_tx, receipts) = mpsc::channel();
+                let relay = thread::spawn(move || {
+                    private_record_relay(relay_host, relay_guardian, &commands_rx, &receipts_tx)
+                });
+                Self {
+                    host: Some(host),
+                    relay: Some(relay),
+                    commands,
+                    receipts,
+                    recovery,
+                    updates,
+                    consumption_probe,
+                    current,
+                    guardian_control: Some(guardian_control),
+                }
+            }
+        }
+
+        impl Drop for ControlPlane {
+            fn drop(&mut self) {
+                lock_recovery(&self.recovery).deny();
+                self.consumption_probe.take();
+                if let Some(stream) = self.guardian_control.take() {
+                    let _ = stream.shutdown(Shutdown::Both);
+                }
+                for worker in [self.relay.take(), self.host.take()].into_iter().flatten() {
+                    match worker.join() {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => eprintln!("KEL143_RACE_RESCUE owner error: {error}"),
+                        Err(error) => eprintln!("KEL143_RACE_RESCUE thread panic: {error:?}"),
+                    }
+                }
+            }
+        }
+
+        fn await_initial_registration(
+            supervisor: &Supervisor,
+            current: &Mutex<Option<RegisteredPrimaryGeneration>>,
+        ) -> u32 {
+            let pid = match supervisor.recv_event(COLLECTION) {
+                Some(crate::SupervisorEvent::Started { pid, attempt: 1 }) => pid,
+                Some(event) => panic!("unexpected initial enrollment event: {event:?}"),
+                None => panic!("actual initial group registration absent"),
+            };
+            assert_eq!(
+                lock_generation(current).map(|generation| generation.group_pid),
+                Some(pid)
+            );
+            pid
+        }
+
+        struct CutFixture {
+            supervisor: Option<Supervisor>,
+            plane: ControlPlane,
+            phase_entered: Receiver<()>,
+            phase_release: Sender<()>,
+            cancelled: Arc<AtomicBool>,
+            no_effect: tempfile::TempDir,
+            initial_pid: u32,
+        }
+
+        impl CutFixture {
+            fn start(cut: DeliveryCut) -> Self {
+                let mut plane = ControlPlane::start(cut);
+                let guardian_control = plane
+                    .guardian_control
+                    .take()
+                    .expect("one guardian private stream");
+                let (phase_tx, phase_entered) = mpsc::channel();
+                let (phase_release, phase_rx) = mpsc::channel();
+                let mut factory_gate = None;
+                let mut lease_gate = None;
+                match cut {
+                    DeliveryCut::FullBeforeLease => {
+                        factory_gate = Some(PhaseGate {
+                            entered: phase_tx,
+                            release: phase_rx,
+                        });
+                    }
+                    DeliveryCut::LeaseBeforeSpawn => {
+                        lease_gate = Some(PhaseGate {
+                            entered: phase_tx,
+                            release: phase_rx,
+                        });
+                    }
+                    DeliveryCut::Zero | DeliveryCut::Partial => {}
+                }
+                let no_effect = tempfile::tempdir().expect("owned successor no-effect sentinel");
+                let successor_effect = no_effect.path().join("unexpected-g2-effect");
+                let initial_release = no_effect.path().join("g1-release");
+                let initial_release_for_child = initial_release.clone();
+                let mut calls = 0;
+                let command_factory = move |_app_link: &str| {
+                    calls += 1;
+                    let mut command = Command::new("/bin/sh");
+                    if calls == 1 {
+                        command.args([
+                            "-c",
+                            "printf KEL143_RACE_G1; while [ ! -e \"$1\" ]; do :; done; exit 1",
+                            "keld-race",
+                        ]);
+                        command.arg(&initial_release_for_child);
+                    } else {
+                        if let Some(gate) = &factory_gate {
+                            gate.wait()?;
+                        }
+                        command.args([
+                            "-c",
+                            "printf KEL143_RACE_BAD_G2; printf bad > \"$1\"; exit 0",
+                            "keld-race",
+                        ]);
+                        command.arg(&successor_effect);
+                    }
+                    Ok(command)
+                };
+                let cancelled = Arc::new(AtomicBool::new(false));
+                let supervisor = Supervisor::start_prepared(
+                    RestartPolicy::default(),
+                    ReturnedLeasePreparer {
+                        inner: GuardedPrimaryPreparer {
+                            command_factory,
+                            control: Arc::new(Mutex::new(GenerationControlPeer {
+                                stream: guardian_control,
+                                reader: GenerationControlReader::new(),
+                            })),
+                            host_unavailable: Arc::new(AtomicBool::new(false)),
+                            preparation_cancelled: Arc::clone(&cancelled),
+                        },
+                        gate: lease_gate,
+                    },
+                )
+                .expect("real initial Supervisor child with actual guarded preparation");
+                // Startup spawn precedes group enrollment. The production
+                // Started receipt follows actual child_spawned/host enrollment.
+                let initial_pid = await_initial_registration(&supervisor, &plane.current);
+                std::fs::write(initial_release, b"release-g1")
+                    .expect("release actual registered G1");
+                Self {
+                    supervisor: Some(supervisor),
+                    plane,
+                    phase_entered,
+                    phase_release,
+                    cancelled,
+                    no_effect,
+                    initial_pid,
+                }
+            }
+
+            fn release_after_clear(&self) -> GenerationControlRecord {
+                assert!(matches!(
+                    self.plane
+                        .receipts
+                        .recv_timeout(COLLECTION)
+                        .expect("actual Clear1"),
+                    RelayReceipt::ClearedOne
+                ));
+                assert!(lock_generation(&self.plane.current).is_none());
+                lock_recovery(&self.plane.recovery).arm();
+                match self
+                    .plane
+                    .receipts
+                    .recv_timeout(COLLECTION)
+                    .expect("actual host Prepared2 emission")
+                {
+                    RelayReceipt::PreparedTwo(record) => record,
+                    _ => panic!("unexpected protocol receipt before Prepared2"),
+                }
+            }
+
+            fn accept_actual_q(&self) {
+                lock_recovery(&self.plane.recovery).deny();
+                let (mut reader, mut writer) = liveness_pipe();
+                validate_liveness_bootstrap(&mut reader).expect("owned validated liveness pipe");
+                set_liveness_nonblocking(&reader, true).expect("active liveness poll");
+                let (mut ack_writer, mut ack_reader) = timed_pair();
+                writer
+                    .write_all(&[SUPERVISED_QUIT_ACCEPTED])
+                    .expect("actual Q byte");
+                let mut quit = false;
+                let mut orderly = false;
+                assert!(
+                    !observe_guarded_liveness(
+                        &mut reader,
+                        self.supervisor.as_ref().expect("Supervisor owner"),
+                        &mut quit,
+                        &mut orderly,
+                        &mut ack_writer,
+                        &self.cancelled
+                    )
+                    .expect("existing guardian Q handling")
+                );
+                let mut bytes = [0; 3];
+                ack_reader
+                    .read_exact(&mut bytes)
+                    .expect("actual KQA receipt");
+                assert_eq!(bytes, *b"KQA");
+                assert!(quit && !orderly);
+                lock_recovery(&self.plane.recovery).shutdown_acknowledged = true;
+            }
+
+            fn collect(
+                mut self,
+                cut: DeliveryCut,
+                response: &GenerationControlRecord,
+                began: Option<Instant>,
+            ) {
+                // All releases/joins precede assertions. The fixture Drop also
+                // releases every fence on failed collection or an unwind.
+                let supervisor = self.supervisor.as_ref().expect("Supervisor owner");
+                let (terminal, started_two) = collect_terminal_event(supervisor);
+                let outcome = supervisor.wait_for_outcome();
+                let current_pid = supervisor.current_pid();
+                let ledger = supervisor.crash_ledger();
+                let output = supervisor.output();
+                // wait_for_outcome observes completion; dropping this sole
+                // Supervisor joins its actual direct child/capture owner.
+                drop(self.supervisor.take());
+                let relay = self
+                    .plane
+                    .relay
+                    .take()
+                    .expect("one relay")
+                    .join()
+                    .expect("relay thread joins");
+                let host = self
+                    .plane
+                    .host
+                    .take()
+                    .expect("one actual host owner")
+                    .join()
+                    .expect("host thread joins");
+                let updates: Vec<_> = self.plane.updates.try_iter().collect();
+                let cleanup_receipts: Vec<_> = self.plane.receipts.try_iter().collect();
+                let (endpoint, _) = parse_app_link(
+                    std::str::from_utf8(&response.payload).expect("actual app link UTF8"),
+                )
+                .expect("actual minted locator");
+                let endpoint_gone = UnixStream::connect(endpoint).is_err();
+                let no_effect = !self.no_effect.path().join("unexpected-g2-effect").exists();
+                relay.expect("real control EOF forwarded after guardian-side owner drop");
+                host.expect("actual exact host lease cleanup completed before EOF success");
+                assert!(!started_two && current_pid.is_none());
+                assert!(lock_generation(&self.plane.current).is_none());
+                assert_eq!(ledger.self_termination_count, 1);
+                assert_eq!(
+                    ledger.last_self_termination.map(|entry| entry.pid),
+                    Some(self.initial_pid)
+                );
+                assert_gone(Some(self.initial_pid));
+                assert!(
+                    ledger
+                        .last_self_termination
+                        .is_some_and(|entry| entry.exit_code == Some(1))
+                );
+                assert!(output.stdout.contains("KEL143_RACE_G1"));
+                assert!(!output.stdout.contains("KEL143_RACE_BAD_G2") && no_effect);
+                assert!(updates.iter().any(|update| matches!(
+                    update,
+                    GuardedPrimaryUpdate::Role(RoleEvent::Provisioned { attempt: 2, .. })
+                )));
+                assert!(updates.iter().any(|update| matches!(
+                    update,
+                    GuardedPrimaryUpdate::Role(RoleEvent::Revoked {
+                        attempt: 2,
+                        cause: crate::role::RoleRevocationCause::Shutdown,
+                        ..
+                    })
+                )));
+                assert!(!updates.iter().any(|update| matches!(update, GuardedPrimaryUpdate::Bound(bound) if bound.attempt() == 2)));
+                assert!(!updates.iter().any(|update| matches!(
+                    update,
+                    GuardedPrimaryUpdate::Role(
+                        RoleEvent::Spawned { attempt: 2, .. }
+                            | RoleEvent::LinkBound { attempt: 2, .. }
+                    )
+                )));
+                assert!(endpoint_gone, "exact minted successor listener survived");
+                assert_cleanup_route(cut, &cleanup_receipts);
+                assert_cut_outcome(cut, &terminal, &outcome, began);
+                println!(
+                    "KEL143_PREPARED_CUT cut={cut:?} actual_mint=true q_ack=true exact_revoked=2 listener_absent={endpoint_gone} g2_effect_absent={no_effect} direct_child_reaped=true"
+                );
+            }
+        }
+
+        fn assert_cleanup_route(cut: DeliveryCut, receipts: &[RelayReceipt]) {
+            let revokes: Vec<_> = receipts
+                .iter()
+                .enumerate()
+                .filter_map(|(index, receipt)| match receipt {
+                    RelayReceipt::NormalRevokeTwo { request, response } => {
+                        Some((index, request, response))
+                    }
+                    _ => None,
+                })
+                .collect();
+            let clears: Vec<_> = receipts
+                .iter()
+                .enumerate()
+                .filter_map(|(index, receipt)| match receipt {
+                    RelayReceipt::NormalClearTwo { request, response } => {
+                        Some((index, request, response))
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                receipts
+                    .iter()
+                    .filter(|receipt| matches!(receipt, RelayReceipt::GuardianControlEof))
+                    .count(),
+                1,
+                "actual guardian control EOF absent/duplicated"
+            );
+            if matches!(
+                cut,
+                DeliveryCut::FullBeforeLease | DeliveryCut::LeaseBeforeSpawn
+            ) {
+                assert_eq!(
+                    revokes.len(),
+                    1,
+                    "normal lease Revoke2 request/ack missing or duplicated"
+                );
+                assert_eq!(
+                    clears.len(),
+                    1,
+                    "normal lease Clear2 request/ack missing or duplicated"
+                );
+                // Literal approved private wire fields are an independent
+                // oracle; changing production constants cannot change these.
+                let expected = [
+                    ControlFields {
+                        kind: 5,
+                        cause: 2,
+                        attempt: 2,
+                        pid: 0,
+                        payload_len: 0,
+                    },
+                    ControlFields {
+                        kind: 6,
+                        cause: 0,
+                        attempt: 2,
+                        pid: 0,
+                        payload_len: 0,
+                    },
+                    ControlFields {
+                        kind: 7,
+                        cause: 0,
+                        attempt: 2,
+                        pid: 0,
+                        payload_len: 0,
+                    },
+                    ControlFields {
+                        kind: 8,
+                        cause: 0,
+                        attempt: 2,
+                        pid: 0,
+                        payload_len: 0,
+                    },
+                ];
+                let actual = [revokes[0].1, revokes[0].2, clears[0].1, clears[0].2];
+                assert_eq!(
+                    actual,
+                    [&expected[0], &expected[1], &expected[2], &expected[3]]
+                );
+                assert!(
+                    revokes[0].0 < clears[0].0,
+                    "normal Clear2 acknowledgment preceded Revoke2 acknowledgment"
+                );
+            } else {
+                assert!(
+                    revokes.is_empty(),
+                    "unclaimed zero/partial cut acquired normal Revoke2 path"
+                );
+                assert!(
+                    clears.is_empty(),
+                    "unclaimed zero/partial cut acquired normal Clear2 path"
+                );
+                // Together with the separately asserted exact host-owned
+                // Revoked2/Shutdown and successful host join, actual EOF plus
+                // absent normal exchanges identifies the host EOF cleanup.
+            }
+        }
+
+        fn collect_terminal_event(supervisor: &Supervisor) -> (crate::SupervisorEvent, bool) {
+            let deadline = Instant::now() + COLLECTION;
+            let mut started_two = false;
+            let terminal = loop {
+                let remaining = deadline
+                    .checked_duration_since(Instant::now())
+                    .expect("bounded terminal event collection");
+                match supervisor.recv_event(remaining) {
+                    Some(crate::SupervisorEvent::Started { attempt: 2, .. }) => started_two = true,
+                    Some(
+                        event @ (crate::SupervisorEvent::Stopped
+                        | crate::SupervisorEvent::Failed { .. }),
+                    ) => break event,
+                    Some(_) => {}
+                    None => panic!("actual Supervisor terminal event absent"),
+                }
+            };
+            (terminal, started_two)
+        }
+
+        fn assert_cut_outcome(
+            cut: DeliveryCut,
+            terminal: &crate::SupervisorEvent,
+            outcome: &SupervisorOutcome,
+            began: Option<Instant>,
+        ) {
+            if cut == DeliveryCut::Partial {
+                assert!(
+                    began.expect("actual prefix write clock").elapsed()
+                        >= GUARDIAN_SHUTDOWN_DEADLINE
+                );
+                assert!(matches!(
+                    terminal,
+                    crate::SupervisorEvent::Failed { attempt: 2 }
+                ));
+                match outcome {
+                    SupervisorOutcome::Failed(error) => {
+                        assert_eq!(runtime_io_kind(error), Some(io::ErrorKind::TimedOut));
+                        assert!(!is_owned_preparation_interruption(error, 2));
+                        assert!(error.to_string().contains("read deadline"));
+                    }
+                    other => panic!("partial Prepared timeout was hidden: {other:?}"),
+                }
+            } else {
+                assert!(matches!(terminal, crate::SupervisorEvent::Stopped));
+                assert!(matches!(outcome, SupervisorOutcome::Stopped));
+            }
+        }
+
+        impl Drop for CutFixture {
+            fn drop(&mut self) {
+                lock_recovery(&self.plane.recovery).deny();
+                self.plane.consumption_probe.take();
+                if let Some(supervisor) = &self.supervisor {
+                    supervisor.shutdown();
+                }
+                self.cancelled.store(true, Ordering::Release);
+                let _ = self.phase_release.send(());
+                let _ = self.plane.commands.send(RelayCommand::AwaitClosure);
+                drop(self.supervisor.take());
+            }
+        }
+
+        fn run_delivery_cut(cut: DeliveryCut) {
+            let mut fixture = CutFixture::start(cut);
+            let response = fixture.release_after_clear();
+            let mut began = None;
+            match cut {
+                DeliveryCut::Zero => {
+                    fixture.accept_actual_q();
+                    fixture
+                        .plane
+                        .commands
+                        .send(RelayCommand::AwaitClosure)
+                        .expect("zero-byte closure collection");
+                }
+                DeliveryCut::Partial => {
+                    fixture
+                        .plane
+                        .commands
+                        .send(RelayCommand::Prefix)
+                        .expect("one canonical prefix");
+                    began = match fixture
+                        .plane
+                        .receipts
+                        .recv_timeout(COLLECTION)
+                        .expect("actual prefix write receipt")
+                    {
+                        RelayReceipt::PrefixSent(time) => Some(time),
+                        _ => panic!("unexpected prefix receipt"),
+                    };
+                    let deadline = Instant::now() + COLLECTION;
+                    loop {
+                        if rustix::io::ioctl_fionread(
+                            fixture
+                                .plane
+                                .consumption_probe
+                                .as_ref()
+                                .expect("observation alias"),
+                        )
+                        .expect("existing safe available-byte primitive")
+                            == 0
+                        {
+                            break;
+                        }
+                        assert!(
+                            Instant::now() < deadline,
+                            "valid prefix not consumed by sole control reader"
+                        );
+                        thread::yield_now();
+                    }
+                    drop(fixture.plane.consumption_probe.take());
+                    fixture.accept_actual_q();
+                    fixture
+                        .plane
+                        .commands
+                        .send(RelayCommand::AwaitClosure)
+                        .expect("partial suffix remains withheld until actual failure/EOF");
+                }
+                DeliveryCut::FullBeforeLease | DeliveryCut::LeaseBeforeSpawn => {
+                    fixture
+                        .plane
+                        .commands
+                        .send(RelayCommand::Full)
+                        .expect("full canonical Prepared2 release");
+                    fixture
+                        .phase_entered
+                        .recv_timeout(COLLECTION)
+                        .expect("exact factory/returned-lease boundary");
+                    fixture.accept_actual_q();
+                    fixture
+                        .phase_release
+                        .send(())
+                        .expect("release only after actual Q ACK");
+                }
+            }
+            fixture.collect(cut, &response, began);
+        }
+
+        #[test]
+        fn prepared_delivery_zero_bytes_retires_exact_unclaimed_host_lease() {
+            run_delivery_cut(DeliveryCut::Zero);
+        }
+
+        #[test]
+        fn prepared_delivery_partial_prefix_keeps_framing_clock_and_typed_timeout() {
+            run_delivery_cut(DeliveryCut::Partial);
+        }
+
+        #[test]
+        fn prepared_delivery_full_before_lease_uses_normal_supervisor_revoke() {
+            run_delivery_cut(DeliveryCut::FullBeforeLease);
+        }
+
+        #[test]
+        fn prepared_delivery_post_lease_pre_spawn_uses_normal_supervisor_revoke() {
+            run_delivery_cut(DeliveryCut::LeaseBeforeSpawn);
+        }
+
+        struct RetiredOwner {
+            guardian: Option<UnixStream>,
+            recovery: Arc<Mutex<RecoveryState>>,
+            updates: Receiver<GuardedPrimaryUpdate>,
+            worker: Option<JoinHandle<Result<(), RuntimeError>>>,
+        }
+
+        impl RetiredOwner {
+            fn stream(&mut self) -> &mut UnixStream {
+                self.guardian.as_mut().expect("retained private peer")
+            }
+
+            fn join(&mut self) -> Result<Vec<GuardedPrimaryUpdate>, RuntimeError> {
+                self.worker
+                    .take()
+                    .expect("one actual host owner")
+                    .join()
+                    .map_err(|_| {
+                        lifecycle_error(
+                            "test actual mint owner join",
+                            io::Error::other("owner panicked"),
+                        )
+                    })??;
+                Ok(self.updates.try_iter().collect())
+            }
+        }
+
+        impl Drop for RetiredOwner {
+            fn drop(&mut self) {
+                lock_recovery(&self.recovery).deny();
+                self.guardian.take();
+                if let Some(worker) = self.worker.take() {
+                    match worker.join() {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => eprintln!("KEL143_MINT_RESCUE owner error: {error}"),
+                        Err(error) => eprintln!("KEL143_MINT_RESCUE panic: {error:?}"),
+                    }
+                }
+            }
+        }
+
+        fn prepare_retired_owner(fence: Option<GenerationProvisionFence>) -> RetiredOwner {
+            let (host, guardian) = timed_pair();
+            let (updates_tx, updates_rx) = mpsc::channel();
+            let current = Arc::new(Mutex::new(None));
+            let recovery = Arc::new(Mutex::new(RecoveryState::new()));
+            lock_recovery(&recovery).arm();
+            let state = Arc::clone(&recovery);
+            let worker = thread::spawn(move || {
+                run_generation_host(host, &updates_tx, &current, &state, fence.as_ref())
+            });
+            let mut owner = RetiredOwner {
+                guardian: Some(guardian),
+                recovery,
+                updates: updates_rx,
+                worker: Some(worker),
+            };
+            write_generation_control(
+                owner.stream(),
+                &GenerationControlRecord::new(CONTROL_PREPARE, 1),
+            )
+            .expect("actual Prepare1");
+            assert_eq!(
+                receive_record(owner.stream())
+                    .expect("actual Prepared1")
+                    .kind,
+                CONTROL_PREPARED
+            );
+            for (kind, expected) in [
+                (CONTROL_REVOKE, CONTROL_REVOKED),
+                (CONTROL_CLEAR, CONTROL_CLEARED),
+            ] {
+                let record = if kind == CONTROL_REVOKE {
+                    GenerationControlRecord::new(kind, 1)
+                        .with_cause(RevocationCause::AdmissionFailed)
+                } else {
+                    GenerationControlRecord::new(kind, 1)
+                };
+                write_generation_control(owner.stream(), &record)
+                    .expect("actual retired predecessor transition");
+                assert_eq!(
+                    receive_record(owner.stream())
+                        .expect("actual predecessor acknowledgment")
+                        .kind,
+                    expected
+                );
+            }
+            owner
+        }
+
+        #[test]
+        fn generation_host_provision_mutex_orders_actual_mint_and_denial() {
+            let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+            let (release_tx, release_rx) = mpsc::channel();
+            let mut owner = prepare_retired_owner(Some(GenerationProvisionFence {
+                attempt: 2,
+                entered: entered_tx,
+                release: release_rx,
+            }));
+            let recovery = Arc::clone(&owner.recovery);
+            lock_recovery(&recovery).arm();
+            write_generation_control(
+                owner.stream(),
+                &GenerationControlRecord::new(CONTROL_PREPARE, 2),
+            )
+            .expect("actual Prepare2");
+            let entered = entered_rx.recv_timeout(COLLECTION);
+            // This is an independent lock observable while actual host mint is
+            // fenced. The fault releases the guard before this same fence.
+            let denial_won_before_mint = match recovery.try_lock() {
+                Ok(mut state) => {
+                    state.deny();
+                    true
+                }
+                Err(TryLockError::WouldBlock) => false,
+                Err(TryLockError::Poisoned(error)) => {
+                    error.into_inner().deny();
+                    true
+                }
+            };
+            let released = release_tx.send(());
+            let response = receive_record(owner.stream());
+            let events_at_mint: Vec<_> = owner.updates.try_iter().collect();
+            lock_recovery(&recovery).deny();
+            let mut listener_was_live = false;
+            let mut listener_gone = false;
+            if let Ok(response) = &response {
+                let (endpoint, _) = parse_app_link(
+                    std::str::from_utf8(&response.payload).expect("actual app link UTF8"),
+                )
+                .expect("actual minted locator");
+                listener_was_live = UnixStream::connect(endpoint).is_ok();
+                for (kind, expected) in [
+                    (CONTROL_REVOKE, CONTROL_REVOKED),
+                    (CONTROL_CLEAR, CONTROL_CLEARED),
+                ] {
+                    let record = if kind == CONTROL_REVOKE {
+                        GenerationControlRecord::new(kind, 2).with_cause(RevocationCause::Shutdown)
+                    } else {
+                        GenerationControlRecord::new(kind, 2)
+                    };
+                    write_generation_control(owner.stream(), &record)
+                        .expect("actual successor cleanup transition");
+                    assert_eq!(
+                        receive_record(owner.stream())
+                            .expect("actual successor cleanup acknowledgment")
+                            .kind,
+                        expected
+                    );
+                }
+                listener_gone = UnixStream::connect(endpoint).is_err();
+            }
+            lock_recovery(&recovery).shutdown_acknowledged = true;
+            owner.guardian.take();
+            let joined = owner.join();
+            entered.expect("actual pre-mint owner fence reached");
+            released.expect("release actual mint fence before assertions");
+            let response = response.expect("actual owner minted matching Prepared2");
+            assert_eq!((response.kind, response.attempt), (CONTROL_PREPARED, 2));
+            let after_cleanup =
+                joined.expect("actual host owner joins after exact cleanup and attributed EOF");
+            assert!(after_cleanup.iter().any(|update| matches!(
+                update,
+                GuardedPrimaryUpdate::Role(RoleEvent::Revoked {
+                    attempt: 2,
+                    cause: crate::role::RoleRevocationCause::Shutdown,
+                    ..
+                })
+            )));
+            assert!(events_at_mint.iter().any(|update| matches!(
+                update,
+                GuardedPrimaryUpdate::Role(RoleEvent::Provisioned { attempt: 2, .. })
+            )));
+            assert!(listener_was_live && listener_gone);
+            println!(
+                "KEL143_MINT_FENCE denied_before_actual_mint={denial_won_before_mint} actual_provisioned=2 listener_was_live={listener_was_live} listener_absent={listener_gone}"
+            );
+            assert!(
+                !denial_won_before_mint,
+                "actual mint followed observed denial at the shared pre-mint fence"
+            );
+        }
+
+        #[test]
+        fn generation_host_denial_winner_has_no_successor_locator() {
+            let mut owner = prepare_retired_owner(None);
+            let recovery = Arc::clone(&owner.recovery);
+            {
+                let mut state = lock_recovery(&recovery);
+                state.deny();
+                state.arm();
+                state.shutdown_acknowledged = true;
+            }
+            write_generation_control(
+                owner.stream(),
+                &GenerationControlRecord::new(CONTROL_PREPARE, 2),
+            )
+            .expect("actual denied Prepare2");
+            // Draining EOF is the actual owner's final processing witness;
+            // absence during a guessed timed interval would not establish it.
+            owner
+                .stream()
+                .shutdown(Shutdown::Write)
+                .expect("real private request EOF after complete Prepare2");
+            let updates = owner
+                .join()
+                .expect("actual denied host owner joins after resource-free attributed completion");
+            assert!(!updates.iter().any(|update| matches!(
+                update,
+                GuardedPrimaryUpdate::Role(RoleEvent::Provisioned { attempt: 2, .. })
+            )));
+            let closure =
+                receive_record(owner.stream()).expect_err("denial fabricated Prepared2 locator");
+            assert_eq!(
+                runtime_io_kind(&closure),
+                Some(io::ErrorKind::UnexpectedEof)
+            );
+            println!(
+                "KEL143_MINT_FENCE denial_winner=true successor_locator=false actual_owner_eof=true"
+            );
+        }
     }
 
     fn long_running_command() -> Command {

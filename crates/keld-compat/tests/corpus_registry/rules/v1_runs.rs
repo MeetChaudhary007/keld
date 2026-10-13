@@ -362,7 +362,7 @@ fn platforms_admission_lists_undeclared_cells_as_unknown() {
         &[output(RUST_PATH, rust_ok(&["app.when-ready", "app.quit"]))],
     )
     .unwrap_or_else(|error| panic!("{error}"));
-    assert!(mac.unknown.is_empty());
+    assert_eq!(mac.unknown, Vec::new());
     // A Bun case skipped on a declared platform fails.
     let skipped = "(skip) app > app.exit_case\n(pass) app > app.name_case [1.00ms]\n".to_owned();
     assert!(matches!(
