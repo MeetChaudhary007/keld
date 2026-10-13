@@ -1657,7 +1657,7 @@ struct UnixCaptureFaults {
 #[cfg(all(unix, test))]
 fn consume_test_interruption(counter: &AtomicU8) -> bool {
     counter
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
             remaining.checked_sub(1)
         })
         .is_ok()
@@ -2224,7 +2224,7 @@ fn spawn_capture_thread_with_faults(
                         Ok(n) => {
                             let mut guard = output.lock().unwrap_or_else(PoisonError::into_inner);
                             guard.push_raw(&buf[..n], is_stdout);
-                            let _ = worker_budget.fetch_update(
+                            let _ = worker_budget.try_update(
                                 Ordering::AcqRel,
                                 Ordering::Acquire,
                                 |current| {
@@ -2320,10 +2320,9 @@ fn spawn_capture_thread(
                     Ok(n) => {
                         let mut guard = output.lock().unwrap_or_else(PoisonError::into_inner);
                         guard.push_raw(&buf[..n], is_stdout);
-                        let _ =
-                            budget.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                                (current != u64::MAX).then_some(current.saturating_sub(n as u64))
-                            });
+                        let _ = budget.try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                            (current != u64::MAX).then_some(current.saturating_sub(n as u64))
+                        });
                         drop(iteration);
                     }
                 }

@@ -5142,7 +5142,7 @@ while (!(await input.read()).done) {}
         assert_eq!(request.attempt, 2);
         assert_eq!(request.pid, 0);
         assert_eq!(request.cause, 0);
-        assert!(request.payload.is_empty());
+        assert_eq!(request.payload, Vec::<u8>::new());
         assert!(
             early.is_none() && !disconnected,
             "zero-byte successor completed before owned reply release: {early:?}"

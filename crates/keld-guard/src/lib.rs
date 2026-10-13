@@ -1297,10 +1297,9 @@ mod tests {
     #[test]
     fn manifest_byte_capture_accepts_empty_and_exact_ceiling() {
         let path = Path::new("keld.permissions.jsonc");
-        assert!(
-            read_manifest_bytes(&[][..], path)
-                .expect("empty capture is valid before parsing")
-                .is_empty()
+        assert_eq!(
+            read_manifest_bytes(&[][..], path).expect("empty capture is valid before parsing"),
+            Vec::<u8>::new()
         );
         let source = vec![0xff; MAX_MANIFEST_BYTES];
         assert_eq!(

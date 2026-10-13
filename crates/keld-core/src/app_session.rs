@@ -1286,7 +1286,7 @@ fn decode_digest(value: &str) -> Result<[u8; 32], HostAppError> {
         ));
     }
     let mut digest = [0_u8; 32];
-    for (index, chunk) in hex.as_bytes().chunks_exact(2).enumerate() {
+    for (index, chunk) in hex.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         let text = std::str::from_utf8(chunk).map_err(|source| {
             boot_error(
                 format!("digest encoding is invalid: {source}"),
@@ -7643,7 +7643,10 @@ mod tests {
 
     #[test]
     fn authenticode_ffi_scan_flags_each_needle() {
-        assert!(authenticode_ffi_needles_in("fn clean() {}").is_empty());
+        assert_eq!(
+            authenticode_ffi_needles_in("fn clean() {}"),
+            [] as [&str; 0]
+        );
         for needle in AUTHENTICODE_FFI_NEEDLES {
             let planted = format!("fn planted() {{ let _ = {needle}; }}");
             assert_eq!(authenticode_ffi_needles_in(&planted), [needle]);
@@ -10943,7 +10946,7 @@ mod tests {
         assert_eq!(pong.kind, FrameKind::Ping);
         assert_eq!(pong.channel, keld_ipc::ChannelId::for_test(99));
         assert_eq!(pong.corr, CorrelationId(0));
-        assert!(pong_payload.is_empty());
+        assert_eq!(pong_payload, [] as [u8; 0]);
 
         let bun_request = EchoRequest {
             message: "bun".to_owned(),
@@ -11333,7 +11336,7 @@ mod tests {
             .install_generation(3, late_server)
             .expect("late bound after admitted restart closes cleanly");
         assert!(handle.current.lock().expect("generation lock").is_none());
-        assert!(handle.readers.lock().expect("reader lock").is_empty());
+        assert_eq!(handle.readers.lock().expect("reader lock").len(), 0);
     }
 
     #[test]
@@ -11367,14 +11370,14 @@ mod tests {
             &failure,
             |attempt| restarted.push(attempt)
         ));
-        assert!(restarted.is_empty());
+        assert_eq!(restarted.len(), 0);
         assert!(handle.current.lock().expect("generation lock").is_none());
         let (late_server, _late_client) = primary_test_stream_pair();
         handle
             .install_generation(3, late_server)
             .expect("late bind is harmless after teardown");
         assert!(handle.current.lock().expect("generation lock").is_none());
-        assert!(handle.readers.lock().expect("reader lock").is_empty());
+        assert_eq!(handle.readers.lock().expect("reader lock").len(), 0);
     }
 
     #[test]
@@ -11431,14 +11434,14 @@ mod tests {
         assert_eq!(admitted, !requests.is_empty());
         assert!(handle.shutdown.reader_stop.load(Ordering::Acquire));
         assert!(handle.current.lock().expect("generation lock").is_none());
-        assert!(handle.readers.lock().expect("reader lock").is_empty());
+        assert_eq!(handle.readers.lock().expect("reader lock").len(), 0);
 
         let (late_server, _late_client) = primary_test_stream_pair();
         handle
             .install_generation(3, late_server)
             .expect("late bound closes after teardown");
         assert!(handle.current.lock().expect("generation lock").is_none());
-        assert!(handle.readers.lock().expect("reader lock").is_empty());
+        assert_eq!(handle.readers.lock().expect("reader lock").len(), 0);
     }
 
     #[test]
