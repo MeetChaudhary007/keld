@@ -25,6 +25,7 @@ use keld_ipc::{
 use crate::PreparedCommand;
 #[cfg(target_os = "linux")]
 use crate::linux_strict::LinuxStrictProfile;
+use crate::virtual_port::RolePrincipal;
 use crate::{
     CapturedOutput, ChildPreparer, CrashLedger, GenerationLease, PreparedChild, RestartPolicy,
     RevocationCause, RuntimeError, Supervisor, SupervisorOutcome,
@@ -209,7 +210,7 @@ impl std::fmt::Debug for RoleGeneration {
 /// completed the possession-token `HELLO`; consumers must not run a second
 /// handshake or derive identity from peer payload bytes.
 pub struct BoundRoleGeneration {
-    generation: RoleGeneration,
+    principal: RolePrincipal,
     attempt: u32,
     stream: BootstrapStream,
 }
@@ -218,7 +219,16 @@ impl BoundRoleGeneration {
     /// Host-minted generation bound to this stream.
     #[must_use]
     pub const fn generation(&self) -> RoleGeneration {
-        self.generation
+        self.principal.generation()
+    }
+
+    /// Host-minted owner and generation from the canonical accepted-role lease.
+    ///
+    /// This trusted metadata is never decoded from the peer's frame, locator,
+    /// PID or environment. It grants no privileged capability by itself.
+    #[must_use]
+    pub const fn principal(&self) -> RolePrincipal {
+        self.principal
     }
 
     /// One-indexed supervisor attempt that produced this stream.
@@ -237,7 +247,7 @@ impl BoundRoleGeneration {
 impl std::fmt::Debug for BoundRoleGeneration {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BoundRoleGeneration")
-            .field("generation", &self.generation)
+            .field("generation", &self.generation())
             .field("attempt", &self.attempt)
             .finish_non_exhaustive()
     }
@@ -1015,7 +1025,7 @@ impl RoleGenerationLease {
                 if let (Some(bound_tx), Some(stream)) = (&self.bound_tx, bound) {
                     bound_tx
                         .send(BoundRoleGeneration {
-                            generation: self.generation,
+                            principal: RolePrincipal::new(self.owner, self.generation),
                             attempt: self.attempt,
                             stream,
                         })
@@ -1360,6 +1370,64 @@ mod tests {
     use std::sync::mpsc;
 
     use super::*;
+
+    #[test]
+    fn authenticated_bound_roles_preserve_owner_and_rotate_principal() {
+        for owner in [RoleOwner::Primary, RoleOwner::AppBound] {
+            let fixture = PrimaryFixture::new();
+            let (probe_tx, probe_rx) = mpsc::channel();
+            let config = match owner {
+                RoleOwner::Primary => RoleConfig::primary("bun"),
+                RoleOwner::AppBound => RoleConfig::app_bound("bun"),
+            };
+            let supervisor = RoleSupervisor::start_with_bound_generations(
+                config
+                    .arg(PrimaryFixture::script_path())
+                    .arg(fixture.control_path())
+                    .current_dir(fixture.dir())
+                    .restart_policy(RestartPolicy {
+                        max_crashes: 3,
+                        window_secs: 30,
+                    })
+                    .admission_timeout(Duration::from_secs(5))
+                    .with_probe(probe_tx),
+            )
+            .expect("one actual role coordinator");
+            let g1 = probe_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("actual g1 mint");
+            let mut control = fixture.accept_control();
+            assert_ready_line(&mut control, &g1.app_link);
+            control.write_line("BIND");
+            let bound1 = supervisor
+                .recv_bound_generation(Duration::from_secs(5))
+                .expect("actual authenticated g1");
+            assert_eq!(control.read_line(), "BOUND");
+            assert_eq!(bound1.principal().owner(), owner);
+            assert_eq!(bound1.principal().generation(), g1.generation);
+            assert_eq!(bound1.generation(), bound1.principal().generation());
+            let p1 = bound1.principal();
+            control.write_line("CRASH");
+            let g2 = probe_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("actual fresh g2 mint");
+            let mut control = fixture.accept_control();
+            assert_ready_line(&mut control, &g2.app_link);
+            control.write_line("BIND");
+            let bound2 = supervisor
+                .recv_bound_generation(Duration::from_secs(5))
+                .expect("actual authenticated g2");
+            assert_eq!(control.read_line(), "BOUND");
+            assert_eq!(bound2.principal().owner(), owner);
+            assert_eq!(bound2.principal().generation(), g2.generation);
+            assert_ne!(p1, bound2.principal());
+            supervisor.shutdown();
+            assert!(matches!(
+                supervisor.wait_for_outcome(),
+                SupervisorOutcome::Stopped
+            ));
+        }
+    }
 
     #[test]
     fn real_bun_primary_restart_rotates_generation_and_rejects_stale_token() {

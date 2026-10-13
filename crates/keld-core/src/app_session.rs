@@ -91,6 +91,8 @@ use keld_runtime::primary::{BoundPrimaryGeneration, PrimaryRoleEvent};
 use keld_runtime::primary::{PrimaryRecoveryGate, PrimaryRoleConfig, PrimaryRoleSupervisor};
 #[cfg(target_os = "linux")]
 use keld_runtime::primary::{PrimaryRecoveryGate, PrimaryRoleConfig, PrimaryRoleSupervisor};
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+use keld_runtime::registry::{RoleOwner, RolePrincipal};
 #[cfg(target_os = "macos")]
 use keld_wv::profile::EphemeralProfile;
 #[cfg(target_os = "linux")]
@@ -5053,8 +5055,27 @@ enum QuitDrainEnd {
 type PrimaryReader = JoinHandle<Result<(), HostAppError>>;
 
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PrimaryLinkIdentity {
+    Role(RolePrincipal),
+    // Historical paired-stream component fixtures are not authenticated role
+    // producers and cannot qualify KEL-97. Never a production admission path.
+    #[cfg(test)]
+    Fixture,
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+#[derive(Clone)]
+struct PrimaryCallerContext {
+    attempt: u32,
+    identity: PrimaryLinkIdentity,
+    reader_stop: Arc<AtomicBool>,
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 struct ActivePrimaryGeneration {
     attempt: u32,
+    identity: PrimaryLinkIdentity,
     writer: BootstrapStream,
     reader_stop: Arc<AtomicBool>,
     /// Correlation id of this generation's accepted-but-unanswered `Quit`
@@ -5949,6 +5970,7 @@ impl PrimaryRouterHandle {
             }
             PrimaryOwnerUpdate::Role(_) => Ok(()),
             PrimaryOwnerUpdate::Bound(bound) => {
+                let identity = PrimaryLinkIdentity::Role(bound.principal());
                 let attempt = bound.attempt();
                 if attempt <= self.last_revoked_attempt.load(Ordering::Acquire) {
                     let stream = bound.into_stream();
@@ -5957,11 +5979,15 @@ impl PrimaryRouterHandle {
                 }
                 #[cfg(target_os = "macos")]
                 {
-                    self.install_prepared_generation(attempt, bound.into_stream())
+                    self.install_prepared_generation_with_identity(
+                        attempt,
+                        bound.into_stream(),
+                        identity,
+                    )
                 }
                 #[cfg(not(target_os = "macos"))]
                 {
-                    self.install_generation(attempt, bound.into_stream())
+                    self.install_generation_with_identity(attempt, bound.into_stream(), identity)
                 }
             }
         }
@@ -5971,10 +5997,11 @@ impl PrimaryRouterHandle {
     // their calling thread. The macOS guardian actor never uses this adapter.
     #[cfg(any(test, not(target_os = "macos")))]
     #[cfg(not(keld_core_native_renderer_main))]
-    fn install_generation(
+    fn install_generation_with_identity(
         &self,
         attempt: u32,
         stream: BootstrapStream,
+        identity: PrimaryLinkIdentity,
     ) -> Result<(), PrimaryGenerationFailure> {
         if let Some(session) = self.fs.as_ref().and_then(Weak::upgrade) {
             {
@@ -6067,14 +6094,48 @@ impl PrimaryRouterHandle {
                     .prepared_attempt = Some(attempt);
             }
         }
-        self.install_prepared_generation(attempt, stream)
+        self.install_prepared_generation_with_identity(attempt, stream, identity)
     }
 
+    #[cfg(all(test, not(keld_core_native_renderer_main)))]
+    fn install_generation(
+        &self,
+        attempt: u32,
+        stream: BootstrapStream,
+    ) -> Result<(), PrimaryGenerationFailure> {
+        self.install_generation_with_identity(attempt, stream, PrimaryLinkIdentity::Fixture)
+    }
+
+    #[cfg(test)]
     fn install_prepared_generation(
         &self,
         attempt: u32,
-        mut stream: BootstrapStream,
+        stream: BootstrapStream,
     ) -> Result<(), PrimaryGenerationFailure> {
+        self.install_prepared_generation_with_identity(
+            attempt,
+            stream,
+            PrimaryLinkIdentity::Fixture,
+        )
+    }
+
+    fn install_prepared_generation_with_identity(
+        &self,
+        attempt: u32,
+        mut stream: BootstrapStream,
+        identity: PrimaryLinkIdentity,
+    ) -> Result<(), PrimaryGenerationFailure> {
+        let is_primary = match identity {
+            PrimaryLinkIdentity::Role(principal) => principal.owner() == RoleOwner::Primary,
+            #[cfg(test)]
+            PrimaryLinkIdentity::Fixture => true,
+        };
+        if !is_primary {
+            let primary = app_detail("primary role binding", "accepted role owner is not primary");
+            let cleanup =
+                finish_link_shutdown(stream.shutdown_app_link(), "wrong primary role link close");
+            return Err(append_app_cleanup(primary, [cleanup]).into());
+        }
         stream
             .set_app_link_read_deadline(Some(APP_LINK_READER_POLL))
             .map_err(|source| app_io("primary session reader deadline", &source))?;
@@ -6114,6 +6175,7 @@ impl PrimaryRouterHandle {
             reader_stop = self.shutdown.register_generation_reader();
             *current = Some(ActivePrimaryGeneration {
                 attempt,
+                identity,
                 writer: writer_stream,
                 reader_stop: Arc::clone(&reader_stop),
                 pending_quit: None,
@@ -6130,10 +6192,15 @@ impl PrimaryRouterHandle {
             }
         }
         let handle = self.clone();
+        let caller = PrimaryCallerContext {
+            attempt,
+            identity,
+            reader_stop,
+        };
         let reader = thread::Builder::new()
             .name(format!("keld-core-primary-router-{attempt}"))
             .spawn(move || {
-                let mut result = read_primary_frames(&mut stream, &handle, attempt, &reader_stop);
+                let mut result = read_primary_frames(&mut stream, &handle, &caller);
                 if result.is_err()
                     && let Err(cleanup) = handle.fail_pending_echo_for_attempt(
                         attempt,
@@ -6344,6 +6411,42 @@ impl PrimaryRouter {
         shutdown: SessionShutdownState,
         fs: Option<&GuardSnapshot>,
     ) -> Result<Self, HostAppError> {
+        Self::start_bound_with_fs_setup(
+            bound,
+            window_commands,
+            guardian,
+            shutdown,
+            fs,
+            #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+            None,
+        )
+    }
+
+    #[cfg(feature = "fs-acceptance-observer")]
+    keld_native::keld_native_fs_observer_items! {
+    #[cfg(all(test, target_os = "macos", not(keld_core_native_renderer_main)))]
+    fn start_bound_with_fs_test_gate(
+        bound: BoundPrimaryGeneration,
+        window_commands: Sender<AppWindowCommand>,
+        guardian: PlatformPrimaryOwnerHandle,
+        shutdown: SessionShutdownState,
+        fs: Option<&GuardSnapshot>,
+        gate: Arc<FsWorkerTestGate>,
+    ) -> Result<Self, HostAppError> {
+        Self::start_bound_with_fs_setup(bound, window_commands, guardian, shutdown, fs, Some(gate))
+    }
+    }
+
+    fn start_bound_with_fs_setup(
+        bound: BoundPrimaryGeneration,
+        window_commands: Sender<AppWindowCommand>,
+        guardian: PlatformPrimaryOwnerHandle,
+        shutdown: SessionShutdownState,
+        fs: Option<&GuardSnapshot>,
+        #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+        fs_worker_test_gate: Option<Arc<FsWorkerTestGate>>,
+    ) -> Result<Self, HostAppError> {
+        let identity = PrimaryLinkIdentity::Role(bound.principal());
         let attempt = bound.attempt();
         let stream = bound.into_stream();
         let handle = PrimaryRouterHandle {
@@ -6374,9 +6477,11 @@ impl PrimaryRouter {
             fs.map(GuardSnapshot::take_initial_broker).transpose()?,
             attempt,
             #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
-            None,
+            fs_worker_test_gate,
         )?;
-        router.handle.install_prepared_generation(attempt, stream)?;
+        router
+            .handle
+            .install_prepared_generation_with_identity(attempt, stream, identity)?;
         Ok(router)
     }
 
@@ -6679,9 +6784,10 @@ impl Drop for PrimaryRouter {
 fn read_primary_frames(
     reader: &mut BootstrapStream,
     handle: &PrimaryRouterHandle,
-    attempt: u32,
-    reader_stop: &Arc<AtomicBool>,
+    caller: &PrimaryCallerContext,
 ) -> Result<(), HostAppError> {
+    let attempt = caller.attempt;
+    let reader_stop = &caller.reader_stop;
     loop {
         if handle.shutdown.cause() == SESSION_CLI_LEASE_LOST {
             handle.cli_lease_lost()?;
@@ -6762,15 +6868,12 @@ fn read_primary_frames(
                 handle.finish_pending_echo(attempt, header.corr(), PrimaryEchoReply::Err(error))?;
             }
             (FrameKind::Call, ECHO_CHANNEL) if handle.shutdown.is_running() => {
-                let reply = keld_ipc::echo::handle_echo(&payload)
-                    .map_err(|source| app_ipc("echo dispatch", &source))?;
-                write_primary_reply(
+                dispatch_primary_echo(
                     &handle.current,
                     &handle.shutdown,
-                    attempt,
-                    ECHO_CHANNEL,
+                    caller,
                     header.corr(),
-                    &reply,
+                    &payload,
                 )?;
             }
             (FrameKind::Call, FS_CHANNEL) if handle.shutdown.is_running() => {
@@ -6890,11 +6993,10 @@ fn write_best_effort_answers(
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
-fn write_primary_reply(
+fn dispatch_primary_echo(
     current: &Mutex<Option<ActivePrimaryGeneration>>,
     shutdown: &SessionShutdownState,
-    attempt: u32,
-    channel: keld_ipc::ChannelId,
+    caller: &PrimaryCallerContext,
     correlation: CorrelationId,
     payload: &[u8],
 ) -> Result<(), HostAppError> {
@@ -6908,16 +7010,25 @@ fn write_primary_reply(
     let Some(active) = current.as_mut() else {
         return Ok(());
     };
-    if active.attempt != attempt {
+    // Generation and owner are Runtime-minted. This existing reader-stop Arc
+    // additionally scopes equal numeric generations to the actual Core link
+    // instance; no Core counter or identity registry is minted or mirrored.
+    if active.attempt != caller.attempt
+        || active.identity != caller.identity
+        || !Arc::ptr_eq(&active.reader_stop, &caller.reader_stop)
+        || caller.reader_stop.load(Ordering::Acquire)
+    {
         return Ok(());
     }
+    let reply =
+        keld_ipc::echo::handle_echo(payload).map_err(|source| app_ipc("echo dispatch", &source))?;
     write_frame(
         &mut active.writer,
         FrameKind::Reply,
         0,
-        channel,
+        ECHO_CHANNEL,
         correlation,
-        payload,
+        &reply,
     )
     .map_err(|source| app_ipc("primary session reply", &source))
 }
@@ -7223,6 +7334,80 @@ mod tests {
                 && output.contains("test result: ok. 1 passed; 0 failed;"),
             "isolated event-order proof failed: status={status}, stdout={output}, stderr={detail}"
         );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn stale_and_foreign_link_contexts_are_inert_before_echo_decode() {
+        use std::os::unix::net::UnixStream;
+        let (writer, _peer) = UnixStream::pair().expect("actual app link pair");
+        let current_stop = Arc::new(AtomicBool::new(false));
+        let current = Mutex::new(Some(ActivePrimaryGeneration {
+            identity: PrimaryLinkIdentity::Fixture,
+            attempt: 2,
+            writer,
+            reader_stop: Arc::clone(&current_stop),
+            pending_quit: None,
+        }));
+        let shutdown = SessionShutdownState::new();
+        for caller in [
+            PrimaryCallerContext {
+                attempt: 1,
+                identity: PrimaryLinkIdentity::Fixture,
+                reader_stop: Arc::clone(&current_stop),
+            },
+            PrimaryCallerContext {
+                attempt: 2,
+                identity: PrimaryLinkIdentity::Fixture,
+                reader_stop: Arc::new(AtomicBool::new(false)),
+            },
+        ] {
+            // Literal malformed Echo is a direct decoder-entry falsifier: deleting
+            // either corresponding context guard must surface IPC003 instead of Ok.
+            dispatch_primary_echo(&current, &shutdown, &caller, CorrelationId(71), &[0xff])
+                .expect("retired or foreign context never reaches unprivileged decoder");
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn current_g2_context_dispatches_original_echo_and_stopped_context_is_inert() {
+        use keld_ipc::link::{AppLinkDeadlines as _, read_frame};
+        use std::os::unix::net::UnixStream;
+        let (writer, mut peer) = UnixStream::pair().expect("actual g2 app link");
+        peer.set_app_link_deadlines(Some(Duration::from_secs(5)))
+            .expect("existing observer bound");
+        let stop = Arc::new(AtomicBool::new(false));
+        let current = Mutex::new(Some(ActivePrimaryGeneration {
+            identity: PrimaryLinkIdentity::Fixture,
+            attempt: 2,
+            writer,
+            reader_stop: Arc::clone(&stop),
+            pending_quit: None,
+        }));
+        let caller = PrimaryCallerContext {
+            attempt: 2,
+            identity: PrimaryLinkIdentity::Fixture,
+            reader_stop: Arc::clone(&stop),
+        };
+        let shutdown = SessionShutdownState::new();
+        let payload = encode(&keld_ipc::echo::EchoRequest {
+            message: "current-g2".to_owned(),
+            count: 72,
+        })
+        .expect("owning codec");
+        dispatch_primary_echo(&current, &shutdown, &caller, CorrelationId(72), &payload)
+            .expect("current original Echo");
+        let (header, bytes) = read_frame(&mut peer).expect("actual g2 terminal wire");
+        assert_eq!(
+            (header.kind, header.channel, header.corr),
+            (FrameKind::Reply, ECHO_CHANNEL, CorrelationId(72))
+        );
+        let reply: keld_ipc::echo::EchoResponse = decode(&bytes).expect("owning reply codec");
+        assert_eq!((reply.message.as_str(), reply.count), ("current-g2", 72));
+        stop.store(true, Ordering::Release);
+        dispatch_primary_echo(&current, &shutdown, &caller, CorrelationId(73), &[0xff])
+            .expect("stopped context remains inert before decoder");
     }
 
     #[test]
@@ -8219,6 +8404,7 @@ mod tests {
         drop(peer);
         let reader_stop = Arc::new(AtomicBool::new(false));
         let current = Arc::new(Mutex::new(Some(ActivePrimaryGeneration {
+            identity: PrimaryLinkIdentity::Fixture,
             attempt: 1,
             writer: server,
             reader_stop: Arc::clone(&reader_stop),
@@ -8352,6 +8538,7 @@ mod tests {
         drop(g1_peer);
         let reader_stop = Arc::new(AtomicBool::new(false));
         let current = Arc::new(Mutex::new(Some(ActivePrimaryGeneration {
+            identity: PrimaryLinkIdentity::Fixture,
             attempt: 1,
             writer: g1_server,
             reader_stop: Arc::clone(&reader_stop),
@@ -8636,6 +8823,9 @@ mod tests {
             _temp: temp,
         }
     }
+
+    #[cfg(target_os = "macos")]
+    mod accepted_primary_identity;
 
     /// GH-528 T2 end-to-end cases: a Bun `WorkerLink` role against this
     /// router (`app_session/tests/worker_link_e2e.rs`).
@@ -9536,6 +9726,7 @@ mod tests {
         let (guardian_tx, _guardian_rx) = mpsc::channel();
         let handle = PrimaryRouterHandle {
             current: Arc::new(Mutex::new(Some(ActivePrimaryGeneration {
+                identity: PrimaryLinkIdentity::Fixture,
                 attempt: 1,
                 writer: g1_server,
                 reader_stop: Arc::new(AtomicBool::new(false)),
@@ -11253,6 +11444,7 @@ mod tests {
         let (window_tx, _window_rx) = mpsc::channel();
         let handle = PrimaryRouterHandle {
             current: Arc::new(Mutex::new(Some(ActivePrimaryGeneration {
+                identity: PrimaryLinkIdentity::Fixture,
                 attempt: 1,
                 writer: server,
                 reader_stop: Arc::new(AtomicBool::new(false)),
@@ -11476,6 +11668,7 @@ mod tests {
                     let (writer, _peer) = primary_test_stream_pair();
                     *handle.current.lock().expect("generation lock") =
                         Some(ActivePrimaryGeneration {
+                            identity: PrimaryLinkIdentity::Fixture,
                             attempt: if case == "successor" { 3 } else { 1 },
                             writer,
                             reader_stop: Arc::new(AtomicBool::new(false)),
@@ -11658,6 +11851,7 @@ mod tests {
         let (window_tx, _window_rx) = mpsc::channel();
         let handle = PrimaryRouterHandle {
             current: Arc::new(Mutex::new(Some(ActivePrimaryGeneration {
+                identity: PrimaryLinkIdentity::Fixture,
                 attempt: 1,
                 writer: server,
                 reader_stop: Arc::new(AtomicBool::new(false)),

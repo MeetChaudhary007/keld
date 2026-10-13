@@ -2,7 +2,7 @@
 use super::super::super::super::{
     AppWindowCommand, GUARDIAN_OWNER_REPLY_DEADLINE, GuardSnapshot, GuardianOwner,
     GuardianOwnerHandle, PrimaryEchoCall, PrimaryRouter, PrimaryRouterHandle,
-    SessionShutdownState,
+    SessionShutdownState, PrimaryCallerContext, PrimaryLinkIdentity, dispatch_primary_echo,
 };
 use super::super::{OBSERVATION_BOUND, sensor, support};
 use super::{
@@ -38,6 +38,14 @@ struct ActorFixture {
 
 impl ActorFixture {
     fn start() -> Self {
+        Self::start_with_admission(false).0
+    }
+
+    fn start_identity() -> (Self, keld_runtime::registry::RolePrincipal) {
+        Self::start_with_admission(true)
+    }
+
+    fn start_with_admission(identity: bool) -> (Self, keld_runtime::registry::RolePrincipal) {
         let inputs = Inputs::supplied();
         assert_eq!(
             fs::read(&inputs.target).expect("Host-seeded target"),
@@ -47,6 +55,7 @@ impl ActorFixture {
         let native = native_worker_setup();
         let mut guardian = inputs.spawn_guardian();
         let bound = next_bound(&mut guardian, 1);
+        let principal = bound.principal();
         let guardian_group = guardian.guardian_pid();
         let initial_bun_group = guardian.group_pid().expect("registered real G1");
         assert_owned_groups(&guardian, initial_bun_group);
@@ -54,19 +63,20 @@ impl ActorFixture {
         let shutdown = SessionShutdownState::new();
         let owner = GuardianOwner::start(guardian, window.clone(), None, shutdown.clone())
             .expect("actual guardian owner loop");
-        let router = PrimaryRouter::start_with_fs_test_gate(
-            bound.into_stream(),
-            window,
-            owner.handle(),
-            shutdown,
-            Some(&snapshot),
-            Some(Arc::clone(&native.gate)),
-        )
-        .expect("actual native router");
-        router
-            .handle()
-            .recovery_armed
-            .store(false, Ordering::Release);
+        let router = if identity {
+            PrimaryRouter::start_bound_with_fs_test_gate(
+                bound, window, owner.handle(), shutdown,
+                Some(&snapshot), Arc::clone(&native.gate),
+            )
+        } else {
+            PrimaryRouter::start_with_fs_test_gate(
+                bound.into_stream(), window, owner.handle(), shutdown,
+                Some(&snapshot), Some(Arc::clone(&native.gate)),
+            )
+        }.expect("actual native router");
+        if !identity {
+            router.handle().recovery_armed.store(false, Ordering::Release);
+        }
         owner
             .attach_router(router.handle())
             .expect("actual owner attachment");
@@ -79,7 +89,7 @@ impl ActorFixture {
             .handle()
             .signal_ready()
             .expect("actual initial arm and acknowledgment");
-        Self {
+        (Self {
             inputs,
             snapshot,
             native,
@@ -88,7 +98,7 @@ impl ActorFixture {
             window: window_rx,
             guardian_group,
             initial_bun_group,
-        }
+        }, principal)
     }
 
     fn handle(&self) -> PrimaryRouterHandle {
@@ -458,4 +468,84 @@ fn actual_owner_preserves_absent_anchor_error_and_fatal_cleanup() {
     println!("KELD_KEL143_AC4_ACTOR_FAILURE code={} fatal=true entries=1 returns=1 roots=0 target_handles=0 owner_joined=true stage_absent=true provision_trace_owned_by=direct", error.code());
     absence.restore();
     println!("KELD_AC7_CASE_DONE case={CASE} actual_actor=true provision_trace_owned_by=direct");
+}
+
+
+/// Actual accepted identities share the existing actor/native physical owner lane.
+#[test]
+#[ignore = "explicit physical macOS source-bound KEL-97 guardian identity lane"]
+fn actual_guardian_retains_primary_identity_through_retirement_and_g2() {
+    use keld_ipc::CorrelationId;
+    const CASE: &str = "guardian-primary-identity";
+    const SELECTOR: &str = "app_session::tests::worker_link_e2e::native_observer_e2e::native_generation_recovery::actor_owner::actual_guardian_retains_primary_identity_through_retirement_and_g2";
+    if !support::is_native_child(CASE) {
+        support::isolated_guardian_case(CASE, SELECTOR);
+        return;
+    }
+    let (mut fixture, initial_principal) = ActorFixture::start_identity();
+    let handle = fixture.handle();
+    let caller1 = {
+        let current = handle.current.lock().expect("actual accepted row");
+        let active = current.as_ref().expect("real G1 row");
+        assert!(active.identity == PrimaryLinkIdentity::Role(initial_principal));
+        PrimaryCallerContext { attempt: active.attempt, identity: active.identity,
+            reader_stop: Arc::clone(&active.reader_stop) }
+    };
+    let old = roundtrip(&handle, "00000000000000000000000000000097");
+    fixture.native.gate_taken.recv_timeout(OBSERVATION_BOUND).expect("actual G1 work taken");
+    let held = fixture.native.signals.held.recv_timeout(OBSERVATION_BOUND).expect("real native hold");
+    assert!(!held.fixture_fault);
+    assert_eq!((held.request_entries, held.request_returns), (1, 0));
+    fixture.assert_held();
+    fixture.owner_handle().fail_generation(1).expect("actual owner fault request");
+    let mut turns = ActorTurns::start(fixture.owner_handle());
+    observe_held_actor_retirement(&fixture, &mut turns, &old);
+    assert!(caller1.reader_stop.load(Ordering::Acquire));
+    dispatch_primary_echo(&handle.current, &handle.shutdown, &caller1, CorrelationId(97), &[0xff])
+        .expect("real retired caller inert before decode");
+    assert_old_return_and_broker_baseline(&mut fixture);
+    let deadline = Instant::now() + OBSERVATION_BOUND;
+    while !handle.is_current(2) {
+        assert!(Instant::now() < deadline, "actual owner G2 absent");
+        turns.advance();
+    }
+    let caller2 = {
+        let current = handle.current.lock().expect("real G2 row");
+        let active = current.as_ref().expect("actual G2 installed");
+        let PrimaryLinkIdentity::Role(principal) = active.identity else {
+            panic!("authenticated G2 lost actual role identity");
+        };
+        assert_eq!(principal.owner(), initial_principal.owner());
+        assert_ne!(principal.generation(), initial_principal.generation());
+        PrimaryCallerContext { attempt: active.attempt, identity: active.identity,
+            reader_stop: Arc::clone(&active.reader_stop) }
+    };
+    let mismatched = PrimaryCallerContext { identity: caller1.identity, ..caller2.clone() };
+    dispatch_primary_echo(&handle.current, &handle.shutdown, &mismatched, CorrelationId(98), &[0xff])
+        .expect("only old accepted principal refuses before decode");
+    dispatch_primary_echo(&handle.current, &handle.shutdown, &caller1, CorrelationId(99), &[0xff])
+        .expect("actual G1 stays inert while G2 current");
+    assert_eq!(caller2.attempt, 2);
+    let successor = roundtrip(&handle, "00000000000000000000000000000197");
+    assert_eq!(public_outcome(&successor), json!({"ok":true,"bytes":fixture.inputs.expected_content}));
+    // Positive is the approved successor channel: actual G2 public FS write/read
+    // carried by this one accepted link; the outer Host Echo is only control.
+    {
+        let current = handle.current.lock().expect("current after actual G2 reply");
+        let active = current.as_ref().expect("G2 survived its successor-channel reply");
+        assert_eq!(active.attempt, caller2.attempt);
+        assert!(active.identity == caller2.identity);
+        assert!(Arc::ptr_eq(&active.reader_stop, &caller2.reader_stop));
+        assert!(!caller2.reader_stop.load(Ordering::Acquire));
+        let state = fixture.snapshot.fs.state.lock().expect("actual G2 worker metadata");
+        assert_eq!(state.prepared_attempt, Some(2));
+        assert_eq!(state.in_flight, 0);
+    }
+    assert_eq!(fs::read(&fixture.inputs.target).expect("independent exact G2 effect"), fixture.inputs.expected_content);
+    let denied = public_call(&handle, "00000000000000000000000000000297", "deny", 2);
+    assert_eq!(public_outcome_count(&denied, 2)["code"], "KELD-GUARD002");
+    assert_eq!(fs::read(&fixture.inputs.outside).expect("denied sentinel"), fixture.inputs.outside_content);
+    drop(turns);
+    fixture.finish();
+    println!("KELD_AC7_CASE_DONE case={CASE} actual_actor=true bound_principal_retained=true window_document_claim=false");
 }
