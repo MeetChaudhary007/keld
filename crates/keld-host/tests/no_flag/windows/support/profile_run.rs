@@ -199,9 +199,15 @@ impl SignedProfileStateRun {
         }
     }
 
-    pub(crate) fn finish(mut self) {
+    pub(crate) fn finish(self) {
+        let deadline = self.deadline;
+        self.finish_by(deadline);
+    }
+
+    /// Finish a deliberately retained live run within its caller-owned shutdown budget.
+    pub(crate) fn finish_by(mut self, deadline: Instant) {
         let host_pid = self.process.host_pid();
-        let _window = wait_for_host_window(host_pid, self.deadline);
+        let _window = wait_for_host_window(host_pid, deadline);
         self.reader
             .get_mut()
             .write_all(b"QUIT\n")
@@ -212,7 +218,7 @@ impl SignedProfileStateRun {
             .expect("flush state host Quit");
         assert_eq!(read_control_line(&mut self.reader), "QUIT_REPLY");
         assert_eq!(read_control_line(&mut self.reader), "LINK_EOF");
-        let status = self.process.wait(self.deadline);
+        let status = self.process.wait(deadline);
         assert!(
             status.success(),
             "{} host exited with {status}",

@@ -223,7 +223,8 @@ fn kel135_signed_profiles_run_concurrently_and_survive_other_app_close() {
         })
     );
 
-    run_a.finish();
+    // A remains live through B's independent setup; shutdown has its own unchanged budget.
+    run_a.finish_by(deadline());
     assert_process_signaled(&first_webview_process, "App A WebView2");
     assert!(
         process_exists(run_b.process.host_pid()),
@@ -244,7 +245,7 @@ fn kel135_signed_profiles_run_concurrently_and_survive_other_app_close() {
         "KELD_KEL135_PROFILE_SURVIVOR {}",
         serde_json::json!({"closed_host": "A", "host_alive": true, "webview2_alive": true, "process": survivor})
     );
-    run_b.finish();
+    run_b.finish_by(deadline());
     assert_process_signaled(&second_webview_process, "App B WebView2");
 
     start_case(&context, &context.fixture_b, &context.restart_case()).finish();
