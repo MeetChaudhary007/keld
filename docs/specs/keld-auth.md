@@ -883,6 +883,24 @@ key: `auth: { "entra-common": { clientId: "…" } }`, with an optional
 `fixedRedirect: "…"` beside `clientId` where the operator registered a fixed
 redirect. (Errata pass 7: earlier revisions wrote `fixedRedirect?:` inside the
 value literal, which is TypeScript *type* syntax and does not parse if copied.)
+
+**T3 config-shape tightening (PR716 follow-up).** Each profile value is a
+closed object with only `clientId` and `fixedRedirect`. The static TypeScript
+config reader accepts string literals for these fields when present. The raw
+schema-1 boot DTO retains its existing `Option<String>` decoding: omission or
+JSON `null` means absence. This tightening does not add TypeScript `null`
+syntax or change that boot compatibility.
+Unknown inner fields are rejected by the one Native configuration DTO on both
+the static-config and schema-1 boot paths, instead of being silently discarded;
+Core reports the existing `KELD-CORE-035` configuration error. Unknown outer
+profile keys remain accepted when their values have this DTO shape and are
+ignored with one load-time Native warning. They cannot introduce fields,
+providers or issuer policy. This shape rule does not validate missing/empty
+client ids or redirect values early: absence remains data, and semantic
+client/redirect validation still happens only after guard Allow. This is an
+explicit acceptance-contract tightening of D14, recorded with the same PR's
+existing public-API/permission delegated review; it is not a claim that the
+original note already required unknown-field rejection.
 Rationale: it is per-application, which is what the value is; it is
 operator-authored, so the child cannot assert its own registration; an OAuth
 public-client id is **not a secret** (that is what PKCE is for), so plaintext

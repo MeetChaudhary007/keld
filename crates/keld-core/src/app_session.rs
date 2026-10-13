@@ -8323,6 +8323,34 @@ mod tests {
     }
 
     #[test]
+    fn strict_schema_v1_boot_rejects_unknown_auth_profile_fields() {
+        let cases = [
+            br#"{"schema":1,"name":"Fixture","entry":"src/main.ts","renderer":"index.html","permissions":{"file":"keld.permissions.jsonc","content_sha256":"sha256:ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356"},"auth":{"entra-common":{"clientID":"operator-client"}}}"#.as_slice(),
+            br#"{"schema":1,"name":"Fixture","entry":"src/main.ts","renderer":"index.html","permissions":{"file":"keld.permissions.jsonc","content_sha256":"sha256:ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356"},"auth":{"entra-common":{"clientId":"operator-client","fixedRedirct":"http://localhost:53161/callback"}}}"#.as_slice(),
+            br#"{"schema":1,"name":"Fixture","entry":"src/main.ts","renderer":"index.html","permissions":{"file":"keld.permissions.jsonc","content_sha256":"sha256:ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356"},"auth":{"future-provider":{"clientID":"unused"}}}"#.as_slice(),
+        ];
+        for bytes in cases {
+            let error = must_err(
+                parse_boot_bytes(bytes),
+                "unknown inner auth field must refuse",
+            );
+            assert_eq!(error.code(), "KELD-CORE-035");
+        }
+    }
+
+    #[test]
+    fn strict_schema_v1_auth_null_fields_preserve_absence() {
+        let bytes = br#"{"schema":1,"name":"Fixture","entry":"src/main.ts","renderer":"index.html","permissions":{"file":"keld.permissions.jsonc","content_sha256":"sha256:ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356"},"auth":{"entra-common":{"clientId":null,"fixedRedirect":null}}}"#;
+        let parsed = parse_boot_bytes(bytes).expect("existing Option null compatibility");
+        let profile = parsed
+            .auth_configuration
+            .get("entra-common")
+            .expect("known profile");
+        assert!(profile.client_id.is_none());
+        assert!(profile.fixed_redirect.is_none());
+    }
+
+    #[test]
     fn strict_schema_v1_boot_without_auth_defaults_to_empty() {
         let bytes = br#"{"schema":1,"name":"Fixture","entry":"src/main.ts","renderer":"index.html","permissions":{"file":"keld.permissions.jsonc","content_sha256":"sha256:ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356"}}"#;
         let parsed = parse_boot_bytes(bytes).expect("legacy schema-v1 boot descriptor");

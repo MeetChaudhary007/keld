@@ -1135,7 +1135,7 @@ match the crate that already emits the code. Do not invent a third spelling.
 - module: auth
 - message: Exact-literal redirect mode is selected with a dynamic port before any socket attempt.
 - fix: Configure the one registered fixed redirect port; bind-0 is not a fallback. If a socket was attempted and bind failed, use KELD-AUTH-004 instead.
-- status: Declared target; request-construction-only boundary unqualified here.
+- status: Implemented T3 macOS redirect-plan validation source; qualification is limited to recorded predicates, not every profile/mode. Other OS-broker paths remain targets.
 
 
 ## KELD-AUTH-010
@@ -1144,7 +1144,7 @@ match the crate that already emits the code. Do not invent a third spelling.
 - module: auth
 - message: The child-supplied login_hint exceeds its byte bound or contains a control character.
 - fix: Correct only the named length or character-class constraint; never include the offending login_hint value in the diagnostic.
-- status: Declared target; post-Allow validation ordering and PII suppression unqualified here.
+- status: Implemented T3 macOS post-Allow login-hint validation source; qualification is limited to recorded ordering and privacy predicates. Other OS-broker paths remain targets.
 
 
 ## KELD-AUTH-011
@@ -1162,7 +1162,7 @@ match the crate that already emits the code. Do not invent a third spelling.
 - module: auth
 - message: The IdP returned an OAuth callback error such as access_denied, invalid_scope or interaction_required.
 - fix: Treat the sanitized provider error code as the IdP decision, not Keld policy. Bound provider text to 256 bytes with truncation marked, strip controls and quote it in a delimited position after Keld’s code; never parse it to select a Keld code path.
-- status: Declared target; callback and D18(a) provider-text behavior unqualified here.
+- status: Implemented T3 macOS correlated provider-callback error and D18(a) sanitation source; qualification is predicate-specific. Other OS-broker paths remain targets.
 
 
 ## KELD-AUTH-013
@@ -1188,7 +1188,7 @@ match the crate that already emits the code. Do not invent a third spelling.
 - module: auth
 - message: Rung-3 loopback listener bind or system-browser launch failed.
 - fix: For a bind failure, free the configured port or correct its registration; for a browser-launch failure, configure a working default browser. Name which operation failed.
-- status: Declared target; real listener/browser behavior unqualified here.
+- status: Implemented T3 macOS loopback-bind and system-browser-launch failure source; qualification is limited to recorded predicates. Other OS-broker paths remain targets.
 
 ## KELD-AUTH-007
 
@@ -1196,7 +1196,7 @@ match the crate that already emits the code. Do not invent a third spelling.
 - module: auth
 - message: The user cancelled the broker or external-user-agent dialog (canceledLogin class); the failure is non-terminal.
 - fix: Retry only when initiated by the user. A defect-neutral default-browser hint is permitted; do not assert an Apple defect or retry automatically.
-- status: Declared target; cancel classification and lifecycle unqualified here.
+- status: Implemented T3 macOS owning-flow cancellation source; qualification is limited to recorded predicates and does not establish external-dialog cancellation. Other OS-broker paths remain targets.
 
 ## KELD-AUTH-008
 
@@ -1204,7 +1204,7 @@ match the crate that already emits the code. Do not invent a third spelling.
 - module: auth
 - message: The authorization step did not complete within the host bound.
 - fix: Start a new user-initiated auth.begin; never retry automatically.
-- status: Declared target; actual deadline behavior unqualified here.
+- status: Implemented T3 macOS authorization/launch deadline source; qualification is limited to recorded absolute-bound predicates. Other OS-broker paths remain targets.
 
 ## KELD-AUTH-009
 
@@ -1212,7 +1212,7 @@ match the crate that already emits the code. Do not invent a third spelling.
 - module: auth
 - message: Terminal invalid_grant refresh failure evicts the session and ends its liveness.
 - fix: Sign in again through auth.begin; the host holds no durable credential.
-- status: Declared target; refresh eviction and live-session behavior unqualified here.
+- status: Implemented T3 macOS exact terminal-refresh classification and current-session eviction source; qualification is predicate-specific, not proof of every IdP outcome. Other OS-broker paths remain targets.
 
 ## KELD-AUTH-015
 
@@ -1220,4 +1220,4 @@ match the crate that already emits the code. Do not invent a third spelling.
 - module: auth
 - message: The resolved provider profile has no clientId configured for this application; this is refused only after guard Allow.
 - fix: Add clientId under the named profile in the keld.config.ts auth section. Name the profile/configuration location without account or session detail.
-- status: Declared target; post-Allow missing-client refusal and configured/unconfigured deny equality unqualified here.
+- status: Implemented T3 macOS post-Allow missing-client refusal source; qualification is limited to recorded admission and denial-equality predicates. Other OS-broker paths remain targets.

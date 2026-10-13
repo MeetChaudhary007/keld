@@ -1065,6 +1065,24 @@ mod auth_config_tests {
     }
 
     #[test]
+    fn static_auth_rejects_unknown_profile_fields_at_owning_dto() {
+        for source in [
+            "export default { auth: { 'entra-common': { clientID: 'operator-client' } } };",
+            "export default { auth: { 'future-provider': { clientID: 'unused' } } };",
+            "export default { auth: { 'entra-common': { clientId: 'operator-client', fixedRedirct: 'http://localhost:53161/callback' } } };",
+        ] {
+            let error = auth_configuration_from_config_ts(source)
+                .expect_err("unknown inner auth field must refuse");
+            assert!(error.to_string().starts_with("KELD-CORE-035"));
+            assert!(
+                error
+                    .to_string()
+                    .contains("invalid auth configuration fields")
+            );
+        }
+    }
+
+    #[test]
     fn static_auth_keeps_unknown_profile_and_missing_client_for_native_owner() {
         let config = auth_configuration_from_config_ts(
             "export default { auth: { 'unknown-provider': { clientId: 'operator' }, 'entra-common': {} } };"

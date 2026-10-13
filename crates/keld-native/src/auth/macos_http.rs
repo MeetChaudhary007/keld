@@ -2,7 +2,7 @@
 //! Call only after the owning auth broker's guard admission. This module owns
 //! HTTP handles/callback custody, not provider policy, JSON/token interpretation,
 //! account/session liveness or single-flight admission.
-#![allow(unsafe_code)] // Proposed KEL-89 exact-path sanction; MUST be reviewed/applied before integration.
+#![allow(unsafe_code)] // Exact KEL-89 path/operation sanction: crates/keld-native/AGENTS.md.
 #![deny(unsafe_op_in_unsafe_fn)]
 
 use std::fmt;

@@ -92,6 +92,8 @@ struct Fixture {
     _temp: tempfile::TempDir,
     finished: bool,
     fs: Option<super::super::GuardSnapshot>,
+    // Reuse the same immutable verified policy to construct a genuine guard-denied result.
+    verified: super::super::VerifiedManifest,
     // Retain the actual routing owner channels through router teardown.
     guardian: std::sync::mpsc::Receiver<super::super::GuardianOwnerCommand>,
     window: std::sync::mpsc::Receiver<super::super::AppWindowCommand>,
@@ -149,7 +151,7 @@ impl Fixture {
                 .transpose()?,
             1,
             None,
-            Some((verified, configuration)),
+            Some((verified.clone(), configuration)),
         )?;
         router
             .handle
@@ -161,6 +163,7 @@ impl Fixture {
             _temp: temp,
             finished: false,
             fs: snapshot,
+            verified,
             guardian,
             window,
         })
@@ -864,6 +867,250 @@ fn cli_loss_auth_poison_preserves_echo_error_link_close_and_guardian_tail() -> F
     drop(writer_probe);
     if let Err(error) = fixture.finish() {
         eprintln!("expected poisoned-fixture cleanup: {error}");
+    }
+    Ok(())
+}
+
+struct AuthWriteProbe {
+    session: Arc<AuthSession>,
+    reader_stop: Arc<AtomicBool>,
+    read_probe: UnixStream,
+    publisher: std::thread::JoinHandle<Option<super::super::HostAppError>>,
+}
+
+fn start_auth_write_probe(fixture: &Fixture, correlation: u32) -> FixtureResult<AuthWriteProbe> {
+    let handle = fixture.router.handle.clone();
+    let session = Arc::clone(handle.auth.as_ref().ok_or("host auth owner absent")?);
+    let (reader_stop, read_probe) = {
+        let current = handle.current.lock().map_err(|_| "current poisoned")?;
+        let active = current.as_ref().ok_or("current generation absent")?;
+        (Arc::clone(&active.reader_stop), active.writer.try_clone()?)
+    };
+    let ticket = session.reserve(1, CorrelationId(correlation))?;
+    let mut broker =
+        keld_native::auth::AuthBroker::prepare(&fixture.verified, AuthConfiguration::new());
+    let (state, ticket) = super::enter_auth_request(
+        &mut broker,
+        &handle,
+        &session,
+        &fixture.verified,
+        super::AuthWork {
+            ticket,
+            request: begin(None),
+            cancellation: Arc::clone(&reader_stop),
+        },
+        false,
+    )?
+    .ok_or("actual auth entry unavailable")?;
+    let keld_native::auth::HandleState::Ready(ref response) = state else {
+        return Err("empty policy did not produce a genuine Native Ready refusal".into());
+    };
+    let denied = response
+        .clone()
+        .into_response()
+        .err()
+        .ok_or("expected actual guard denial")?;
+    if denied.code != "KELD-GUARD001" {
+        return Err("unexpected Native guard-denied response".into());
+    }
+    // Fail only the actual outbound direction; the reader remains live until
+    // publication retires it. Keep this duplicate to exclude Drop-only cleanup.
+    read_probe.shutdown(std::net::Shutdown::Write)?;
+    let publisher_session = Arc::clone(&session);
+    let publisher = std::thread::spawn(move || {
+        let mut operations = HashMap::new();
+        let mut failure = None;
+        super::dispatch_result(
+            state,
+            ticket,
+            &mut operations,
+            &handle,
+            &publisher_session,
+            &mut failure,
+        );
+        failure
+    });
+    Ok(AuthWriteProbe {
+        session,
+        reader_stop,
+        read_probe,
+        publisher,
+    })
+}
+
+#[test]
+fn auth_terminal_write_loss_keeps_host_owner_and_actual_successor_route() -> FixtureResult<()> {
+    use super::super::{AppWindowCommand, GuardianOwnerCommand};
+    use std::io::Read as _;
+    let mut fixture = Fixture::new("{}", AuthConfiguration::new())?;
+    let worker = fixture
+        .router
+        .auth_worker
+        .as_ref()
+        .ok_or("worker absent")?
+        .join
+        .as_ref()
+        .ok_or("worker join absent")?
+        .thread()
+        .id();
+    let probe = start_auth_write_probe(&fixture, 701)?;
+    let AuthWriteProbe {
+        session,
+        reader_stop,
+        mut read_probe,
+        publisher,
+    } = probe;
+    let command = fixture.guardian.recv_timeout(Duration::from_secs(5))?;
+    let GuardianOwnerCommand::FailGeneration(1, reply) = command else {
+        return Err("auth write loss sent wrong existing guardian request".into());
+    };
+    let retired_before_ack = fixture
+        .router
+        .handle
+        .current
+        .lock()
+        .map_err(|_| "current poisoned")?
+        .is_none();
+    let stopped_before_ack = reader_stop.load(Ordering::Acquire);
+    reply.send(Ok(()))?;
+    let failure = publisher
+        .join()
+        .map_err(|_| "publication caller panicked")?;
+    let mut byte = [0];
+    let read_closed = matches!(read_probe.read(&mut byte), Ok(0));
+    let running = fixture.router.handle.shutdown.is_running();
+    let accepting = session.accepting.load(Ordering::Acquire);
+    let tail = session.tail.load(Ordering::Acquire);
+    let no_fatal = !fixture
+        .window
+        .try_iter()
+        .any(|event| matches!(event, AppWindowCommand::Fatal));
+    fixture
+        .take_reader(1)?
+        .join()
+        .map_err(|_| "retired reader panicked")??;
+    let mut healthy = None;
+    if failure.is_none() && running && accepting && !tail && no_fatal {
+        let (server, client) = UnixStream::pair()?;
+        client.set_app_link_deadlines(Some(Duration::from_secs(5)))?;
+        fixture
+            .router
+            .handle
+            .install_prepared_generation(2, server)
+            .map_err(|failure| failure.error)?;
+        fixture.client = client;
+        healthy = Some(fixture.call(&begin(None), 702)?.code);
+    }
+    let same_owner = Arc::ptr_eq(
+        &session,
+        fixture
+            .router
+            .handle
+            .auth
+            .as_ref()
+            .ok_or("successor auth owner absent")?,
+    );
+    let same_worker = fixture
+        .router
+        .auth_worker
+        .as_ref()
+        .ok_or("worker absent")?
+        .join
+        .as_ref()
+        .ok_or("worker join absent")?
+        .thread()
+        .id()
+        == worker;
+    let zero = session.used.load(Ordering::Acquire);
+    let cleanup = fixture.finish(); // Complete normal fixture cleanup before the baseline oracle.
+    assert!(
+        failure.is_none(),
+        "successful retirement/ACK became Fatal: {failure:?}"
+    );
+    assert!((retired_before_ack && stopped_before_ack && read_closed) && running);
+    assert!(accepting && !tail && no_fatal && same_owner && same_worker);
+    assert_eq!(healthy.as_deref(), Some("KELD-GUARD001"));
+    assert_eq!(zero, 0);
+    cleanup?;
+    Ok(())
+}
+
+#[test]
+fn auth_terminal_write_loss_preserves_failed_ack_and_cleanup_as_fatal() -> FixtureResult<()> {
+    use super::super::{AppWindowCommand, GuardianOwnerCommand};
+    use std::io::Read as _;
+    for cleanup_fault in [false, true] {
+        let mut fixture = Fixture::new_with_fs("{}", AuthConfiguration::new(), cleanup_fault)?;
+        if cleanup_fault {
+            let fs = Arc::clone(&fixture.fs.as_ref().ok_or("FS snapshot absent")?.fs);
+            assert!(
+                std::thread::spawn(move || {
+                    let _held = fs.state.lock().expect("actual cleanup state");
+                    panic!("controlled FS retirement poison");
+                })
+                .join()
+                .is_err()
+            );
+        }
+        let AuthWriteProbe {
+            session,
+            reader_stop,
+            mut read_probe,
+            publisher,
+        } = start_auth_write_probe(&fixture, 703)?;
+        let command = fixture.guardian.recv_timeout(Duration::from_secs(5))?;
+        let GuardianOwnerCommand::FailGeneration(1, reply) = command else {
+            return Err("auth write loss sent wrong existing guardian request".into());
+        };
+        if cleanup_fault {
+            reply.send(Ok(()))?;
+        } else {
+            reply.send(Err("controlled recovery acknowledgment failure".to_owned()))?;
+        }
+        let failure = publisher
+            .join()
+            .map_err(|_| "publication caller panicked")?;
+        let mut byte = [0];
+        let read_closed = matches!(read_probe.read(&mut byte), Ok(0));
+        let retired = fixture
+            .router
+            .handle
+            .current
+            .lock()
+            .map_err(|_| "current poisoned")?
+            .is_none();
+        let fatal = fixture
+            .window
+            .try_iter()
+            .any(|event| matches!(event, AppWindowCommand::Fatal));
+        let stopped = reader_stop.load(Ordering::Acquire);
+        let tail = session.tail.load(Ordering::Acquire);
+        let accepting = session.accepting.load(Ordering::Acquire);
+        fixture
+            .take_reader(1)?
+            .join()
+            .map_err(|_| "retired reader panicked")??;
+        let cleanup = fixture.finish(); // Typed failed cleanup is retained, not a success fallback.
+        let error = failure.ok_or("failed ACK/cleanup did not remain fatal")?;
+        assert_eq!(error.code(), "KELD-CORE-037");
+        assert_eq!(
+            error.phase, "auth call error",
+            "primary typed phase was replaced"
+        );
+        let rendered = error.to_string();
+        assert!(rendered.contains("auth call error") && rendered.contains("cleanup"));
+        if cleanup_fault {
+            assert!(rendered.contains("filesystem retirement"));
+        } else {
+            assert!(rendered.contains("controlled recovery acknowledgment failure"));
+        }
+        assert!(retired && stopped && read_closed && fatal && tail && !accepting);
+        if cleanup_fault {
+            let error = cleanup.expect_err("actual poisoned fixture cleanup must remain typed");
+            assert!(error.to_string().contains("filesystem"));
+        } else {
+            cleanup?;
+        }
     }
     Ok(())
 }

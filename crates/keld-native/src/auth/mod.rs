@@ -180,6 +180,7 @@ pub fn provider_profile(key: &str) -> Option<&'static ProviderProfile> {
 /// `keld.config.ts` and `keld.boot.json`. They are distinct from the
 /// `snake_case` auth CALL/REPLY payload fields.
 #[derive(Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuthProfileConfiguration {
     /// Public OAuth client id; absence is checked only after guard Allow.
     #[serde(rename = "clientId", default, skip_serializing_if = "Option::is_none")]
@@ -535,6 +536,48 @@ mod tests {
         ] {
             assert!(provider_profile(key).is_none(), "{key}");
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn configuration_rejects_unknown_inner_fields_without_validating_values() {
+        for value in [
+            r#"{"clientID":"operator-client"}"#,
+            r#"{"clientId":"operator-client","fixedRedirct":"http://localhost:53161/callback"}"#,
+            r#"{"clientId":"operator-client","issuer":"https://unconfigured.invalid"}"#,
+        ] {
+            let error = serde_json::from_str::<AuthProfileConfiguration>(value)
+                .expect_err("unknown profile field must refuse");
+            assert!(error.to_string().contains("unknown field"));
+        }
+        let absent: AuthProfileConfiguration =
+            serde_json::from_str("{}").expect("missing client remains post-Allow data");
+        assert!(absent.client_id.is_none());
+        let unvalidated: AuthProfileConfiguration =
+            serde_json::from_str(r#"{"clientId":"","fixedRedirect":"not-a-uri"}"#)
+                .expect("value validation remains post-Allow");
+        assert_eq!(unvalidated.client_id.as_deref(), Some(""));
+        assert_eq!(unvalidated.fixed_redirect.as_deref(), Some("not-a-uri"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn decoded_unknown_outer_profile_is_filtered_once_after_shape_parse() {
+        let mut configuration: AuthConfiguration =
+            serde_json::from_str(r#"{"entra-common":{},"future-provider":{"clientId":"unused"}}"#)
+                .expect("outer profile names are not a schema rejection");
+        assert_eq!(configuration.len(), 2);
+        let mut warnings = Vec::new();
+        retain_known_profiles(&mut configuration, |key| warnings.push(key.to_owned()));
+        assert_eq!(warnings, ["future-provider"]);
+        assert_eq!(configuration.len(), 1);
+        assert!(
+            configuration
+                .get("entra-common")
+                .expect("known profile")
+                .client_id
+                .is_none()
+        );
     }
 
     #[test]

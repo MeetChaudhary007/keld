@@ -258,6 +258,12 @@ impl Drop for AuthWorker {
     }
 }
 
+// A recovered write loss is an observed typed incident, not successful delivery.
+enum AuthPublication {
+    NoIncident,
+    GenerationRetired(HostAppError),
+}
+
 impl PrimaryRouterHandle {
     pub(super) fn enqueue_auth(
         &self,
@@ -316,20 +322,20 @@ impl PrimaryRouterHandle {
         session: &AuthSession,
         ticket: &Arc<CallerTicket>,
         response: ReadyResponse,
-    ) -> Result<(), HostAppError> {
+    ) -> Result<AuthPublication, HostAppError> {
         let transition = self.shutdown.transition_guard();
         let mut current = self
             .current
             .lock()
             .map_err(|_| app_detail("auth publication", "generation lock poisoned"))?;
         let Some(active) = current.as_mut().filter(|a| a.attempt == ticket.key.0) else {
-            return Ok(());
+            return Ok(AuthPublication::NoIncident);
         };
         if !self.shutdown.is_running() || active.reader_stop.load(Ordering::Acquire) {
-            return Ok(());
+            return Ok(AuthPublication::NoIncident);
         }
         if !session.take(ticket)? {
-            return Ok(());
+            return Ok(AuthPublication::NoIncident);
         }
         // Freshness conversion occurs per live follower AFTER final Core checks.
         let result = response.into_response();
@@ -367,9 +373,12 @@ impl PrimaryRouterHandle {
             drop(current);
             drop(transition);
             let recovery = self.link_failed(ticket.key.0);
-            return Err(super::append_app_cleanup(primary, [cleanup, recovery]));
+            return match (cleanup, recovery) {
+                (Ok(()), Ok(())) => Ok(AuthPublication::GenerationRetired(primary)),
+                (cleanup, recovery) => Err(super::append_app_cleanup(primary, [cleanup, recovery])),
+            };
         }
-        Ok(())
+        Ok(AuthPublication::NoIncident)
     }
 }
 
@@ -394,6 +403,21 @@ fn record_failure(
         eprintln!("{error}"); // only already-redacted component/Core diagnostics
         *failure = Some(error);
         let _ = handle.window_commands.send(AppWindowCommand::Fatal);
+    }
+}
+
+// All publication callers share this classification. The original resource-redacted
+// typed incident is reported only after retirement and the existing owner ACK succeed.
+fn observe_auth_publication(
+    handle: &PrimaryRouterHandle,
+    session: &AuthSession,
+    failure: &mut Option<HostAppError>,
+    publication: Result<AuthPublication, HostAppError>,
+) {
+    match publication {
+        Ok(AuthPublication::NoIncident) => {}
+        Ok(AuthPublication::GenerationRetired(primary)) => eprintln!("{primary}"),
+        Err(error) => record_failure(handle, session, failure, error),
     }
 }
 
@@ -490,9 +514,12 @@ fn publish_events(
     {
         if let Some(operation) = operations.get_mut(&operation) {
             for ticket in operation.callers.drain(..) {
-                if let Err(error) = handle.publish_auth(session, &ticket, response.clone()) {
-                    record_failure(handle, session, failure, error);
-                }
+                observe_auth_publication(
+                    handle,
+                    session,
+                    failure,
+                    handle.publish_auth(session, &ticket, response.clone()),
+                );
             }
         }
     }
@@ -575,9 +602,12 @@ fn dispatch_result(
 ) {
     match state {
         HandleState::Ready(response) => {
-            if let Err(error) = handle.publish_auth(session, &ticket, response) {
-                record_failure(handle, session, failure, error);
-            }
+            observe_auth_publication(
+                handle,
+                session,
+                failure,
+                handle.publish_auth(session, &ticket, response),
+            );
         }
         HandleState::Pending {
             operation,
@@ -621,9 +651,12 @@ fn dispatch_result(
             }
         }
         HandleState::DeniedInvariant { response, fault } => {
-            if let Err(error) = handle.publish_auth(session, &ticket, response) {
-                record_failure(handle, session, failure, error);
-            }
+            observe_auth_publication(
+                handle,
+                session,
+                failure,
+                handle.publish_auth(session, &ticket, response),
+            );
             record_failure(handle, session, failure, host_fault(&fault));
         }
         HandleState::HostFault(fault) => {
