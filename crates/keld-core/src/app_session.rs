@@ -7009,7 +7009,7 @@ fn read_primary_frames(
             reader_stop,
             || handle.pending_echo_corr_for(attempt),
             handle.privileged_calls(),
-            |entry, corr| {
+            |entry, _corr| {
                 if entry.id() == FS_CHANNEL {
                     return if handle.has_outstanding_fs_call(attempt) {
                         GuardedCallAdmission::RejectSession
@@ -7023,7 +7023,7 @@ fn read_primary_frames(
                         .auth
                         .as_ref()
                         .map_or(GuardedCallAdmission::RejectSession, |auth| {
-                            auth.admission(attempt, corr)
+                            auth.admission(attempt, _corr)
                         });
                 }
                 GuardedCallAdmission::RejectSession
