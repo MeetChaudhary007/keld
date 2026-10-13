@@ -244,6 +244,19 @@ selected channels use their own bounded owner state; an outstanding FS call
 cannot silently occupy an auth slot, and auth pending-call capacity is distinct
 from the broker's account/scope single-flight key. No selection mints authority:
 exact channel payload decoding and the sole guard-before-handler dispatch follow.
+
+Guarded admission distinguishes a terminal session violation from temporary capacity
+exhaustion. Duplicate correlations and closed/poisoned owners remain terminal IPC005
+before payload allocation. A valid fresh CALL at capacity is not admitted: the shared
+reader consumes its complete MAX_FRAME_LEN-bounded body under the same first-byte
+absolute frame deadline, without decoding or handler/guard entry; Core then sends the
+IPC-owned resource-free `CallError::admission_capacity` as a correlated IPC005 ERR and
+continues the link. Truncation or frame expiry stays terminal and yields no refusal
+result. This is not an AUTH016 producer or a new authorization rule. Core auth retains
+its 32 physical/caller reservations; a logical reply does not release a physical leader
+before Native Drained. The published error contract does not require callers to mirror
+that private counter or infer physical drain from a reply.
+
 The accepted-Quit drain uses the same selected entries and existing deadlines,
 with no new admission or handler entry after quiescence.
 
@@ -293,6 +306,7 @@ same absolute instant.
 | structured payload codec/trailing bytes | `KELD-IPC-003` | close, or correlated `ERR` only where an approved live session explicitly permits request errors | never invoke handler |
 | payload envelope over maximum | `KELD-IPC-004` | close | close; pre-auth may reaccept |
 | invalid kind/flags/channel/correlation/declared length | `KELD-IPC-005` | close | never invoke handler; pre-auth may reaccept |
+| valid fresh guarded CALL at host-owned admission capacity | `KELD-IPC-005` capacity constant | correlated `ERR`, after complete bounded body | link remains live; no admission, decode, Guard or broker effect; original first-byte frame deadline unchanged |
 | absolute transport/frame/call expiry | `KELD-IPC-006` | close/local timeout | partial frame is terminal for the link; generation expiry is terminal for admission |
 | exact-shape foreign HELLO token | `KELD-IPC-007` (redacted) | close/local I/O failure | pre-auth may reaccept while generation deadline remains |
 | valid privileged request denied by guard | registered `KELD-GUARD-*` `CallError` | correlated `ERR` | session remains live; zero broker side effect |

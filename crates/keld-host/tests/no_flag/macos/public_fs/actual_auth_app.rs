@@ -484,7 +484,7 @@ fn await_active_begin_terminal(
             report["phase"] == "begin-quit-terminal"
                 && pid(&report, "pid")? == bun
                 && report["smokeCase"] == case.name
-                && (report["code"] == "KELD-IPC-022" || report["code"] == "KELD-IPC-024"),
+                && (report["code"] == "KELD-IPC-022" || report["code"] == "KELD-IPC-023"),
             "pending actual public Begin did not terminate through accepted Quit",
         )?;
         Some(report)

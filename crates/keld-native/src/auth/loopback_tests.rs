@@ -113,6 +113,182 @@ fn actual_dynamic_bind_fragmented_get_and_single_use_correlation() {
     assert!(flow.accepted.is_none() && flow.listener.is_none());
 }
 #[test]
+fn quiet_first_peer_cannot_block_a_valid_second_callback() {
+    let (mut flow, state) = flow();
+    let original_deadline = flow.deadline;
+    let mut quiet = client(&flow);
+    while flow.accepted.is_none() {
+        assert!(matches!(flow.poll(), LoopbackProgress::Pending));
+        assert!(
+            Instant::now() < original_deadline,
+            "quiet accepted receipt absent"
+        );
+        thread::yield_now();
+    }
+    let accepted = flow.accepted.as_ref().expect("actual quiet accepted owner");
+    assert!(accepted.request.is_empty());
+    assert!(accepted.reply.is_none());
+    let mut callback = client(&flow);
+    let wire = request(
+        &flow,
+        &format!("/callback?code=C&state={state}"),
+        &format!("localhost:{}", flow.bound_port),
+    );
+    callback
+        .write_all(&wire)
+        .expect("actual complete second GET");
+    let correlated = finish(&mut flow).expect("valid second callback must progress");
+    assert_eq!(
+        flow.deadline, original_deadline,
+        "absolute bound must not renew"
+    );
+    let form = correlated
+        .token_form("test-client", flow.redirect())
+        .expect("single-use form");
+    assert!(form.as_str().contains("code=C"));
+    let page = read_page(&mut callback); // reads the selected kernel stream to EOF
+    assert!(page.starts_with(b"HTTP/1.1 200 OK\r\n"));
+    assert!(!String::from_utf8_lossy(&page).contains(&state));
+    assert!(!String::from_utf8_lossy(&page).contains("code=C"));
+    let mut byte = [0u8; 1];
+    assert!(
+        matches!(quiet.read(&mut byte), Ok(0)),
+        "quiet kernel peer did not close"
+    );
+    assert!(flow.listener.is_none() && flow.accepted.is_none() && flow.pending.is_none());
+    assert!(matches!(flow.poll(), LoopbackProgress::Complete(Err(error))
+        if error.code() == "KELD-AUTH-016"));
+    actual_dynamic_bind_fragmented_get_and_single_use_correlation();
+}
+
+#[test]
+fn full_idle_set_recycles_only_on_new_accept_then_allows_valid_callback() {
+    let (mut flow, state) = flow();
+    let original_deadline = flow.deadline;
+    let mut first = client(&flow);
+    first
+        .set_nonblocking(true)
+        .expect("nonblocking peer observation");
+    while flow.accepted.is_none() {
+        assert!(matches!(flow.poll(), LoopbackProgress::Pending));
+        assert!(
+            Instant::now() < original_deadline,
+            "first accepted receipt absent"
+        );
+        thread::yield_now();
+    }
+    assert!(matches!(flow.poll(), LoopbackProgress::Pending));
+    let mut byte = [0u8; 1];
+    assert!(
+        matches!(first.read(&mut byte), Err(error)
+        if error.kind() == io::ErrorKind::WouldBlock),
+        "ordinary idle poll closed first peer"
+    );
+    let mut second = client(&flow);
+    assert!(matches!(flow.poll(), LoopbackProgress::Pending));
+    let mut third = client(&flow);
+    let second_address = second.local_addr().expect("second client identity");
+    loop {
+        assert!(matches!(flow.poll(), LoopbackProgress::Pending));
+        let oldest_is_second = flow
+            .accepted
+            .as_ref()
+            .is_some_and(|accepted| accepted.stream.peer_addr().ok() == Some(second_address));
+        if oldest_is_second {
+            break;
+        }
+        assert!(
+            Instant::now() < original_deadline,
+            "full idle set never admitted third peer"
+        );
+        thread::yield_now();
+    }
+    loop {
+        match first.read(&mut byte) {
+            Ok(0) => break,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+            other => panic!("recycled zero-byte peer did not close: {other:?}"),
+        }
+        assert!(
+            Instant::now() < original_deadline,
+            "recycled peer EOF absent"
+        );
+        thread::yield_now();
+    }
+    let mut callback = client(&flow);
+    callback
+        .write_all(&request(
+            &flow,
+            &format!("/callback?code=C&state={state}"),
+            &format!("localhost:{}", flow.bound_port),
+        ))
+        .expect("valid callback after full idle set");
+    let correlated = finish(&mut flow).expect("full idle set must not consume authorization");
+    let form = correlated
+        .token_form("test-client", flow.redirect())
+        .expect("single-use form");
+    assert!(form.as_str().contains("code=C"));
+    assert_eq!(flow.deadline, original_deadline);
+    assert!(read_page(&mut callback).starts_with(b"HTTP/1.1 200 OK\r\n"));
+    assert!(matches!(second.read(&mut byte), Ok(0)));
+    assert!(matches!(third.read(&mut byte), Ok(0)));
+    assert!(flow.listener.is_none() && flow.accepted.is_none() && flow.pending.is_none());
+}
+
+#[test]
+fn started_callback_remains_fatal_behind_a_quiet_peer() {
+    for variant in 0..3 {
+        let (mut flow, state) = flow();
+        let original_deadline = flow.deadline;
+        let mut quiet = client(&flow);
+        while flow.accepted.is_none() {
+            assert!(matches!(flow.poll(), LoopbackProgress::Pending));
+            assert!(
+                Instant::now() < original_deadline,
+                "quiet accepted receipt absent"
+            );
+            thread::yield_now();
+        }
+        let mut invalid = client(&flow);
+        let wire = match variant {
+            0 => request(
+                &flow,
+                "/callback?code=C&state=wrong",
+                &format!("localhost:{}", flow.bound_port),
+            ),
+            1 => request(
+                &flow,
+                &format!("/callback?code=C&state={state}"),
+                "attacker.invalid",
+            ),
+            _ => b"GET /callback?state=incomplete HTTP/1.1\r\nHost:".to_vec(),
+        };
+        invalid
+            .write_all(&wire)
+            .expect("actual invalid second request");
+        if variant == 2 {
+            invalid
+                .shutdown(std::net::Shutdown::Write)
+                .expect("actual truncated EOF");
+        }
+        let error = finish(&mut flow).expect_err("invalid callback must consume whole flow");
+        assert_eq!(error.code(), "KELD-AUTH-011");
+        assert_eq!(flow.deadline, original_deadline);
+        assert!(!error.to_string().contains(&state));
+        let mut byte = [0u8; 1];
+        assert!(matches!(quiet.read(&mut byte), Ok(0)));
+        if variant == 2 {
+            assert!(matches!(invalid.read(&mut byte), Ok(0)));
+        } else {
+            assert!(read_page(&mut invalid).starts_with(b"HTTP/1.1 400 Bad Request\r\n"));
+        }
+        assert!(flow.listener.is_none() && flow.accepted.is_none() && flow.pending.is_none());
+        assert!(matches!(flow.poll(), LoopbackProgress::Complete(Err(error))
+            if error.code() == "KELD-AUTH-016"));
+    }
+}
+
+#[test]
 fn host_path_framing_and_state_are_independent_real_socket_rejections() {
     for variant in 0..7 {
         let (mut flow, state) = flow();

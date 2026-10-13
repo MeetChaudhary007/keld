@@ -469,24 +469,50 @@ pub fn read_primary_app_frame_interruptible_with_privileged_call<S: Read>(
     )
 }
 
+/// Trusted guarded-call admission state, separate from header validity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuardedCallAdmission {
+    /// The channel owner can reserve this fresh caller after exact payload decode.
+    Admit,
+    /// A fresh valid caller exceeds the channel owner's current bounded capacity.
+    /// Consume its complete frame before a correlated capacity `ERR`; enter no handler.
+    AtCapacity,
+    /// Duplicate correlation, closed owner, poisoned state, or another terminal
+    /// session rule. Reject before payload allocation/consumption as IPC005.
+    RejectSession,
+}
+
+/// One complete primary frame plus the host-selected guarded admission outcome.
+/// This is trusted local metadata, never a field or schema on the wire.
+pub struct PrimaryAppFrame {
+    /// Header admitted by the canonical receive policy.
+    pub header: ValidatedFrameHeader,
+    /// Complete bounded body, read under the header's original first-byte clock.
+    /// An `AtCapacity` body must not be decoded or dispatched.
+    pub payload: Vec<u8>,
+    /// Owner outcome; non-guarded frames always carry Admit.
+    pub admission: GuardedCallAdmission,
+}
+
+impl std::fmt::Debug for PrimaryAppFrame {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PrimaryAppFrame")
+            .field("header", &self.header)
+            .field("admission", &self.admission)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Interruptible primary reader with independently admitted guarded CALL channels.
 ///
-/// The host selects table entries before reading any frame. The existing KEL-133
-/// validator admits only a matching `GuardedCall` with the canonical kind, flags
-/// and nonzero correlation. After validation, `call_unavailable` samples trusted
-/// admission state for that matched entry and correlation, before any payload is
-/// allocated or consumed. A `true` result rejects this CALL as `KELD-IPC-005`.
-///
-/// The callback can reject a duplicate correlation or a full bounded owner queue;
-/// it does not grant authority. Guard dispatch still runs after exact payload
-/// decode. Each channel owner supplies its own admission state: FS keeps its
-/// one-outstanding rule, while auth can admit concurrent callers under a separate
-/// bound. Echo reply matching, lifecycle and PING stay unchanged.
+/// Compatibility adapter: `true` still means a terminal session-contract
+/// rejection before payload allocation. Owners which distinguish transient
+/// capacity from invalid session state use
+/// [`read_primary_app_frame_interruptible_with_admission`] instead.
 ///
 /// # Errors
-///
-/// As [`read_primary_app_frame_interruptible`]. A selected entry outside the
-/// guarded policy class, or an unavailable CALL, is [`IpcError::Protocol`].
+/// As [`read_primary_app_frame_interruptible_with_admission`].
 pub fn read_primary_app_frame_interruptible_with_privileged_calls<S: Read>(
     stream: &mut S,
     stop: &AtomicBool,
@@ -494,6 +520,43 @@ pub fn read_primary_app_frame_interruptible_with_privileged_calls<S: Read>(
     privileged_calls: &[&'static ChannelEntry],
     call_unavailable: impl Fn(&'static ChannelEntry, CorrelationId) -> bool,
 ) -> Result<Option<(ValidatedFrameHeader, Vec<u8>)>, IpcError> {
+    read_primary_app_frame_interruptible_with_admission(
+        stream,
+        stop,
+        pending_echo_reply,
+        privileged_calls,
+        |entry, corr| {
+            if call_unavailable(entry, corr) {
+                GuardedCallAdmission::RejectSession
+            } else {
+                GuardedCallAdmission::Admit
+            }
+        },
+    )
+    .map(|frame| frame.map(|frame| (frame.header, frame.payload)))
+}
+
+/// Reads one frame using canonical header policies and trusted per-channel admission.
+///
+/// Admission is sampled once after header validation and before body allocation.
+/// `RejectSession` is terminal IPC005 before reading the body. `AtCapacity` preserves
+/// the same `MAX_FRAME_LEN` bound and the same first-byte absolute frame deadline
+/// while reading the complete body; only then may Core send the canonical
+/// [`crate::CallError::admission_capacity`] correlated ERR and continue the link.
+/// No capacity refusal decodes a request, reserves a ticket, or enters Guard/Native.
+/// Echo reply matching, lifecycle/PING and the singular FS contract are unchanged.
+///
+/// # Errors
+/// Returns existing syntax/envelope/semantic/transport errors. Truncated or
+/// expired bodies remain terminal even for `AtCapacity`; no partial-body refusal
+/// is returned. This function does not write any reply or authorize any request.
+pub fn read_primary_app_frame_interruptible_with_admission<S: Read>(
+    stream: &mut S,
+    stop: &AtomicBool,
+    pending_echo_reply: impl Fn() -> Option<CorrelationId>,
+    privileged_calls: &[&'static ChannelEntry],
+    admission: impl Fn(&'static ChannelEntry, CorrelationId) -> GuardedCallAdmission,
+) -> Result<Option<PrimaryAppFrame>, IpcError> {
     read_frame_interruptible_validated_with(
         stream,
         stop,
@@ -506,21 +569,33 @@ pub fn read_primary_app_frame_interruptible_with_privileged_calls<S: Read>(
                 privileged_calls,
                 header,
             )?;
-            if header.kind == FrameKind::Call
-                && let Some(entry) = privileged_calls
+            let outcome = if header.kind == FrameKind::Call {
+                privileged_calls
                     .iter()
                     .copied()
                     .find(|entry| header.channel == entry.id())
-                && call_unavailable(entry, header.corr)
-            {
+                    .map_or(GuardedCallAdmission::Admit, |entry| {
+                        admission(entry, header.corr)
+                    })
+            } else {
+                GuardedCallAdmission::Admit
+            };
+            if outcome == GuardedCallAdmission::RejectSession {
                 return Err(IpcError::Protocol {
                     // Preserve the singular FS wrapper's public diagnostic.
                     detail: "privileged Call is already outstanding for this session",
                 });
             }
-            Ok(validated)
+            Ok((validated, outcome))
         },
     )
+    .map(|frame| {
+        frame.map(|((header, admission), payload)| PrimaryAppFrame {
+            header,
+            payload,
+            admission,
+        })
+    })
 }
 
 /// Host-side reader for the drain after an accepted `Quit` (GH-527 §4.9).
@@ -2141,6 +2216,142 @@ mod validated_read_tests {
             assert!(matches!(error, IpcError::Protocol { .. }));
             assert_eq!(cursor.position(), HEADER_LEN as u64);
         }
+    }
+
+    #[test]
+    fn capacity_refusal_consumes_complete_frame_and_keeps_next_frame_aligned() {
+        let stop = AtomicBool::new(false);
+        let mut bytes = frame_bytes(
+            FrameKind::Call,
+            0,
+            crate::channel_table::AUTH.wire_id(),
+            7,
+            &[0xff, 0xaa, 0x55],
+        );
+        bytes.extend(frame_bytes(FrameKind::Ping, 0, 1, 9, &[]));
+        let mut cursor = std::io::Cursor::new(bytes);
+        let frame = read_primary_app_frame_interruptible_with_admission(
+            &mut cursor,
+            &stop,
+            || None,
+            &[&crate::channel_table::AUTH],
+            |_, _| GuardedCallAdmission::AtCapacity,
+        )
+        .expect("complete refused frame")
+        .expect("frame");
+        assert_eq!(frame.admission, GuardedCallAdmission::AtCapacity);
+        assert_eq!(frame.payload, [0xff, 0xaa, 0x55]);
+        assert_eq!(cursor.position(), (HEADER_LEN + 3) as u64);
+        let next = read_primary_app_frame_interruptible_with_admission(
+            &mut cursor,
+            &stop,
+            || None,
+            &[&crate::channel_table::AUTH],
+            |_, _| panic!("PING must not sample guarded admission"),
+        )
+        .expect("same stream healthy")
+        .expect("next frame");
+        assert_eq!(next.header.kind(), FrameKind::Ping);
+        assert_eq!(next.header.corr(), CorrelationId(9));
+        assert_eq!(next.admission, GuardedCallAdmission::Admit);
+    }
+
+    #[test]
+    fn capacity_result_keeps_original_clock_after_header_admission() {
+        let stop = AtomicBool::new(false);
+        let mut cursor = std::io::Cursor::new(frame_bytes(
+            FrameKind::Call,
+            0,
+            crate::channel_table::AUTH.wire_id(),
+            7,
+            &[0xaa],
+        ));
+        let error = read_frame_interruptible_validated_with(
+            &mut cursor,
+            &stop,
+            None,
+            None,
+            Duration::from_millis(2),
+            |header| {
+                let validated = validate_primary_app_header_with_privileged_calls(
+                    None,
+                    &[&crate::channel_table::AUTH],
+                    header,
+                )?;
+                // Clock fault stimulus, not sleep-sync: hold admission until an
+                // observed absolute instant beyond the original first-byte bound.
+                let end = Instant::now() + Duration::from_millis(20);
+                while Instant::now() < end {
+                    std::thread::yield_now();
+                }
+                Ok((validated, GuardedCallAdmission::AtCapacity))
+            },
+        )
+        .expect_err("capacity cannot renew the first-byte clock before the body");
+        assert!(matches!(error, IpcError::Timeout));
+        assert_eq!(
+            cursor.position(),
+            HEADER_LEN as u64,
+            "expired body must not be consumed or acknowledged"
+        );
+    }
+
+    #[test]
+    fn capacity_refusal_never_returns_a_truncated_body_or_hides_bad_header() {
+        let stop = AtomicBool::new(false);
+        let complete = frame_bytes(
+            FrameKind::Call,
+            0,
+            crate::channel_table::AUTH.wire_id(),
+            7,
+            &[0xaa, 0xbb],
+        );
+        let mut cursor = std::io::Cursor::new(complete[..complete.len() - 1].to_vec());
+        let error = read_primary_app_frame_interruptible_with_admission(
+            &mut cursor,
+            &stop,
+            || None,
+            &[&crate::channel_table::AUTH],
+            |_, _| GuardedCallAdmission::AtCapacity,
+        )
+        .expect_err("partial body must be terminal, never a refusal result");
+        assert!(
+            matches!(error, IpcError::Io(ref source) if source.kind() == std::io::ErrorKind::UnexpectedEof)
+        );
+        let mut cursor = std::io::Cursor::new(frame_bytes(
+            FrameKind::Call,
+            crate::frame::FLAG_RAW,
+            crate::channel_table::AUTH.wire_id(),
+            7,
+            &[0xaa; 64],
+        ));
+        let error = read_primary_app_frame_interruptible_with_admission(
+            &mut cursor,
+            &stop,
+            || None,
+            &[&crate::channel_table::AUTH],
+            |_, _| panic!("header semantics must precede capacity"),
+        )
+        .expect_err("invalid header remains terminal");
+        assert!(matches!(error, IpcError::Protocol { .. }));
+        assert_eq!(cursor.position(), HEADER_LEN as u64);
+        let mut cursor = std::io::Cursor::new(frame_bytes(
+            FrameKind::Call,
+            0,
+            crate::channel_table::AUTH.wire_id(),
+            7,
+            &[0xaa; 64],
+        ));
+        let error = read_primary_app_frame_interruptible_with_admission(
+            &mut cursor,
+            &stop,
+            || None,
+            &[&crate::channel_table::AUTH],
+            |_, _| GuardedCallAdmission::RejectSession,
+        )
+        .expect_err("duplicate/invalid session must stay terminal");
+        assert!(matches!(error, IpcError::Protocol { .. }));
+        assert_eq!(cursor.position(), HEADER_LEN as u64);
     }
 
     #[test]

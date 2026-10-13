@@ -63,7 +63,7 @@ console.error("KELD_KEL89_PUBLIC_QUIT_REQUEST " + smokeCase);
 await app.quit();
 if (pendingBegin !== undefined) {
   const ended = await pendingBegin;
-  if (ended.ok !== false || (ended.code !== "KELD-IPC-022" && ended.code !== "KELD-IPC-024")) {
+  if (ended.ok !== false || (ended.code !== "KELD-IPC-022" && ended.code !== "KELD-IPC-023")) {
     throw new Error("KEL89_ACTIVE_BEGIN_QUIT_WRONG_TERMINAL");
   }
   await report("begin-quit-terminal", { code: ended.code });

@@ -83,6 +83,20 @@ impl core::fmt::Display for CallError {
 impl core::error::Error for CallError {}
 
 impl CallError {
+    /// `KELD-IPC-005`: a valid guarded CALL exceeded its owner's admission capacity.
+    ///
+    /// The receiver consumed the complete bounded frame but admitted no work.
+    /// Write this correlated `ERR` only on an ERR-declaring guarded channel;
+    /// the link remains usable. Duplicate/invalid correlations remain terminal.
+    #[must_use]
+    pub fn admission_capacity() -> Self {
+        Self {
+            code: "KELD-IPC-005".to_owned(),
+            message: "KELD-IPC-005: guarded call capacity is exhausted; this call was not admitted. Wait for admitted work to finish before issuing new work; the link remains usable."
+                .to_owned(),
+        }
+    }
+
     /// `KELD-IPC-023`: the host retired the caller's role generation before
     /// this call's handler finished (GH-527 spec §4.4, criterion 6). Like
     /// `KELD-IPC-022`, the call's host effect is unknown. The host writes it

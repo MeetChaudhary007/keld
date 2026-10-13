@@ -76,7 +76,8 @@ use keld_ipc::link::read_primary_app_frame_interruptible_with_privileged_call;
 use keld_ipc::link::read_quit_drain_frame_with_privileged_calls;
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
 use keld_ipc::link::{
-    AppLinkDeadlines, read_primary_app_frame_interruptible_with_privileged_calls, write_frame,
+    AppLinkDeadlines, GuardedCallAdmission, read_primary_app_frame_interruptible_with_admission,
+    write_frame,
 };
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
 use keld_ipc::{
@@ -5847,7 +5848,11 @@ impl PrimaryRouterHandle {
                     .current
                     .lock()
                     .map_err(|_| app_detail("auth Quit", "generation lock poisoned"))?;
-                self.answer_pending_calls_locked(&mut current, attempt, &CallError::quit_drained());
+                self.answer_pending_calls_locked(
+                    &mut current,
+                    attempt,
+                    &CallError::generation_retired(),
+                );
                 auth.retire(attempt)
             })();
             // Close physical admission even when the caller bookkeeping failed.
@@ -6999,26 +7004,32 @@ fn read_primary_frames(
         // selects the existing privileged CALL policy for the `fs` channel
         // table entry; an unguarded session keeps the legacy
         // echo/lifecycle/PING policy.
-        let frame = read_primary_app_frame_interruptible_with_privileged_calls(
+        let frame = read_primary_app_frame_interruptible_with_admission(
             reader,
             reader_stop,
             || handle.pending_echo_corr_for(attempt),
             handle.privileged_calls(),
             |entry, corr| {
                 if entry.id() == FS_CHANNEL {
-                    return handle.has_outstanding_fs_call(attempt);
+                    return if handle.has_outstanding_fs_call(attempt) {
+                        GuardedCallAdmission::RejectSession
+                    } else {
+                        GuardedCallAdmission::Admit
+                    };
                 }
                 #[cfg(target_os = "macos")]
                 if entry.id() == keld_ipc::channel_table::AUTH.id() {
                     return handle
                         .auth
                         .as_ref()
-                        .is_none_or(|auth| auth.unavailable(attempt, corr));
+                        .map_or(GuardedCallAdmission::RejectSession, |auth| {
+                            auth.admission(attempt, corr)
+                        });
                 }
-                true
+                GuardedCallAdmission::RejectSession
             },
         );
-        let (header, payload) = match frame {
+        let frame = match frame {
             Ok(Some(frame)) => frame,
             Ok(None) => {
                 if handle.shutdown.cause() == SESSION_CLI_LEASE_LOST {
@@ -7059,6 +7070,25 @@ fn read_primary_frames(
         if handle.shutdown.cause() == SESSION_CLI_LEASE_LOST {
             handle.cli_lease_lost()?;
             return Ok(());
+        }
+        let keld_ipc::link::PrimaryAppFrame {
+            header,
+            payload,
+            admission,
+        } = frame;
+        if admission == GuardedCallAdmission::AtCapacity {
+            // The shared reader consumed the complete bounded frame under its
+            // original clock. It admitted no call and the body is never decoded.
+            with_primary_caller_writer(&handle.current, &handle.shutdown, caller, |writer| {
+                keld_ipc::write_call_error(
+                    writer,
+                    header.channel(),
+                    header.corr(),
+                    &CallError::admission_capacity(),
+                )
+                .map_err(|source| app_ipc("guarded call capacity refusal", &source))
+            })?;
+            continue;
         }
         match (header.kind(), header.channel()) {
             #[cfg(target_os = "macos")]
@@ -7208,12 +7238,11 @@ fn write_best_effort_answers(
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
-fn dispatch_primary_echo(
+fn with_primary_caller_writer(
     current: &Mutex<Option<ActivePrimaryGeneration>>,
     shutdown: &SessionShutdownState,
     caller: &PrimaryCallerContext,
-    correlation: CorrelationId,
-    payload: &[u8],
+    write: impl FnOnce(&mut BootstrapStream) -> Result<(), HostAppError>,
 ) -> Result<(), HostAppError> {
     let _transition = shutdown.transition_guard();
     let mut current = current
@@ -7235,17 +7264,30 @@ fn dispatch_primary_echo(
     {
         return Ok(());
     }
-    let reply =
-        keld_ipc::echo::handle_echo(payload).map_err(|source| app_ipc("echo dispatch", &source))?;
-    write_frame(
-        &mut active.writer,
-        FrameKind::Reply,
-        0,
-        ECHO_CHANNEL,
-        correlation,
-        &reply,
-    )
-    .map_err(|source| app_ipc("primary session reply", &source))
+    write(&mut active.writer)
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+fn dispatch_primary_echo(
+    current: &Mutex<Option<ActivePrimaryGeneration>>,
+    shutdown: &SessionShutdownState,
+    caller: &PrimaryCallerContext,
+    correlation: CorrelationId,
+    payload: &[u8],
+) -> Result<(), HostAppError> {
+    with_primary_caller_writer(current, shutdown, caller, |writer| {
+        let reply = keld_ipc::echo::handle_echo(payload)
+            .map_err(|source| app_ipc("echo dispatch", &source))?;
+        write_frame(
+            writer,
+            FrameKind::Reply,
+            0,
+            ECHO_CHANNEL,
+            correlation,
+            &reply,
+        )
+        .map_err(|source| app_ipc("primary session reply", &source))
+    })
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]

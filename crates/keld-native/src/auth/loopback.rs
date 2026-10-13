@@ -122,6 +122,8 @@ impl Drop for Accepted {
 pub(super) struct LoopbackFlow {
     listener: Option<TcpListener>,
     accepted: Option<Accepted>,
+    // One additional never-started peer. Only accepted may own request bytes.
+    idle: Option<Accepted>,
     pending: Option<PendingAuthorization>,
     redirect: LoopbackRedirect,
     bound_port: u16,
@@ -134,6 +136,7 @@ impl fmt::Debug for LoopbackFlow {
         f.debug_struct("LoopbackFlow")
             .field("listener_live", &self.listener.is_some())
             .field("peer_live", &self.accepted.is_some())
+            .field("idle_peer_live", &self.idle.is_some())
             .field("consumed", &self.consumed)
             .finish_non_exhaustive()
     }
@@ -166,6 +169,7 @@ impl LoopbackFlow {
         Ok(Self {
             listener: Some(listener),
             accepted: None,
+            idle: None,
             pending: Some(pending),
             redirect,
             bound_port,
@@ -202,6 +206,7 @@ impl LoopbackFlow {
     ) -> LoopbackProgress {
         self.listener.take();
         self.accepted.take();
+        self.idle.take();
         self.pending.take();
         self.consumed = true;
         LoopbackProgress::Complete(result)
@@ -222,20 +227,28 @@ impl LoopbackFlow {
         error.delivery_stopped = Some(stop);
         self.finish(Err(error))
     }
-    /// At most one accept, one bounded read or one nonblocking write per poll.
-    /// Absolute clock/cancellation checks precede every I/O phase.
+    fn stop_requested(&mut self) -> Option<LoopbackProgress> {
+        if self.cancelled.load(Ordering::Acquire) {
+            Some(self.stop(Stop::Cancelled))
+        } else if Instant::now() >= self.deadline {
+            Some(self.stop(Stop::Deadline))
+        } else {
+            None
+        }
+    }
+    /// At most two retained peers, one accept and three bounded reads per poll;
+    /// a reply poll performs one nonblocking write. The extra peer never owns
+    /// request bytes. Absolute clock/cancel checks precede every I/O phase.
     pub(super) fn poll(&mut self) -> LoopbackProgress {
         if self.consumed {
             return LoopbackProgress::Complete(Err(LoopbackError::new(Failure::Consumed)));
         }
-        if self.cancelled.load(Ordering::Acquire) {
-            return self.stop(Stop::Cancelled);
+        if let Some(progress) = self.stop_requested() {
+            return progress;
         }
-        if Instant::now() >= self.deadline {
-            return self.stop(Stop::Deadline);
-        }
+        let mut chunk = [0u8; 1024];
         if self.accepted.is_none() {
-            return self.poll_accept();
+            return self.poll_accept(&mut chunk);
         }
         if self
             .accepted
@@ -244,23 +257,53 @@ impl LoopbackFlow {
         {
             return self.poll_reply();
         }
+        let read = match self.accepted.as_mut() {
+            Some(accepted) => read_peer(accepted, &mut chunk),
+            None => Err(LoopbackError::new(Failure::Io)),
+        };
+        match read {
+            Ok(Some(count)) => {
+                self.idle.take(); // First bytes commit the existing sole callback.
+                return self.receive_chunk(&chunk[..count]);
+            }
+            Ok(None) => {}
+            Err(error) => return self.finish(Err(error)),
+        }
+        if self
+            .accepted
+            .as_ref()
+            .is_some_and(|peer| !peer.request.is_empty())
+        {
+            // Never evict or bypass a started/truncated/malformed callback.
+            return LoopbackProgress::Pending;
+        }
+        if self.idle.is_some() {
+            if let Some(progress) = self.stop_requested() {
+                return progress;
+            }
+            let read = match self.idle.as_mut() {
+                Some(idle) => read_peer(idle, &mut chunk),
+                None => Err(LoopbackError::new(Failure::Io)),
+            };
+            match read {
+                Ok(Some(count)) => {
+                    self.accepted = self.idle.take();
+                    return self.receive_chunk(&chunk[..count]);
+                }
+                Ok(None) => {}
+                Err(error) => return self.finish(Err(error)),
+            }
+        }
+        if let Some(progress) = self.stop_requested() {
+            return progress;
+        }
+        self.poll_accept(&mut chunk)
+    }
+    fn receive_chunk(&mut self, chunk: &[u8]) -> LoopbackProgress {
         let Some(accepted) = self.accepted.as_mut() else {
             return self.finish(Err(LoopbackError::new(Failure::Io)));
         };
-        let mut chunk = [0u8; 1024];
-        let count = match accepted.stream.read(&mut chunk) {
-            Ok(0) => return self.finish(Err(PrimitiveError::Correlation.into())),
-            Ok(count) => count,
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
-                ) =>
-            {
-                return LoopbackProgress::Pending;
-            }
-            Err(_) => return self.finish(Err(LoopbackError::new(Failure::Io))),
-        };
+        let count = chunk.len();
         if count > MAX_OAUTH_TEXT_BYTES.saturating_sub(accepted.request.len()) {
             return self.finish(Err(PrimitiveError::InputLimit.into()));
         }
@@ -284,6 +327,7 @@ impl LoopbackFlow {
         };
         self.pending.take();
         self.listener.take(); // No second callback/replay admission after decision.
+        self.idle.take();
         let (status, body) = if result.is_ok() {
             ("200 OK", "Sign-in received. Return to the application.\n")
         } else {
@@ -302,7 +346,7 @@ impl LoopbackFlow {
         });
         LoopbackProgress::Pending
     }
-    fn poll_accept(&mut self) -> LoopbackProgress {
+    fn poll_accept(&mut self, chunk: &mut [u8; 1024]) -> LoopbackProgress {
         let Some(listener) = &self.listener else {
             return self.finish(Err(LoopbackError::new(Failure::Io)));
         };
@@ -314,11 +358,37 @@ impl LoopbackFlow {
                 if stream.set_nonblocking(true).is_err() {
                     return self.finish(Err(LoopbackError::new(Failure::Io)));
                 }
-                self.accepted = Some(Accepted {
+                let incoming = Accepted {
                     stream,
                     request: Vec::new(),
                     reply: None,
-                });
+                };
+                if self.accepted.is_none() {
+                    self.accepted = Some(incoming);
+                } else if self.idle.is_none() {
+                    self.idle = Some(incoming);
+                } else {
+                    // Both retained peers were observed empty before this accept.
+                    // Recheck oldest before recycling; newly arrived bytes win.
+                    if let Some(progress) = self.stop_requested() {
+                        return progress;
+                    }
+                    let read = match self.accepted.as_mut() {
+                        Some(accepted) => read_peer(accepted, chunk),
+                        None => Err(LoopbackError::new(Failure::Io)),
+                    };
+                    match read {
+                        Ok(Some(count)) => {
+                            self.idle.take();
+                            return self.receive_chunk(&chunk[..count]);
+                        }
+                        Ok(None) => {
+                            self.accepted = self.idle.take();
+                            self.idle = Some(incoming);
+                        }
+                        Err(error) => return self.finish(Err(error)),
+                    }
+                }
                 LoopbackProgress::Pending
             }
             Err(error)
@@ -366,6 +436,26 @@ impl LoopbackFlow {
             return self.finish(result);
         }
         LoopbackProgress::Pending
+    }
+}
+// A single safe nonblocking read; EOF/error classification matches the
+// existing whole-flow policy, including zero-byte EOF. No request copy here.
+fn read_peer(
+    accepted: &mut Accepted,
+    chunk: &mut [u8; 1024],
+) -> Result<Option<usize>, LoopbackError> {
+    match accepted.stream.read(chunk) {
+        Ok(0) => Err(PrimitiveError::Correlation.into()),
+        Ok(count) => Ok(Some(count)),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+            ) =>
+        {
+            Ok(None)
+        }
+        Err(_) => Err(LoopbackError::new(Failure::Io)),
     }
 }
 fn page_failure(

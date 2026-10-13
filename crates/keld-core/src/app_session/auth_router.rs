@@ -41,13 +41,23 @@ impl AuthSession {
         })
     }
 
-    pub(super) fn unavailable(&self, attempt: u32, corr: CorrelationId) -> bool {
-        !self.accepting.load(Ordering::Acquire)
-            || self.used.load(Ordering::Acquire) >= AUTH_CALL_CAPACITY
-            || self
-                .pending
-                .lock()
-                .map_or(true, |p| p.contains_key(&(attempt, corr)))
+    pub(super) fn admission(
+        &self,
+        attempt: u32,
+        corr: CorrelationId,
+    ) -> super::GuardedCallAdmission {
+        use super::GuardedCallAdmission;
+        let Ok(pending) = self.pending.lock() else {
+            return GuardedCallAdmission::RejectSession;
+        };
+        if !self.accepting.load(Ordering::Acquire) || pending.contains_key(&(attempt, corr)) {
+            return GuardedCallAdmission::RejectSession;
+        }
+        if self.used.load(Ordering::Acquire) >= AUTH_CALL_CAPACITY {
+            GuardedCallAdmission::AtCapacity
+        } else {
+            GuardedCallAdmission::Admit
+        }
     }
 
     fn reserve(

@@ -986,6 +986,14 @@ passed 3/3; the bound moved to the host producer, which deferred 9,976 EVENTs.
     fails or times out marks the link lost: no later answer is attempted, the link
     closes as before, and the role sees `KELD-IPC-022`. Failed-write retirements send
     nothing.
+  - KEL-89 auth pending calls admitted before accepted Quit may already have
+    entered Native work: the host attempts `generation_retired` IPC023, whose
+    host effect is unknown. Delivery remains best effort: a public WorkerLink
+    closes on the Quit REPLY and may observe IPC022 if the answer is not retained
+    before that close. The existing generation lock orders this against any real
+    reply; only still-pending calls are answered. Physical Native owners/leases
+    remain until Drained. IPC024 is reserved for calls newly read by the post-Quit
+    drain, which are never executed.
   - *Quit* (macOS and Linux). The FS drain stays unbounded, so every admitted
     handler finishes and sends its real reply (KEL-130 durability). After the real
     `Quit` REPLY and that drain, the reader reads on until the role ends the link:

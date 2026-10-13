@@ -584,6 +584,12 @@ AuthRequest::Token { account_id, scopes? }
 //   account_id: host-minted, opaque, host-session-scoped runtime selector
 //   (§4 "Auth session registry"), NOT an authorization scope (D11/AC13).
 
+// Core auth admission is bounded independently of Native account/scope single-flight.
+// A fresh well-framed call at capacity is not admitted and receives correlated
+// IPC005 after the complete body is consumed under its original frame deadline;
+// the link stays live. Duplicate/stale/poisoned/closed admission remains terminal.
+// This pre-handler transport refusal is not a Native AUTH016 condition.
+
 AuthResponse::Begin { account_id, granted_scopes }
 AuthResponse::Token { access_token, expires_at, token_type }  // no refresh_token field exists
 //   expires_at: u64 — whole UTC seconds since the UNIX epoch (T3 implementation
@@ -1224,7 +1230,7 @@ compact `KELD-AUTH001`; that spelling is withdrawn.
 | `KELD-AUTH-008` | The authorization step did not complete within the host's bound | §4 Errors | Retry as a new user-initiated `auth.begin`; never an automatic retry |
 | `KELD-AUTH-009` | Terminal refresh failure (`invalid_grant`). Evicts the session from the registry, ending its liveness | §4 Errors, §4 registry | That the account must sign in again via `auth.begin`, and that the host holds no durable credential (D5) |
 | `KELD-AUTH-010` | Child-supplied `login_hint` failed host validation: over the byte bound, or containing a control character | §4 Request surface | The violated constraint (length or character class) only — **never** the offending value, which is end-user PII |
-| `KELD-AUTH-011` | Loopback/scheme callback failed correlation: unknown or mismatched `state`, or a PKCE verifier that does not match | AC4, AC10 (`state` is host-owned) | That the callback was discarded and the flow must be restarted; MUST NOT echo the received `state` |
+| `KELD-AUTH-011` | Loopback/scheme callback parsing or correlation failed, including malformed or ambiguous input and unknown or mismatched `state`; an IdP rejection of the authorization-code/verifier exchange is AUTH013 | Callback correlation, AC10 (`state` is host-owned; AC4 still requires PKCE S256) | That the callback was discarded and the flow must be restarted; MUST NOT echo the received `state` |
 | `KELD-AUTH-012` | The IdP returned an OAuth error at the callback (`access_denied`, `invalid_scope`, `interaction_required`, …) | Rung 3 callback | The IdP's error code and that it is the IdP's decision, not Keld's — **sanitised per D18(a)**: provider text is bounded to 256 bytes with truncation marked, control characters stripped, quoted in a delimited position **after** Keld's own code so it can never be read as a code line, and never parsed to select a Keld code path |
 | `KELD-AUTH-013` | The authorization-code → token exchange failed | Rung 3, `auth.begin` completion; also `auth.token` when the IdP refuses a requested scope set (D17) | Whether the failure was transport or IdP-rejection, and that no automatic retry occurs. Any provider text carried here is **sanitised per D18(a)** |
 | `KELD-AUTH-014` | Silent acquisition needs interaction (`UserInteractionRequired` / `0xCAA10001` / `interaction_required`) | Windows rung 1, `auth.token`; 241 §4.3/§4.4 `[fact]` | That the caller must run a fresh interactive `auth.begin`; MUST NOT auto-escalate to a UI |

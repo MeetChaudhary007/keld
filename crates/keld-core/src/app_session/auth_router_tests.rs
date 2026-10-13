@@ -62,9 +62,16 @@ fn independent_auth_budget_supports_multiple_callers_and_rejects_duplicate() {
                 .expect("bounded caller")
         })
         .collect();
-    assert!(session.unavailable(1, CorrelationId(100)));
+    assert_eq!(
+        session.admission(1, CorrelationId(100)),
+        super::super::GuardedCallAdmission::AtCapacity
+    );
     assert!(session.reserve(1, CorrelationId(100)).is_err());
     assert!(session.reserve(1, CorrelationId(1)).is_err());
+    assert_eq!(
+        session.admission(1, CorrelationId(1)),
+        super::super::GuardedCallAdmission::RejectSession
+    );
     session.retire(1).expect("detach logical callers");
     assert_eq!(
         session.used.load(Ordering::Acquire),
@@ -73,7 +80,10 @@ fn independent_auth_budget_supports_multiple_callers_and_rejects_duplicate() {
     );
     drop(tickets);
     assert_eq!(session.used.load(Ordering::Acquire), 0);
-    assert!(!session.unavailable(2, CorrelationId(1)));
+    assert_eq!(
+        session.admission(2, CorrelationId(1)),
+        super::super::GuardedCallAdmission::Admit
+    );
 }
 
 struct Fixture {
@@ -299,6 +309,131 @@ fn actual_primary_auth_token_unknown_account_uses_private_not_granted_constant()
     assert!(!error.message.contains("unresolved"));
     assert!(!error.message.contains("https://"));
     fixture.finish()?;
+    Ok(())
+}
+
+#[test]
+fn auth_capacity_refuses_one_call_without_fatal_or_stream_desynchronization() -> FixtureResult<()> {
+    let mut fixture = Fixture::new("{}", AuthConfiguration::new())?;
+    let session = Arc::clone(
+        fixture
+            .router
+            .handle
+            .auth
+            .as_ref()
+            .ok_or("auth session absent")?,
+    );
+    assert_eq!(
+        AUTH_CALL_CAPACITY, 32,
+        "do not fix overflow by growing the bound"
+    );
+    let mut tickets: Vec<_> = (1..=32)
+        .map(|corr| session.reserve(1, CorrelationId(corr)))
+        .collect::<Result<_, _>>()?;
+    let error = fixture.call(&begin(None), 100)?;
+    assert_eq!(error.code, "KELD-IPC-005");
+    assert!(error.message.contains("capacity"));
+    assert!(error.message.contains("not admitted"));
+    assert!(!error.message.contains("entra-common"));
+    assert_eq!(session.used.load(Ordering::Acquire), 32);
+    assert_eq!(
+        session
+            .pending
+            .lock()
+            .map_err(|_| "pending poisoned")?
+            .len(),
+        32
+    );
+    // A non-auth frame proves the refused frame body was fully consumed.
+    write_frame(
+        &mut fixture.client,
+        FrameKind::Ping,
+        0,
+        keld_ipc::channel_table::ECHO.id(),
+        CorrelationId(101),
+        &[],
+    )?;
+    let (ping, payload) = read_frame(&mut fixture.client)?;
+    assert_eq!(
+        (ping.kind, ping.corr),
+        (FrameKind::Ping, CorrelationId(101))
+    );
+    assert!(payload.is_empty());
+    assert!(matches!(
+        fixture.window.try_recv(),
+        Err(mpsc::TryRecvError::Empty)
+    ));
+    let released = tickets.pop().ok_or("missing retained ticket")?;
+    assert!(session.take(&released)?);
+    drop(released);
+    assert_eq!(session.used.load(Ordering::Acquire), 31);
+    assert_eq!(fixture.call(&begin(None), 102)?.code, "KELD-GUARD001");
+    session.retire(1)?;
+    drop(tickets);
+    assert_eq!(session.used.load(Ordering::Acquire), 0);
+    fixture.finish()?;
+    Ok(())
+}
+
+#[test]
+fn pre_quit_pending_auth_uses_wire_023_for_unknown_effect() -> FixtureResult<()> {
+    let mut fixture = Fixture::new("{}", AuthConfiguration::new())?;
+    let session = Arc::clone(
+        fixture
+            .router
+            .handle
+            .auth
+            .as_ref()
+            .ok_or("auth session absent")?,
+    );
+    // Real admission owner state, retained by the pending map. No Native work
+    // is launched: this row isolates the terminal answer's effect claim.
+    drop(session.reserve(1, CorrelationId(50))?);
+    write_frame(
+        &mut fixture.client,
+        FrameKind::Call,
+        0,
+        keld_ipc::LIFECYCLE_CHANNEL,
+        CorrelationId(51),
+        &encode(&keld_ipc::LifecycleRequest::Quit)?,
+    )?;
+    fixture.acknowledge_prepare()?;
+    let (quit, _) = read_frame(&mut fixture.client)?;
+    assert_eq!(
+        (quit.kind, quit.channel, quit.corr),
+        (
+            FrameKind::Reply,
+            keld_ipc::LIFECYCLE_CHANNEL,
+            CorrelationId(51)
+        )
+    );
+    let (terminal, bytes) = read_frame(&mut fixture.client)?;
+    // Preserve the actual terminal result, then complete normal product cleanup
+    // before evaluating the expected old-024 failure. Drop is not the oracle.
+    fixture.client.shutdown(std::net::Shutdown::Write)?;
+    assert!(fixture.acknowledge_tail_if_reached()?);
+    assert!(matches!(
+        fixture.window.recv_timeout(Duration::from_secs(5))?,
+        super::super::AppWindowCommand::Quit
+    ));
+    assert_eq!(session.used.load(Ordering::Acquire), 0);
+    fixture.finish()?;
+    assert_eq!(
+        (terminal.kind, terminal.channel, terminal.corr),
+        (
+            FrameKind::Err,
+            keld_ipc::channel_table::AUTH.id(),
+            CorrelationId(50)
+        )
+    );
+    assert!(
+        bytes.starts_with(b"\x0cKELD-IPC-023"),
+        "exact postcard code field must be 023, not 024"
+    );
+    let error: CallError = decode(&bytes)?;
+    assert_eq!(error.code, "KELD-IPC-023");
+    assert!(error.message.contains("host effect is unknown"));
+    assert!(error.message.contains("Do not replay"));
     Ok(())
 }
 

@@ -60,8 +60,9 @@ match the crate that already emits the code. Do not invent a third spelling.
 ## KELD-IPC-005
 
 - crate: keld-ipc
-- message: Unexpected kipc frame or session state
-- fix: Check frame kind and channel match the session contract.
+- message: Unexpected kipc frame or session state; a valid guarded call may instead be refused because its host-owned admission capacity is exhausted.
+- fix: For terminal protocol rejection, check frame kind and channel match the session contract. For a correlated capacity refusal, wait for admitted work to finish before issuing new work; that call was not admitted and the link remains usable.
+- status: Capacity refusal uses the IPC-owned `CallError::admission_capacity` constant only after the complete bounded frame is consumed under its original first-byte deadline. It is nonterminal and resource-free. Duplicate/invalid correlations, closed or poisoned admission, malformed headers, truncated bodies and deadline failures retain their terminal behavior.
 
 ## KELD-IPC-006
 
@@ -1125,7 +1126,7 @@ match the crate that already emits the code. Do not invent a third spelling.
 - module: auth
 - message: The provider names no key in the closed v0 provider-profile table; AC14(a) is the only pre-Allow auth refusal.
 - fix: Correct the quoted/escaped unknown provider key to one of the closed valid profile keys named by the auth diagnostic.
-- status: Declared target; actual provider-resolution route unqualified by this documentation proposal.
+- status: Implemented T3 macOS provider-resolution source; route qualification remains bound to its recorded predicates, not established by this registry entry. Other OS-broker paths remain targets.
 
 
 ## KELD-AUTH-003
@@ -1150,9 +1151,9 @@ match the crate that already emits the code. Do not invent a third spelling.
 
 - crate: keld-native
 - module: auth
-- message: Loopback/scheme callback correlation failed because state is unknown/mismatched or the PKCE verifier does not match.
+- message: Loopback/scheme callback parsing or correlation failed, including malformed or ambiguous input and unknown/mismatched state. An IdP rejection of the authorization-code/verifier exchange is KELD-AUTH-013.
 - fix: Discard the callback and restart the flow; never echo the received state.
-- status: Declared target; actual correlation/PKCE behavior unqualified here.
+- status: T3 macOS implements host-side callback parsing and state correlation. This entry does not establish other scheme/broker behavior or IdP PKCE validation.
 
 
 ## KELD-AUTH-012
@@ -1170,7 +1171,7 @@ match the crate that already emits the code. Do not invent a third spelling.
 - module: auth
 - message: Authorization-code-to-token exchange failed, or the IdP refused the scope set requested by auth.token.
 - fix: Name transport failure versus IdP rejection and start only a new user-initiated operation; no automatic retry occurs. Sanitize any provider text under D18(a): bounded 256-byte quoted text, controls stripped and truncation marked, after Keld’s own code.
-- status: Declared contract; a transport source currently emits this code, but this registry proposal proves neither complete exchange behavior nor T3 flow acceptance.
+- status: Implemented T3 macOS transport and token-reply source; this registry entry proves neither complete exchange behavior nor T3 flow acceptance. Other OS-broker paths remain targets.
 
 
 ## KELD-AUTH-016
