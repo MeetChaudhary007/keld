@@ -36,6 +36,8 @@ use std::process::ExitStatus;
 use std::process::{Command, Stdio};
 #[cfg(any(target_os = "linux", windows))]
 use std::sync::OnceLock;
+#[cfg(any(target_os = "linux", windows))]
+use std::sync::atomic::AtomicU64;
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
@@ -251,6 +253,54 @@ struct SessionShutdownState {
     /// session because its lease tail would run beside the handover's teardown.
     #[cfg(any(target_os = "linux", windows))]
     under_dev_lease: Arc<AtomicBool>,
+    /// The lifecycle-Quit handler of one generation entered for a `Quit` while the
+    /// session ran and has neither claimed the session cause nor given up: `0`, or
+    /// [`quit_admission_tag`] of that generation's attempt. Written and read only under
+    /// `transition`; a [`QuitAdmission`] clears it on every path that does not claim,
+    /// and the generation's retirement clears it because a retired generation's `Quit`
+    /// can no longer claim. While it is set, the handover's deadline claim waits
+    /// (`await_quit_or_claim_handover`), so a `Quit` whose handler entered inside D
+    /// keeps its claim through its filesystem drain (KEL-53 §4 "Profile handover",
+    /// steps 3b and 3c).
+    #[cfg(any(target_os = "linux", windows))]
+    quit_admission: Arc<AtomicU64>,
+}
+
+/// The [`SessionShutdownState::quit_admission`] value of `attempt`'s admitted `Quit`;
+/// never `0`, which means none.
+#[cfg(any(target_os = "linux", windows))]
+fn quit_admission_tag(attempt: u32) -> u64 {
+    (1 << 32) | u64::from(attempt)
+}
+
+/// One lifecycle-Quit handler's admitted `Quit` (`SessionShutdownState::quit_admission`).
+/// The handler releases it under `transition` in the hold that decides its claim; every
+/// other return path, including an error or an unwind out of the filesystem drain,
+/// releases it on drop. Either release wakes the handover's wait.
+#[cfg(any(target_os = "linux", windows))]
+struct QuitAdmission<'a> {
+    shutdown: &'a SessionShutdownState,
+    attempt: u32,
+    released: bool,
+}
+
+#[cfg(any(target_os = "linux", windows))]
+impl QuitAdmission<'_> {
+    /// Caller holds `transition`.
+    fn release_guarded(mut self) {
+        self.shutdown.clear_quit_admission_guarded(self.attempt);
+        self.released = true;
+    }
+}
+
+#[cfg(any(target_os = "linux", windows))]
+impl Drop for QuitAdmission<'_> {
+    fn drop(&mut self) {
+        if !self.released {
+            let _transition = self.shutdown.transition_guard();
+            self.shutdown.clear_quit_admission_guarded(self.attempt);
+        }
+    }
 }
 
 /// The handover's instants on the host's monotonic clock, each set once: the request,
@@ -2212,6 +2262,8 @@ impl SessionShutdownState {
             handover_clock: Arc::new(HandoverClock::default()),
             #[cfg(any(target_os = "linux", windows))]
             under_dev_lease: Arc::new(AtomicBool::new(false)),
+            #[cfg(any(target_os = "linux", windows))]
+            quit_admission: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -2267,17 +2319,64 @@ impl SessionShutdownState {
         TailRun { shutdown: self }
     }
 
+    /// Caller holds `transition` and found the session running: records that the
+    /// lifecycle-Quit handler of `attempt` entered for a `Quit` and may still claim the
+    /// session after its filesystem drain.
+    #[cfg(any(target_os = "linux", windows))]
+    fn admit_quit_guarded(&self, attempt: u32) -> QuitAdmission<'_> {
+        self.quit_admission
+            .store(quit_admission_tag(attempt), Ordering::Release);
+        self.changed.notify_all();
+        QuitAdmission {
+            shutdown: self,
+            attempt,
+            released: false,
+        }
+    }
+
+    /// Caller holds `transition`: `attempt`'s admitted `Quit`, if it is the recorded
+    /// one, can no longer claim the session (it claimed, gave up or failed, or its
+    /// generation retired). Wakes the handover's wait either way.
+    #[cfg(any(target_os = "linux", windows))]
+    fn clear_quit_admission_guarded(&self, attempt: u32) {
+        let _ = self.quit_admission.compare_exchange(
+            quit_admission_tag(attempt),
+            0,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        self.changed.notify_all();
+    }
+
     /// Waits for the application's `Quit` until `deadline`: returns as soon as any
     /// claimant reserved the session cause, or claims [`SESSION_HANDOVER`] at the
     /// deadline under the same guard hold as the last running check, so the first
     /// claim wins and no claim is lost between the check and the claim (KEL-53 §4
     /// "Profile handover", steps 3b and 3c).
+    ///
+    /// The deadline claim waits while a `Quit` is admitted (`quit_admission`): a
+    /// `Quit` whose handler entered before the deadline keeps its claim through its
+    /// filesystem drain, so the claim point agrees with the D sample, the handler's
+    /// entry. Its admission ends with its claim, which ends this wait, or with its
+    /// release, after which this wait claims the handover at once if the deadline has
+    /// passed. This adds no unbounded wait: that drain waits only for filesystem calls
+    /// admitted before the `Quit` on its generation (the reader is paused in the `Quit`;
+    /// a successor generation exists only after a retirement, which clears the
+    /// admission), and the forced tail this wait would otherwise start drains the same
+    /// calls without a deadline (`cli_lease_lost`, `quiesce_and_drain_fs`).
     #[cfg(any(target_os = "linux", windows))]
     fn await_quit_or_claim_handover(&self, deadline: Instant) -> HandoverWait {
         let mut transition = self.transition_guard();
         loop {
             if !self.is_running() {
                 return HandoverWait::ClaimedByOther;
+            }
+            if self.quit_admission.load(Ordering::Acquire) != 0 {
+                transition = self
+                    .changed
+                    .wait(transition)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                continue;
             }
             let now = Instant::now();
             if now >= deadline {
@@ -6091,6 +6190,10 @@ impl PrimaryRouterHandle {
             ));
         };
         active.reader_stop.store(true, Ordering::Release);
+        // Every caller holds `transition`. A `Quit` of a retired generation can no
+        // longer claim the session, so it no longer holds the handover's deadline.
+        #[cfg(any(target_os = "linux", windows))]
+        self.shutdown.clear_quit_admission_guarded(attempt);
         #[cfg(target_os = "macos")]
         let auth_retirement = self
             .auth
@@ -6542,6 +6645,8 @@ impl PrimaryRouterHandle {
         reader: &mut BootstrapStream,
     ) -> Result<(), HostAppError> {
         let quit_frame = Instant::now();
+        #[cfg(any(target_os = "linux", windows))]
+        let admission;
         {
             let transition = self.shutdown.transition_guard();
             let mut current_guard = self.current.lock().map_err(|_| {
@@ -6565,6 +6670,12 @@ impl PrimaryRouterHandle {
             // Pending until its REPLY: a retirement during the FS drain below
             // answers it with KELD-IPC-023 (GH-527 §4.9).
             active.pending_quit = Some(correlation);
+            // Admitted while the session runs: a handover's deadline claim now waits
+            // for this handler's claim or its release (`await_quit_or_claim_handover`).
+            #[cfg(any(target_os = "linux", windows))]
+            {
+                admission = self.shutdown.admit_quit_guarded(attempt);
+            }
         }
 
         // This reader is paused in Quit, so no later FS Call can enter. Keep
@@ -6576,6 +6687,10 @@ impl PrimaryRouterHandle {
         }
 
         let transition = self.shutdown.transition_guard();
+        // This hold decides the admitted Quit's claim, and the handover's wait observes
+        // neither the release nor the claim before the hold ends.
+        #[cfg(any(target_os = "linux", windows))]
+        admission.release_guarded();
         let current_guard = self
             .current
             .lock()

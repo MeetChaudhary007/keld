@@ -10,11 +10,11 @@
 
 use super::{
     AppWindowCommand, BootstrapStream, CorrelationId, FS_CHANNEL, FrameKind, FsDispatchSession,
-    FsInFlight, HandoverClock, HostAppError, LIFECYCLE_CHANNEL, LifecycleEvent, ManifestError,
-    PERMISSIONS_FILE, PendingFsCall, PrimaryRouterHandle, SESSION_HANDOVER, SESSION_LIFECYCLE_QUIT,
-    TestPrimaryOwnerCommand, app_ipc, complete_profile_handover,
-    initial_ready_router_with_window_loop, load_verified_manifest, primary_test_stream_pair,
-    write_frame,
+    FsInFlight, HandoverClock, HandoverWait, HostAppError, LIFECYCLE_CHANNEL, LifecycleEvent,
+    ManifestError, PERMISSIONS_FILE, PendingFsCall, PrimaryRouterHandle, SESSION_HANDOVER,
+    SESSION_LIFECYCLE_QUIT, SessionShutdownState, TestPrimaryOwnerCommand, app_ipc,
+    complete_profile_handover, initial_ready_router_with_window_loop, load_verified_manifest,
+    primary_test_stream_pair, write_frame,
 };
 use std::fs::{self, File};
 use std::sync::mpsc::Receiver;
@@ -258,12 +258,12 @@ fn a_natural_last_window_close_does_not_start_the_handover_deadline() {
     let quit_entered = Instant::now();
 
     let quit_result = join("the Quit handler", quit);
-    let waited = join("the stand-in main thread", waiter);
+    let handover_result = join("the stand-in main thread", waiter);
     let (cause, clock) = release(handle);
     let frames = join("the application reader", application);
     eprintln!(
         "P1-1 cell: cause={cause} handover_event={handover_event:?} quit={quit_result:?} \
-         handover={waited:?} forced={} quit_entry_after_write_start_ms={} frames={frames:?}",
+         handover={handover_result:?} forced={} quit_entry_after_write_start_ms={} frames={frames:?}",
         set(&clock.forced),
         quit_entered
             .saturating_duration_since(before_write)
@@ -284,7 +284,7 @@ fn a_natural_last_window_close_does_not_start_the_handover_deadline() {
         "the handover writes its own LastWindowClosed"
     );
     quit_result.expect("the Quit tail");
-    waited.expect("the handover");
+    handover_result.expect("the handover");
     assert!(
         position(&frames, (FrameKind::Reply, "lifecycle", QUIT_CORRELATION.0)).is_some(),
         "the application's Quit is answered: {frames:?}"
@@ -347,13 +347,13 @@ fn a_quit_admitted_inside_d_keeps_its_claim_through_its_fs_drain() {
     // The direct path never defers a failed write's recovery.
     .map(|deferred_recovery| deferred_recovery.is_some());
     let quit_result = join("the Quit handler", quit);
-    let waited = join("the stand-in main thread", waiter);
+    let handover_result = join("the stand-in main thread", waiter);
     let (cause, clock) = release(handle);
     let frames = join("the application reader", application);
     eprintln!(
         "P1-2 cell: running_past_deadline={running_past_deadline} \
          forced_past_deadline={forced_past_deadline} cause={cause} fs_write={fs_write:?} \
-         quit={quit_result:?} handover={waited:?} frames={frames:?}"
+         quit={quit_result:?} handover={handover_result:?} frames={frames:?}"
     );
     assert!(
         quit_entered < before_write + TEST_D,
@@ -367,7 +367,7 @@ fn a_quit_admitted_inside_d_keeps_its_claim_through_its_fs_drain() {
     assert!(!set(&clock.forced), "the deadline claim never ran");
     assert!(!fs_write.expect("the FS terminal write"));
     quit_result.expect("the Quit tail");
-    waited.expect("the handover");
+    handover_result.expect("the handover");
     let fs_reply = position(&frames, (FrameKind::Reply, "fs", FS_CORRELATION.0));
     let quit_reply = position(&frames, (FrameKind::Reply, "lifecycle", QUIT_CORRELATION.0));
     assert!(
@@ -401,12 +401,12 @@ fn a_quit_that_fails_in_its_fs_drain_past_d_lets_the_deadline_claim() {
     });
     // The drain releases the state lock while it waits; poison it there.
     let poisoner = Arc::clone(&fs);
-    let poisoned = thread::spawn(move || {
+    let poison_outcome = thread::spawn(move || {
         let _state = poisoner.state.lock().expect("FS state");
         panic!("poison the FS dispatch state under the parked drain");
     })
     .join();
-    assert!(poisoned.is_err(), "the poisoning thread panicked");
+    assert!(poison_outcome.is_err(), "the poisoning thread panicked");
 
     let deadline = handover_write(&handle.shutdown.handover_clock) + TEST_D;
     // Time must pass the deadline while the Quit drains; bounded, not a sync wait.
@@ -416,13 +416,13 @@ fn a_quit_that_fails_in_its_fs_drain_past_d_lets_the_deadline_claim() {
     // Releasing the lease wakes the drain, which now fails.
     drop(admitted);
     let quit_result = join("the Quit handler", quit);
-    let waited = join("the stand-in main thread", waiter);
+    let handover_result = join("the stand-in main thread", waiter);
     // Neither failed tail closed the link; the last router handle's drop does.
     let (cause, clock) = release(handle);
     let frames = join("the application reader", application);
     eprintln!(
         "P1-2 failure cell: running_past_deadline={running_past_deadline} cause={cause} \
-         forced={} quit={quit_result:?} handover={waited:?} frames={frames:?}",
+         forced={} quit={quit_result:?} handover={handover_result:?} frames={frames:?}",
         set(&clock.forced)
     );
     assert!(
@@ -439,7 +439,8 @@ fn a_quit_that_fails_in_its_fs_drain_past_d_lets_the_deadline_claim() {
         "the main thread claimed once the failed Quit released its admission"
     );
     assert!(set(&clock.forced), "the deadline claim ran");
-    let tail_error = waited.expect_err("the forced tail meets the same poisoned state");
+    let tail_error =
+        handover_result.expect_err("the forced tail meets the same poison_outcome state");
     assert!(
         tail_error.to_string().contains("in-flight lock poisoned"),
         "{tail_error}"
@@ -486,13 +487,13 @@ fn a_quit_retired_during_its_fs_drain_no_longer_holds_the_deadline() {
 
     drop(admitted);
     let quit_result = join("the Quit handler", quit);
-    let waited = join("the stand-in main thread", waiter);
+    let handover_result = join("the stand-in main thread", waiter);
     let (cause, _clock) = release(handle);
     let frames = join("the application reader", application);
     eprintln!(
         "P1-2 retirement control: claim_after_deadline_ms={} \
          fs_in_flight_at_claim={fs_in_flight_at_claim} cause={cause} quit={quit_result:?} \
-         handover={waited:?} frames={frames:?}",
+         handover={handover_result:?} frames={frames:?}",
         claimed_after_deadline.as_millis()
     );
     assert!(
@@ -501,7 +502,7 @@ fn a_quit_retired_during_its_fs_drain_no_longer_holds_the_deadline() {
     );
     assert_eq!(cause, SESSION_HANDOVER);
     quit_result.expect("a retired Quit returns quietly");
-    waited.expect("the forced tail");
+    handover_result.expect("the forced tail");
     // The retirement's KELD-IPC-023 answers are best effort by contract
     // (`answer_pending_calls_locked`): its link close may discard what the
     // application has not read yet, so only the absent reply is asserted.
@@ -530,16 +531,58 @@ fn a_quit_inside_d_claims_the_session_and_is_answered() {
     let (quit, quit_peer) = send_quit(&handle);
     let application = application_reader(client, quit_peer);
     let quit_result = join("the Quit handler", quit);
-    let waited = join("the stand-in main thread", waiter);
+    let handover_result = join("the stand-in main thread", waiter);
     let (cause, clock) = release(handle);
     let frames = join("the application reader", application);
     assert_eq!(cause, SESSION_LIFECYCLE_QUIT);
     assert!(!set(&clock.forced), "the deadline claim never ran");
     quit_result.expect("the Quit tail");
-    waited.expect("the handover");
+    handover_result.expect("the handover");
     assert!(
         position(&frames, (FrameKind::Reply, "lifecycle", QUIT_CORRELATION.0)).is_some(),
         "the application's Quit is answered: {frames:?}"
     );
     join("the owner", owner);
+}
+
+/// The admission alone, on the session state: an expired deadline does not claim while
+/// a `Quit` is admitted; dropping the admission (any non-claiming return of the
+/// handler) or releasing it under the guard lets the waiter claim at once; a stale
+/// generation's clear never releases a newer generation's admission.
+#[test]
+fn an_admitted_quit_holds_an_expired_deadline_until_it_is_released() {
+    let shutdown = SessionShutdownState::new();
+    let admission = {
+        let _transition = shutdown.transition_guard();
+        shutdown.admit_quit_guarded(2)
+    };
+    {
+        let _transition = shutdown.transition_guard();
+        shutdown.clear_quit_admission_guarded(1);
+    }
+    let waiter_state = shutdown.clone();
+    let waiter = thread::spawn(move || waiter_state.await_quit_or_claim_handover(Instant::now()));
+    // Bounded observation that the expired deadline does not claim; not a sync wait.
+    thread::sleep(Duration::from_millis(200));
+    assert!(
+        !waiter.is_finished() && shutdown.is_running(),
+        "an admitted Quit holds the expired deadline, and a stale clear released nothing"
+    );
+    drop(admission);
+    assert_eq!(join("the waiter", waiter), HandoverWait::ClaimedHandover);
+    assert_eq!(shutdown.cause(), SESSION_HANDOVER);
+
+    let released = SessionShutdownState::new();
+    let admission = {
+        let _transition = released.transition_guard();
+        released.admit_quit_guarded(1)
+    };
+    {
+        let _transition = released.transition_guard();
+        admission.release_guarded();
+    }
+    assert_eq!(
+        released.await_quit_or_claim_handover(Instant::now()),
+        HandoverWait::ClaimedHandover
+    );
 }
