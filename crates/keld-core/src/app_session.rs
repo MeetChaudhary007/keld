@@ -3425,9 +3425,9 @@ impl TestSessionSeam {
 /// when the application's `Quit` won, this thread awaits that tail's end before the
 /// teardown, as it awaited the loop's return before. A `LastWindowClosed` write that
 /// fails ends the session at once under the handover cause (fail closed, no D). D runs
-/// from the return of this function's own write alone, which it records in the session's
-/// [`HandoverClock`] beside the instants of the loop's return and of the forced claim. `quit_deadline` is D: [`HANDOVER_QUIT_DEADLINE`] in the host; the
-/// unit cells pass a shorter one.
+/// from the return of this function's own write alone, recorded in the session's
+/// [`HandoverClock`] beside the loop's return and the forced claim. `quit_deadline` is
+/// D: [`HANDOVER_QUIT_DEADLINE`] in the host; the unit cells pass a shorter one.
 #[cfg(any(target_os = "linux", windows))]
 fn complete_profile_handover(
     router: &PrimaryRouterHandle,
