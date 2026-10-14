@@ -111,13 +111,51 @@ pub(crate) fn wait_for_process_signal(process: &OwnedHandle, timeout_ms: u32) ->
     unsafe { WaitForSingleObject(process.as_raw_handle().cast(), timeout_ms) }
 }
 
+/// Waits for `child` to exit until the kill switch `deadline`. At expiry the panic
+/// carries [`process_tree_report`], taken while the host and its browser still live
+/// (the caller's cleanup terminates them afterwards), so a stall can be classified.
 pub(crate) fn wait_child(child: &mut Child, deadline: Instant) -> ExitStatus {
     loop {
         if let Some(status) = child.try_wait().expect("observe host exit") {
             return status;
         }
-        assert!(Instant::now() < deadline, "host exit timed out");
+        assert!(
+            Instant::now() < deadline,
+            "host exit timed out; {}",
+            process_tree_report(child.id())
+        );
         thread::park_timeout(Duration::from_millis(10));
+    }
+}
+
+/// Diagnostics for a kill switch's expiry: whether `root_pid` is alive and every live
+/// descendant (`name:pid<parent`), with the `WebView2` browser processes
+/// (`msedgewebview2.exe`) counted, so a stall separates a browser that never exited
+/// (the shutdown hang guard's regime) from one that exited (the post-exit grace's) and
+/// from a host that waits on neither. Parent links are as the OS reports them now; a
+/// reused PID can add an unrelated process, which only widens the report.
+pub(crate) fn process_tree_report(root_pid: u32) -> String {
+    let script = format!(
+        "$all=@(Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,Name); \
+         $tree=@{{}}; $tree[[uint32]{root_pid}]=$true; $grew=$true; \
+         while ($grew) {{ $grew=$false; foreach ($p in $all) {{ \
+           if ($p.ProcessId -ne {root_pid} -and -not $tree.ContainsKey([uint32]$p.ProcessId) -and $tree.ContainsKey([uint32]$p.ParentProcessId)) {{ $tree[[uint32]$p.ProcessId]=$true; $grew=$true }} }} }}; \
+         $desc=@($all | Where-Object {{ $_.ProcessId -ne {root_pid} -and $tree.ContainsKey([uint32]$_.ProcessId) }}); \
+         $browser=@($desc | Where-Object {{ $_.Name -eq 'msedgewebview2.exe' }}); \
+         'host_alive=' + [bool]($all | Where-Object {{ $_.ProcessId -eq {root_pid} }}) + \
+         ' browser_processes=' + $browser.Count + \
+         ' descendants=' + (($desc | ForEach-Object {{ $_.Name + ':' + $_.ProcessId + '<' + $_.ParentProcessId }}) -join ',')"
+    );
+    match Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .output()
+    {
+        Ok(output) => format!(
+            "process tree of {root_pid}: {}{}",
+            String::from_utf8_lossy(&output.stdout).trim(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ),
+        Err(error) => format!("process tree of {root_pid}: query failed: {error}"),
     }
 }
 

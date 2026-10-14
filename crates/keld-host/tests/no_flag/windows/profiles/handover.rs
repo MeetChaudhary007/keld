@@ -15,9 +15,12 @@ use super::sessions::{
     LifecycleObservation, ObservedSession, SeamedHost, assert_first_exited_before_second,
     engine_constructions, read_lifecycle_record,
 };
+use crate::PRODUCT_DEADLINE;
 use crate::support::control::{accept_ready_generation, try_read_control_line};
 use crate::support::installed::{INSTALLER_ENV, InstalledApp, SIGNED_HOST_A_P1, fixture_env};
-use crate::support::process::{open_process_for_wait, process_times, wait_for_process_signal};
+use crate::support::process::{
+    open_process_for_wait, process_times, process_tree_report, wait_for_process_signal,
+};
 use crate::support::product::ProductFixture;
 use crate::support::profile_run::{ProfileTestRoot, assert_profile_test_root_feature};
 use serde_json::Value;
@@ -43,9 +46,73 @@ const HOST_EVIDENCE_PREFIX: &str = "KELD_TEST_WINDOWS_HANDOVER ";
 /// The quit deadline D as KEL-53 §4 *Margin and deadlines* records it (S6c2a's
 /// measurement is below its 10 s floor, so D is the floor).
 const QUIT_DEADLINE: Duration = Duration::from_secs(10);
-/// Kill switch over the handover's UI end (the liveness-gated barrier: at most the
-/// shutdown hang guard plus the post-exit grace) and D; never a synchronization wait.
-const HANDOVER_KILL_SWITCH: Duration = Duration::from_secs(150);
+/// How late after D h12's forced end may come, on the host's clock (`forced_after_us`)
+/// and on the test's clock (`LastWindowClosed` read to `LINK_EOF` read). Measured
+/// overshoot past D over the 44 h12 runs of S6c2a and its review (2026-10-14, RAMANI,
+/// the S6c2a debug host): host clock idle max 14.9 ms, under full-core load (16
+/// busy-loop burners, 10 runs) max 39.2 ms; test clock idle max 15 ms, load max
+/// 115 ms. Each slack is sixteen times its clock's maximum rounded up to a whole
+/// second (0.63 s -> 1 s; 1.84 s -> 2 s), wide because only ten samples ran under
+/// load, and each stays below the 5 s shift of the review's late-deadline mutant
+/// (`r-m6`), which each bound fails on its own.
+const FORCED_END_HOST_SLACK: Duration = Duration::from_secs(1);
+const FORCED_END_TEST_SLACK: Duration = Duration::from_secs(2);
+
+/// keld-wv's release-barrier constants, read from their one definition so that this
+/// harness follows any change to them (no copy of their values lives here).
+const KELD_WV_WEBVIEW2_SOURCE: &str = include_str!("../../../../../keld-wv/src/webview2/mod.rs");
+
+/// The `Duration` value of the `const <name>: Duration = Duration::from_<unit>(<n>);`
+/// item in keld-wv's `webview2/mod.rs`.
+fn keld_wv_duration(name: &str) -> Duration {
+    let prefix = format!("const {name}: Duration = Duration::from_");
+    let item = KELD_WV_WEBVIEW2_SOURCE
+        .lines()
+        .find_map(|line| line.trim_start().strip_prefix(prefix.as_str()))
+        .unwrap_or_else(|| panic!("keld-wv defines `{name}` as a whole-unit Duration"));
+    let (unit, rest) = item
+        .split_once('(')
+        .unwrap_or_else(|| panic!("`{name}`: {item}"));
+    let amount: u64 = rest
+        .strip_suffix(");")
+        .and_then(|value| value.parse().ok())
+        .unwrap_or_else(|| panic!("`{name}` has a literal amount: {item}"));
+    match unit {
+        "millis" => Duration::from_millis(amount),
+        "secs" => Duration::from_secs(amount),
+        "mins" => Duration::from_mins(amount),
+        _ => panic!("`{name}` uses an unparsed Duration unit: {item}"),
+    }
+}
+
+/// Kill switch over each wait of a handover cell, never a synchronization wait. The
+/// longest wait is a UI end: the liveness-gated release barrier runs up to keld-wv's
+/// `BROWSER_SHUTDOWN_HANG_GUARD` while the browser lives and then up to its
+/// `BROWSER_EXIT_GRACE` once the browser exited, so a healthy UI end takes at most
+/// their sum; the forced end adds D, and the harness's per-step `PRODUCT_DEADLINE`
+/// covers the rest of the step (the window close, the record writes, the control
+/// line). Each wait stays below the nextest per-test terminate timeout (10 min).
+fn handover_kill_switch() -> Duration {
+    keld_wv_duration("BROWSER_SHUTDOWN_HANG_GUARD")
+        + keld_wv_duration("BROWSER_EXIT_GRACE")
+        + QUIT_DEADLINE
+        + PRODUCT_DEADLINE
+}
+
+/// The kill switch reads keld-wv's barrier constants in every ordinary run, so a renamed
+/// or reshaped constant fails here rather than first inside a stalled cell, and each
+/// handover wait is bounded above the healthy barrier's maximum plus D.
+#[test]
+fn handover_kill_switch_covers_the_keld_wv_barrier_and_d() {
+    let hang_guard = keld_wv_duration("BROWSER_SHUTDOWN_HANG_GUARD");
+    let grace = keld_wv_duration("BROWSER_EXIT_GRACE");
+    assert!(!hang_guard.is_zero() && !grace.is_zero());
+    assert!(
+        handover_kill_switch() > hang_guard + grace + QUIT_DEADLINE,
+        "{:?} must exceed {hang_guard:?} + {grace:?} + {QUIT_DEADLINE:?}",
+        handover_kill_switch()
+    );
+}
 
 /// The run-owned installation, profile root and control listener one cell uses.
 struct HandoverCell {
@@ -176,10 +243,12 @@ fn host_main_window_with_title(pid: u32) -> (u64, String) {
     (handle.parse().unwrap_or(0), title.to_owned())
 }
 
-/// Reads one control line under the handover kill switch.
-fn read_handover_line(reader: &mut BufReader<TcpStream>, label: &str) -> String {
-    try_read_control_line(reader, Instant::now() + HANDOVER_KILL_SWITCH)
-        .unwrap_or_else(|error| panic!("{label}: {error}"))
+/// Reads one control line under the handover kill switch. A failed read reports the
+/// host's process tree first (the browser's liveness); the unwinding `SeamedHost` then
+/// terminates the host and prints its stdout and stderr.
+fn read_handover_line(reader: &mut BufReader<TcpStream>, host_pid: u32, label: &str) -> String {
+    try_read_control_line(reader, Instant::now() + handover_kill_switch())
+        .unwrap_or_else(|error| panic!("{label}: {error}; {}", process_tree_report(host_pid)))
 }
 
 /// The one `KELD_TEST_WINDOWS_HANDOVER` line the seam-driven host prints.
@@ -200,7 +269,10 @@ struct HandoverRun {
     host_pid: u32,
     bun_pids: [u32; 2],
     /// Taken only while the host waits D (h12); the reference application's session
-    /// ends too fast for an unambiguous census (h11 records the window transitions).
+    /// ends too fast for an unambiguous census, so h11 records the window transitions
+    /// and asserts no census. h12's census covers h11's host path too: up to the
+    /// `LastWindowClosed` write (3a) the two cells run the identical host code, and
+    /// they differ only in the application's mode after it.
     window_census_at_last_window_closed: Option<u64>,
     control_ms_from_last_window_closed_to_link_eof: u64,
     quit_reply: bool,
@@ -231,7 +303,7 @@ fn run_handover_then_second_session(
 
     // 3a: the UI loop returned and the host told the application; the window is gone.
     assert_eq!(
-        read_handover_line(&mut reader, "await LastWindowClosed"),
+        read_handover_line(&mut reader, host_pid, "await LastWindowClosed"),
         "LAST_WINDOW_CLOSED"
     );
     let last_window_closed_at = Instant::now();
@@ -259,7 +331,7 @@ fn run_handover_then_second_session(
     // milliseconds, so the ordering is asserted by h12 and only recorded here (h8).
 
     // 3b / 3c as the application's mode decides.
-    let next = read_handover_line(&mut reader, "await the session end");
+    let next = read_handover_line(&mut reader, host_pid, "await the session end");
     let quit_reply = if ignore_last_window_closed {
         assert_eq!(
             next, "LINK_EOF",
@@ -272,17 +344,21 @@ fn run_handover_then_second_session(
             "the host answers the application's Quit"
         );
         assert_eq!(
-            read_handover_line(&mut reader, "await the link close"),
+            read_handover_line(&mut reader, host_pid, "await the link close"),
             "LINK_EOF"
         );
         true
     };
     let control_ms_from_last_window_closed_to_link_eof = elapsed_ms(last_window_closed_at);
     if ignore_last_window_closed {
+        let control = Duration::from_millis(control_ms_from_last_window_closed_to_link_eof);
         assert!(
-            Duration::from_millis(control_ms_from_last_window_closed_to_link_eof)
-                >= QUIT_DEADLINE.saturating_sub(Duration::from_secs(1)),
+            control >= QUIT_DEADLINE.saturating_sub(Duration::from_secs(1)),
             "the forced end waited for D: {control_ms_from_last_window_closed_to_link_eof} ms"
+        );
+        assert!(
+            control <= QUIT_DEADLINE + FORCED_END_TEST_SLACK,
+            "the forced end came at D, not later than D + {FORCED_END_TEST_SLACK:?} on the test's clock: {control_ms_from_last_window_closed_to_link_eof} ms"
         );
     }
 
@@ -336,7 +412,7 @@ fn second_session_then_exit(
     );
     let bun_2 = second.bun_pid;
     let bun_2_handle = second.quit("second session");
-    let (status, stdout, stderr) = seamed.finish_by(Instant::now() + HANDOVER_KILL_SWITCH);
+    let (status, stdout, stderr) = seamed.finish_by(Instant::now() + handover_kill_switch());
     let transitions = watch.finish();
     assert!(
         status.success(),
@@ -374,7 +450,9 @@ fn second_session_then_exit(
 /// h11, cooperative quit: the reference application receives `LastWindowClosed` after
 /// the window closed, requests `Quit` within D, the host answers it and the session ends
 /// under the lifecycle-Quit cause, never the forced one; the loop then runs the next
-/// session. The host's own clock yields one D sample (write to Quit frame).
+/// session. The host's own clock yields one D sample (write to Quit frame). This cell
+/// records the window transitions but asserts no window census: h12 asserts it on the
+/// identical host path (`HandoverRun::window_census_at_last_window_closed`).
 #[test]
 #[ignore = "requires KELD_KEL254_SIGNED_HOST_A_P1 (a debug host built with kel135-profile-test-root) and KELD_KEL254_INSTALLER_FIXTURE (KEL-254 installed-host operator fixtures)"]
 fn kel270_s6c2a_h11_reference_app_quits_within_d_after_handover() {
@@ -433,14 +511,21 @@ fn kel270_s6c2a_h12_app_ignoring_last_window_closed_is_ended_at_d() {
     let forced_after_us = run.evidence["forced_after_us"]
         .as_u64()
         .unwrap_or_else(|| panic!("the host recorded the forced end: {}", run.evidence));
+    let deadline_us = run.evidence["deadline_us"].as_u64().expect("deadline");
     assert!(
-        forced_after_us >= run.evidence["deadline_us"].as_u64().expect("deadline"),
+        forced_after_us >= deadline_us,
         "the forced end came no earlier than D on the host's clock: {}",
+        run.evidence
+    );
+    let slack_us = u64::try_from(FORCED_END_HOST_SLACK.as_micros()).expect("slack fits u64");
+    assert!(
+        forced_after_us < deadline_us + slack_us,
+        "the forced end came less than {FORCED_END_HOST_SLACK:?} after D on the host's clock: {}",
         run.evidence
     );
     assert!(
         run.evidence["quit_wait_us"].is_null(),
-        "no Quit frame was admitted: {}",
+        "no Quit frame claimed the session: {}",
         run.evidence
     );
     println!(
@@ -479,7 +564,7 @@ fn kel270_s6c2a_h9_failed_handover_tail_exits_with_its_error() {
     let bun_1_handle = open_process_for_wait(bun_1, true);
 
     // The handover's UI end faults at the barrier: the host exits with that error.
-    let (failed_status, stdout, stderr) = seamed.finish_by(Instant::now() + HANDOVER_KILL_SWITCH);
+    let (failed_status, stdout, stderr) = seamed.finish_by(Instant::now() + handover_kill_switch());
     assert!(
         !failed_status.success(),
         "a failed handover tail must end the host with an error\nstdout:\n{stdout}\nstderr:\n{stderr}"
