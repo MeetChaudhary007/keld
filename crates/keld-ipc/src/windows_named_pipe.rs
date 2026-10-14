@@ -1442,20 +1442,24 @@ fn wait_for_operation(
     deadline: Option<Instant>,
 ) -> io::Result<WaitOutcome> {
     let handles = [cancel_event, operation_event];
-    let timeout = match deadline {
-        None => INFINITE,
-        Some(deadline) => deadline
-            .checked_duration_since(Instant::now())
-            .map_or(0, |remaining| duration_to_wait_ms(Some(remaining))),
-    };
-    // SAFETY: both handles remain live for the wait; the array length is exact.
-    let result = unsafe {
-        WaitForMultipleObjects(
-            u32::try_from(handles.len()).map_err(io::Error::other)?,
-            handles.as_ptr(),
-            0,
-            timeout,
-        )
+    let count = u32::try_from(handles.len()).map_err(io::Error::other)?;
+    let result = loop {
+        let timeout = match deadline {
+            None => INFINITE,
+            Some(deadline) => deadline
+                .checked_duration_since(Instant::now())
+                .map_or(0, |remaining| duration_to_wait_ms(Some(remaining))),
+        };
+        // SAFETY: both handles remain live for the wait; the array length is exact.
+        let result = unsafe { WaitForMultipleObjects(count, handles.as_ptr(), 0, timeout) };
+        // The kernel measures the timeout on its own clock, which can run a
+        // fraction of a millisecond ahead of the monotonic clock the deadline
+        // is on; a timeout that fires before the deadline consumed nothing, so
+        // the remainder is waited out and the deadline is never reported early.
+        if result == WAIT_TIMEOUT && deadline.is_some_and(|deadline| Instant::now() < deadline) {
+            continue;
+        }
+        break result;
     };
     match result {
         WAIT_OBJECT_0 => {
