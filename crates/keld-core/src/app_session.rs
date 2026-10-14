@@ -248,6 +248,13 @@ struct SessionShutdownState {
 #[cfg(any(target_os = "linux", windows))]
 #[derive(Default)]
 struct HandoverClock {
+    #[cfg_attr(
+        not(all(debug_assertions, windows)),
+        expect(
+            dead_code,
+            reason = "read by the debug evidence seam; the PerUserDirect coordinator (S6c2e) is the production reader"
+        )
+    )]
     requested: OnceLock<Instant>,
     ui_returned: OnceLock<Instant>,
     last_window_closed_written: OnceLock<Instant>,
@@ -2203,6 +2210,13 @@ impl SessionShutdownState {
 
     /// Caller holds `transition` and has just sent the handover's `Quit` to the UI loop.
     #[cfg(any(target_os = "linux", windows))]
+    #[cfg_attr(
+        not(all(debug_assertions, windows)),
+        expect(
+            dead_code,
+            reason = "called by request_handover, whose production caller is the PerUserDirect coordinator (S6c2e)"
+        )
+    )]
     fn mark_handover_requested_guarded(&self) {
         let _ = self.handover_clock.requested.set(Instant::now());
         self.handover_requested.store(true, Ordering::Release);
@@ -5770,6 +5784,13 @@ impl PrimaryRouterHandle {
     /// session is ending or a handover was already requested. A session under a dev
     /// lease must not request one: its lease tail would run beside the teardown.
     #[cfg(any(target_os = "linux", windows))]
+    #[cfg_attr(
+        not(all(debug_assertions, windows)),
+        expect(
+            dead_code,
+            reason = "the PerUserDirect coordinator (S6c2e) is the production caller; until then only the debug evidence seam calls it"
+        )
+    )]
     fn request_handover(&self) -> Result<bool, HostAppError> {
         let _transition = self.shutdown.transition_guard();
         if !self.shutdown.is_running() || self.shutdown.handover_requested() {
