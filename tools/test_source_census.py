@@ -59,6 +59,21 @@ class CounterContracts(unittest.TestCase):
                 self.assertEqual((category, encoding), (got[0], got[3]))
                 self.assertTrue(got[2], "F must have specific exclusion reason")
 
+    def test_generated_census_outputs_do_not_enter_authored_budgets(self):
+        prefix = "docs/audits/source-census-2026-10-15/"
+        for name in ("README.md", "summary.json", "manifest.csv"):
+            category, reason, exclusion, encoding = census.classify(
+                prefix + name, "100644", b"generated")
+            self.assertEqual("F", category)
+            self.assertEqual("generated", encoding)
+            self.assertIn("source_census.py", exclusion)
+        for name in ("review-notes.md", "analysis.json"):
+            category, _, _, _ = census.classify(prefix + name,
+                                                  "100644", b"human notes")
+            self.assertNotEqual("F", category)
+        self.assertEqual("E", census.classify(
+            "docs/audits/site-audit.md", "100644", b"human authored")[0])
+
     def test_classify_entrypoints_tests_and_tooling(self):
         cases = {
             "crates/keld-runtime/src/lib.rs": "A",

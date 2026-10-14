@@ -131,6 +131,14 @@ def classify(path, mode, data):
         return "F", "dependency lockfile", "generated dependency resolver output", "lock"
     if p in GENERATED:
         return "F", "documented derived index/view", "generated; see root AGENTS.md", "generated"
+    # Exactly the three artifacts authored by this census command. Do not
+    # exempt arbitrary audit documentation or user-written adjacent files.
+    if re.fullmatch(
+        r"docs/audits/source-census-\d{4}-\d{2}-\d{2}/(?:readme\.md|manifest\.csv|summary\.json)",
+        p,
+    ):
+        return ("F", "pinned census generator output",
+                "derived by tools/source_census.py", "generated")
     if ext in ASSETS:
         return "F", "static/media/compiled extension", "asset, not authored source text", "asset"
     if b"\0" in data:
