@@ -1582,6 +1582,7 @@ dependencies = [
  "keld-cli",
  "keld-core",
  "keld-runtime",
+ "keld-wv",
  "serde_json",
  "tempfile",
  "windows-sys 0.61.2",

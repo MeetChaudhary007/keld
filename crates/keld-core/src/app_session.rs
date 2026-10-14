@@ -2220,6 +2220,17 @@ impl SessionShutdownState {
         self.handover_requested.load(Ordering::Acquire)
     }
 
+    /// The handover fact as a reader outside `transition` must see it.
+    /// `request_handover` sends the handover's `Quit` and records the fact in one
+    /// `transition` hold. A reader that saw the `Quit` take effect, such as the main
+    /// thread after the UI loop returned, therefore reads under the same guard, so it
+    /// can never land between the send and the record and misclassify a handover as
+    /// an ordinary end.
+    fn handover_requested_guarded(&self) -> bool {
+        let _transition = self.transition_guard();
+        self.handover_requested()
+    }
+
     /// Caller holds `transition` and has just sent the handover's `Quit` to the UI loop.
     #[cfg(any(target_os = "linux", windows))]
     #[cfg_attr(
@@ -3715,7 +3726,8 @@ fn run_direct_app_session(
     // A handover ended the loop: the application session is still live and ends here
     // (KEL-53 §4 "Profile handover", steps 3a to 3c). A loop that returned an error
     // under a handover is a failed tail: no step follows, the session fails.
-    let handover_result = match (&window_result, shutdown.handover_requested()) {
+    let ended_by_handover = shutdown.handover_requested_guarded();
+    let handover_result = match (&window_result, ended_by_handover) {
         (Ok(()), true) => complete_profile_handover(&router.handle(), shutdown),
         _ => Ok(()),
     };
@@ -3726,7 +3738,7 @@ fn run_direct_app_session(
             shutdown.handover_clock.evidence_json(shutdown.cause())
         );
     }
-    let session_end = if shutdown.handover_requested() {
+    let session_end = if ended_by_handover {
         DirectSessionEnd::Handover
     } else {
         DirectSessionEnd::Ordinary
@@ -8635,6 +8647,29 @@ mod tests {
         assert!(
             waited.elapsed() < Duration::from_secs(5),
             "a CLI-lease-loss claim is not awaited"
+        );
+    }
+
+    /// A thread that saw the handover's `Quit` arrive, standing in for the main thread
+    /// after the UI loop returned, reads the handover fact under `transition`. It can
+    /// therefore never see the `Quit` without the fact, which is the post-loop
+    /// classification of a handover end.
+    #[test]
+    #[cfg(any(target_os = "linux", windows))]
+    fn a_reader_that_saw_the_handover_quit_reads_the_handover_fact() {
+        let (handle, _client, owner_rx, window_rx) = initial_ready_router_with_window_loop();
+        drop(owner_rx);
+        let shutdown = handle.shutdown.clone();
+        let ui_loop = thread::spawn(move || {
+            let command = window_rx.recv_timeout(Duration::from_secs(2));
+            (command, shutdown.handover_requested_guarded())
+        });
+        assert!(handle.request_handover().expect("a running session"));
+        let (command, observed) = ui_loop.join().expect("UI loop stand-in");
+        assert_eq!(command, Ok(AppWindowCommand::Quit));
+        assert!(
+            observed,
+            "a reader that saw the handover's Quit must see the handover fact"
         );
     }
 
