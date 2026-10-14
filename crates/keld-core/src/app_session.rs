@@ -249,7 +249,7 @@ struct SessionShutdownState {
 #[derive(Default)]
 struct HandoverClock {
     #[cfg_attr(
-        not(all(debug_assertions, windows)),
+        not(any(all(debug_assertions, windows), test)),
         expect(
             dead_code,
             reason = "read by the debug evidence seam; the PerUserDirect coordinator (S6c2e) is the production reader"
@@ -2211,7 +2211,7 @@ impl SessionShutdownState {
     /// Caller holds `transition` and has just sent the handover's `Quit` to the UI loop.
     #[cfg(any(target_os = "linux", windows))]
     #[cfg_attr(
-        not(all(debug_assertions, windows)),
+        not(any(all(debug_assertions, windows), test)),
         expect(
             dead_code,
             reason = "called by request_handover, whose production caller is the PerUserDirect coordinator (S6c2e)"
@@ -5785,7 +5785,7 @@ impl PrimaryRouterHandle {
     /// lease must not request one: its lease tail would run beside the teardown.
     #[cfg(any(target_os = "linux", windows))]
     #[cfg_attr(
-        not(all(debug_assertions, windows)),
+        not(any(all(debug_assertions, windows), test)),
         expect(
             dead_code,
             reason = "the PerUserDirect coordinator (S6c2e) is the production caller; until then only the debug evidence seam calls it"
