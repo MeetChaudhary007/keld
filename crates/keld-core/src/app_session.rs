@@ -34,12 +34,14 @@ use std::path::{Component, Path, PathBuf};
 use std::process::ExitStatus;
 #[cfg(target_os = "macos")]
 use std::process::{Command, Stdio};
+#[cfg(any(target_os = "linux", windows))]
+use std::sync::OnceLock;
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TrySendError};
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
-use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Condvar, Mutex, Weak};
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
 use std::thread::{self, JoinHandle};
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
@@ -2226,6 +2228,7 @@ impl SessionShutdownState {
     /// thread after the UI loop returned, therefore reads under the same guard, so it
     /// can never land between the send and the record and misclassify a handover as
     /// an ordinary end.
+    #[cfg(any(target_os = "linux", windows))]
     fn handover_requested_guarded(&self) -> bool {
         let _transition = self.transition_guard();
         self.handover_requested()
