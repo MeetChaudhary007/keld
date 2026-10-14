@@ -1865,17 +1865,19 @@ handover's step 3b, the time the application has after `LastWindowClosed` to req
 `Quit`, at least four times the maximum that the S6c2a pull request measures for the
 reference application on the same harness, floor 10 s, because no landed deadline
 bounds that wait (the loop waits for the application's `Quit` without one,
-`mod.rs:3350-3359`; `HOST_ANSWER_BUDGET` and `APP_LINK_IO_DEADLINE` bound single
+`mod.rs:3338-3353` and `:3357-3361`: a window's close only sends
+`LastWindowClosed`, and the loop exits only after a terminal command;
+`HOST_ANSWER_BUDGET` and `APP_LINK_IO_DEADLINE` bound single
 writes and reads, not the application's decision). D is measured on the reference
 application only; a third-party application's time to persist its state is unknown
 to Keld, so an application that takes longer than D to quit is force-ended, and S6c2a
 records D where application authors read it, at the `@keld/electron`
 `window-all-closed` mapping (`packages/@keld/electron/src/app.ts:68-75`). D's record
 (S6c2a): the interval runs on the host's monotonic clock from the return of the
-`LastWindowClosed` write (`app_session.rs:5743-5755`) to the lifecycle-Quit handler's
+`LastWindowClosed` write (`app_session.rs:5784-5796`) to the lifecycle-Quit handler's
 entry for the frame, recorded only for the `Quit` that claims the session
-(`app_session.rs:6463`), measured through the §7 h11 cell on
-the KEL-254/KEL-135 signed fixture host with the reference application
+(`app_session.rs:6529`, set at `:6586` only after the claim), measured through the §7
+h11 cell on the KEL-254/KEL-135 signed fixture host with the reference application
 (`crates/keld-host/tests/fixtures/t1b_harness.ts`), thirty runs idle and thirty under
 full-core load (sixteen busy-loop burners on sixteen logical cores, the F55 method);
 the sixty samples, the machine, the builds and the load method are the keld-benches
@@ -1990,7 +1992,7 @@ census interaction, the dependencies and the rejected alternatives.
 *Facts.* A Windows release host selects its persistent profile identity before any
 listener, child or window (Architecture 05 §1, `05-webview-and-native.md:55-56`) and
 takes the KEL-135 lease when it constructs its engine: `WebView2Engine::new`
-(`crates/keld-wv/src/webview2/mod.rs:2235-2244`) prepares the profile (`mod.rs:834-842`),
+(`crates/keld-wv/src/webview2/mod.rs:2944-2947`) prepares the profile (`mod.rs:834-842`),
 which opens `profile.lock` (`mod.rs:188`) with share mode zero (`mod.rs:517-523`, the
 open at `:792-795`); a second opener gets `ProfileInUse` (`mod.rs:521-538`). Every environment of that engine requests
 exclusive user-data-folder access (`mod.rs:1200`), so even a free lease admits no second
@@ -2034,43 +2036,43 @@ mints the identities, writing nothing
 (`crates/keld-update/src/windows_baseline/activate.rs:170-186`); (2) the owner creates
 and holds its endpoint and reads the descriptor back ("Candidate connect-back",
 *Order*); (3) the handover, a cooperative quit in three parts: (3a) the host ends its
-UI through the existing `Quit` command of the UI loop (`mod.rs:3321-3326`: `stopping`
+UI through the existing `Quit` command of the UI loop (`mod.rs:3314-3319`: `stopping`
 is committed, the views are dropped, the loop waits for the barrier, writes `idle` and
 releases the lease; the command's documentation widens from "the correlated Quit reply
 has been written" to "the session is ending", a doc change on a public item), and,
 once the loop has returned, the host itself writes `LastWindowClosed` to the
 application through the router's `signal_last_window_closed`
-(`app_session.rs:5743-5755`), the same write a window's close triggers
-(`app_session.rs:4486`), because the `Quit` command's path emits no `LastWindowClosed`
-(`mod.rs:3321-3326`; only a window's close does, `:3356-3359`); (3b) the host waits
+(`app_session.rs:5784-5796`), the same write a window's close triggers
+(`app_session.rs:4527`), because the `Quit` command's path emits no `LastWindowClosed`
+(`mod.rs:3314-3319`; only a window's close does, `:3349-3352`); (3b) the host waits
 up to the quit deadline D of *Margin and deadlines*, counted from that write, for the
 application's `Quit`, which the landed lifecycle-Quit handler admits by claiming the
-session cause (`app_session.rs:6515`) and answers with the reply, the quiesce and
+session cause (`app_session.rs:6574`) and answers with the reply, the quiesce and
 drain, the peer close, the link close and the guardian reap
-(`app_session.rs:6463-6607`); `finish_tail`'s UI step (`app_session.rs:7048-7064`),
-which before S6c2a failed on the closed window-commands channel (`:7058-7063`), is a
+(`app_session.rs:6522-6624`); `finish_tail`'s UI step (`app_session.rs:7112-7121`),
+which before S6c2a failed on the closed window-commands channel (`:7119-7121`), is a
 no-op once a handover has ended the UI loop, under whichever cause the tail runs; that
 session fact is set in the same transition-guard hold as the handover's `Quit` send,
 after that send succeeds, and read under the guard by `finish_tail`, because the loop's wake bridge
-drops its command receiver on the first terminal command (`mod.rs:3455-3463`), so a
+drops its command receiver on the first terminal command (`mod.rs:3447-3457`), so a
 `Quit` the application sends after the loop returned cannot race it; (3c) only when D
 passes without a `Quit`, the host claims the handover cause, the session's third
 (`SESSION_HANDOVER`, beside the lifecycle-Quit and CLI-lease-loss causes,
 `app_session.rs:166-175`), and runs the forced tail of CLI lease loss
-(`app_session.rs:6663-6740`: accepted-shutdown preparation, quiesce and drain, link
+(`app_session.rs:6721-6785`: accepted-shutdown preparation, quiesce and drain, link
 close, guardian reap) under that cause on the thread that claimed it, the main thread
-(`complete_profile_handover`, `app_session.rs:3279-3312`; the bounded wait and the
-claim under one guard hold, `await_quit_or_claim_handover`, `:2223-2241`); the first
+(`complete_profile_handover`, `app_session.rs:3317-3345`; the bounded wait and the
+claim under one guard hold, `await_quit_or_claim_handover`, `:2261-2279`); the first
 claim wins (`claim_guarded` is one compare-and-swap from the running state,
-`app_session.rs:2285-2287`, and `begin_tail` is one-shot, `:2344-2346`): an application
+`app_session.rs:2323-2325`, and `begin_tail` is one-shot, `:2382-2384`): an application
 whose `Quit` claims the session before the deadline's claim is answered, and a `Quit`
-read after the forced claim returns without a reply (`:6481-6489`); then the router
-and the primary owner are shut down (`app_session.rs:3700-3701`), after the claimant's
+read after the forced claim returns without a reply (`:6541-6549`); then the router
+and the primary owner are shut down (`app_session.rs:3739-3740`), after the claimant's
 tail has ended, which the main thread awaits as it awaited the loop's return before.
 Both tails are landed; S6c2a admits the handover cause in the forced tail's gate, which
-before admitted only CLI lease loss (`app_session.rs:6665`), and the UI-ended no-op in
+before admitted only CLI lease loss (`app_session.rs:6723`), and the UI-ended no-op in
 `finish_tail`, and lists both in its scope (§5); no `AppWindowCommand` variant is added
-(`crates/keld-wv/src/engine.rs:91-96`). Rejected: a new
+(`crates/keld-wv/src/engine.rs:91-100`). Rejected: a new
 `CloseAppWindows` command that keeps the loop alive windowless until the application's
 `Quit`, which adds a public variant and a live loop with no window for the same
 observable; (4) `journal()` writes `PublishPending` and runs to `AwaitingHealth`
@@ -2174,7 +2176,7 @@ it with the two-sessions cell of the §7 row before any composition. The stop ru
 therefore did not fire. That rule was: if the cell could not pass, S6c stopped and this
 specification was amended under the public-API gate, with the recorded alternative of
 keeping the event loop alive and replacing the environment inside it, which adds an
-`AppWindowCommand` variant (`crates/keld-wv/src/engine.rs:91-96`).
+`AppWindowCommand` variant (`crates/keld-wv/src/engine.rs:91-100`).
 
 The cell showed that the libraries were not the only process-wide fact. Landed
 `keld-core` prepared the guard snapshot's sole filesystem broker once per process, so
@@ -2988,35 +2990,35 @@ Implement in:
 - landed-code changes in `keld-core`, `keld-wv` and `keld-host` (slice S6c; "Profile
   handover"; "Candidate connect-back", *Health sequence* and *Margin and deadlines*;
   "Candidate release after commit"):
-  - `run_app_direct` (`crates/keld-core/src/app_session.rs:3387`) becomes a loop
+  - `run_app_direct` (`crates/keld-core/src/app_session.rs:3426`) becomes a loop
     of application sessions in one process: a session ends by the user's Quit, a fatal,
     CLI lease loss or the handover; after a handover the main thread runs the
     coordinator (launch, claim, health, resolution), then either the committed exit
     path or the restore (R1 to R5 of "Profile handover": the restore's engine is
     constructed before `roll_back`, then the Bun start, the router and the window).
     The handover is the cooperative quit of step 3: the router's crate-private
-    `request_handover` (`app_session.rs:5766-5776`; S6c2a; the entry the coordinator
+    `request_handover` (`app_session.rs:5817-5835`; S6c2a; the entry the coordinator
     calls) sends the existing
-    `Quit` command, which ends the UI (`crates/keld-wv/src/webview2/mod.rs:3321-3326`;
+    `Quit` command, which ends the UI (`crates/keld-wv/src/webview2/mod.rs:3314-3319`;
     its documentation widens to the host-initiated session end) and emits no
     `LastWindowClosed`, so once the loop has returned the main thread writes
     `LastWindowClosed` itself through `signal_last_window_closed`
-    (`app_session.rs:5743-5755`); the application's `Quit` is admitted and answered
-    by the landed lifecycle-Quit handler (`app_session.rs:6463-6607`), and past the
+    (`app_session.rs:5784-5796`); the application's `Quit` is admitted and answered
+    by the landed lifecycle-Quit handler (`app_session.rs:6522-6624`), and past the
     quit deadline D the handover cause `SESSION_HANDOVER` (`app_session.rs:166-175`;
-    S6c2a) runs the CLI-lease-loss tail (`app_session.rs:6663-6740`) on the main
+    S6c2a) runs the CLI-lease-loss tail (`app_session.rs:6721-6785`) on the main
     thread. Two landed tails change (S6c2a): the forced tail's gate admits the
-    handover cause beside CLI lease loss (`app_session.rs:6665`), and `finish_tail`'s
+    handover cause beside CLI lease loss (`app_session.rs:6723`), and `finish_tail`'s
     UI step, which before failed on the closed window-commands channel
-    (`:7058-7063`), is a no-op once a handover has ended the UI loop, under whichever
+    (`:7119-7121`), is a no-op once a handover has ended the UI loop, under whichever
     cause the tail runs. The claim wait is bounded by the deadline and by the launch
     handle: a watcher waits on the retained launch handle in bounded slices
     (`WindowsLaunchedProcess::wait_until_exited`) and drives the endpoint's public
     claim canceller (`WindowsAttemptEndpoint::claim_canceller`, S6c2b), which ends the
     wait with `ClaimCancelled` (`KELD-IPC-028`) and is serialised with the one-shot;
     no production FFI call and no crate is added; no
-    `AppWindowCommand` variant is added (`crates/keld-wv/src/engine.rs:91-96`), and
-    `WebView2Engine::new` (`crates/keld-wv/src/webview2/mod.rs:2235-2244`) is
+    `AppWindowCommand` variant is added (`crates/keld-wv/src/engine.rs:91-100`), and
+    `WebView2Engine::new` (`crates/keld-wv/src/webview2/mod.rs:2921-2944`) is
     documented as constructible again on the main thread after a previous engine's
     session ended, which the two-sessions cell proves. The loop keeps per process the
     boot selection, the installed version-tree pin, the profile mode selected at boot,
