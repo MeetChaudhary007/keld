@@ -193,11 +193,22 @@ impl PendingAuthorization {
         scopes: Option<&[String]>,
         login_hint: Option<&str>,
     ) -> Result<OutgoingText, PrimitiveError> {
+        self.authorization_uri(profile, client_id, &redirect.uri, scopes, login_hint)
+    }
+    /// Same OAuth form owner for the reviewed AS registration literal.
+    pub(super) fn authorization_uri(
+        &self,
+        profile: &ProviderProfile,
+        client_id: &str,
+        redirect_uri: &str,
+        scopes: Option<&[String]>,
+        login_hint: Option<&str>,
+    ) -> Result<OutgoingText, PrimitiveError> {
         validate_login_hint(login_hint)?;
         let mut form = FormBuilder::new();
         form.field("response_type", "code")?;
         form.field("client_id", client_id)?;
-        form.field("redirect_uri", &redirect.uri)?;
+        form.field("redirect_uri", redirect_uri)?;
         if let Some(scopes) = scopes
             && !scopes.is_empty()
         {
@@ -277,13 +288,76 @@ impl CorrelatedAuthorization {
         client_id: &str,
         redirect: &LoopbackRedirect,
     ) -> Result<OutgoingText, PrimitiveError> {
+        self.token_form_uri(client_id, &redirect.uri)
+    }
+    /// Consume the same code/verifier with the exact reviewed AS redirect value.
+    pub(super) fn token_form_uri(
+        self,
+        client_id: &str,
+        redirect_uri: &str,
+    ) -> Result<OutgoingText, PrimitiveError> {
         let mut form = FormBuilder::new();
         form.field("grant_type", "authorization_code")?;
         form.field("client_id", client_id)?;
         form.field("code", &self.code)?;
-        form.field("redirect_uri", &redirect.uri)?;
+        form.field("redirect_uri", redirect_uri)?;
         form.field("code_verifier", &self.verifier)?;
         Ok(OutgoingText(form.finish()))
+    }
+}
+
+/// Exact optional operator registration; no provider selection or URI synthesis.
+pub(super) struct AsRedirect {
+    uri: String,
+    scheme: String,
+}
+impl fmt::Debug for AsRedirect {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("AsRedirect([redacted])")
+    }
+}
+impl AsRedirect {
+    pub(super) fn new(value: &str, client_id: &str) -> Option<Self> {
+        if value.len() > MAX_OAUTH_TEXT_BYTES || client_id.len() > MAX_OAUTH_TEXT_BYTES {
+            return None;
+        }
+        let scheme = format!("msal{client_id}");
+        if !scheme
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.'))
+            || value != format!("{scheme}://auth")
+        {
+            return None;
+        }
+        Some(Self {
+            uri: value.to_owned(),
+            scheme,
+        })
+    }
+    pub(super) fn uri(&self) -> &str {
+        &self.uri
+    }
+    pub(super) fn scheme(&self) -> &str {
+        &self.scheme
+    }
+    pub(super) fn correlate(
+        &self,
+        pending: PendingAuthorization,
+        callback: &str,
+    ) -> Result<CorrelatedAuthorization, PrimitiveError> {
+        if callback.contains('#') {
+            return Err(PrimitiveError::Correlation);
+        }
+        let (base, query) = callback
+            .split_once('?')
+            .ok_or(PrimitiveError::Correlation)?;
+        // Entra may append exactly one slash to its empty-path AS return.
+        // Only this exact registered destination representation is compatible;
+        // query/state/response correlation below remains strict and single-use.
+        if base != self.uri && base.strip_suffix('/') != Some(self.uri.as_str()) {
+            return Err(PrimitiveError::Correlation);
+        }
+        pending.correlate_callback(query)
     }
 }
 
@@ -701,6 +775,119 @@ mod tests {
             .expect("dynamic plan")
             .complete(4321)
             .expect("actual bound port")
+    }
+
+    #[test]
+    fn as_registration_keeps_one_literal_across_both_oauth_legs() {
+        let raw = "msal12345678-1234-1234-1234-123456789abc://auth";
+        let client = "12345678-1234-1234-1234-123456789abc";
+        let redirect = AsRedirect::new(raw, client).expect("literal registered binding");
+        let profile = provider_profile("entra-common").expect("closed profile");
+        let pending = fixture();
+        let url = pending
+            .authorization_uri(profile, client, redirect.uri(), None, None)
+            .expect("same form owner");
+        assert!(
+            url.as_str()
+                .contains("redirect_uri=msal12345678-1234-1234-1234-123456789abc%3A%2F%2Fauth")
+        );
+        let callback =
+            format!("{raw}?code=literal-code&state=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+        let form = redirect
+            .correlate(pending, &callback)
+            .expect("exact state/base")
+            .token_form_uri(client, redirect.uri())
+            .expect("same token form owner");
+        assert!(
+            form.as_str()
+                .contains("redirect_uri=msal12345678-1234-1234-1234-123456789abc%3A%2F%2Fauth")
+        );
+        assert!(
+            form.as_str()
+                .contains("code_verifier=dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk")
+        );
+    }
+    #[test]
+    fn as_return_empty_path_slash_keeps_state_and_raw_oauth_binding() {
+        let client = "12345678-1234-1234-1234-123456789abc";
+        let raw = "msal12345678-1234-1234-1234-123456789abc://auth";
+        let redirect = AsRedirect::new(raw, client).expect("literal registration");
+        let pending = fixture();
+        let authorization = pending
+            .authorization_uri(
+                provider_profile("entra-common").expect("closed profile"),
+                client,
+                redirect.uri(),
+                None,
+                None,
+            )
+            .expect("existing authorization form");
+        assert!(
+            authorization
+                .as_str()
+                .contains("redirect_uri=msal12345678-1234-1234-1234-123456789abc%3A%2F%2Fauth")
+        );
+        let callback =
+            format!("{raw}/?code=literal-code&state=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+        let form = redirect
+            .correlate(pending, &callback)
+            .expect("provider-added empty-path slash")
+            .token_form_uri(client, redirect.uri())
+            .expect("same raw registration");
+        assert!(
+            form.as_str()
+                .contains("redirect_uri=msal12345678-1234-1234-1234-123456789abc%3A%2F%2Fauth&")
+        );
+        assert!(
+            !form
+                .as_str()
+                .contains("redirect_uri=msal12345678-1234-1234-1234-123456789abc%3A%2F%2Fauth%2F")
+        );
+        assert!(
+            form.as_str()
+                .contains("code_verifier=dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk")
+        );
+        for callback in [
+            format!("{raw}/?code=code&state=wrong"),
+            format!("{raw}/?code=code&state=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA&state=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+            format!("{raw}/?code=code&state=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA#fragment"),
+            format!("{raw}//?code=code&state=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+            format!("{raw}/other?code=code&state=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+            "msalother://auth/?code=code&state=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+            "msal12345678-1234-1234-1234-123456789abc://auth.evil/?code=code&state=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+            "msal12345678-1234-1234-1234-123456789abc://user@auth/?code=code&state=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+        ] {
+            assert!(matches!(redirect.correlate(fixture(), &callback), Err(PrimitiveError::Correlation)));
+        }
+        assert!(
+            AsRedirect::new(&format!("{raw}/"), client).is_none(),
+            "outgoing registration itself stays exact"
+        );
+    }
+
+    #[test]
+    fn as_registration_and_callback_reject_aliases_and_wrong_state() {
+        let client = "12345678-1234-1234-1234-123456789abc";
+        let raw = "msal12345678-1234-1234-1234-123456789abc://auth";
+        for invalid in [
+            "",
+            "https://example.invalid/auth",
+            "msalother://auth",
+            "msal12345678-1234-1234-1234-123456789abc://auth/",
+        ] {
+            assert!(AsRedirect::new(invalid, client).is_none());
+        }
+        let redirect = AsRedirect::new(raw, client).expect("binding");
+        for callback in [
+            format!("{raw}?code=code&state=wrong"),
+            format!("{raw}/other?code=code&state=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+            format!("{raw}?code=code&state=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA#fragment"),
+        ] {
+            assert!(matches!(
+                redirect.correlate(fixture(), &callback),
+                Err(PrimitiveError::Correlation)
+            ));
+        }
     }
 
     #[test]

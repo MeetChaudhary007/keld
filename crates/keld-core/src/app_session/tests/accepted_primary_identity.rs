@@ -122,6 +122,7 @@ fn accepted_app_bound_identity_is_refused_by_primary_admission() {
         SessionShutdownState::new(),
         None,
         AuthConfiguration::new(),
+        None,
     );
     let Err(error) = result else {
         panic!("accepted app-bound role entered primary router");

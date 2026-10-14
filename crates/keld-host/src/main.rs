@@ -11,7 +11,6 @@ use std::fs;
 use std::fs::File;
 #[cfg(target_os = "macos")]
 use std::io;
-#[cfg(any(target_os = "macos", windows))]
 use std::io::Write as _;
 #[cfg(target_os = "macos")]
 use std::os::unix::fs::MetadataExt;
@@ -109,14 +108,24 @@ fn main() {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     let dev_stage_cleanup = dev_stage_cleanup_root();
     let result = keld_core::app_session::ValidatedBootSelection::from_current_exe_unprivileged()
+        .map_err(keld_core::app_session::HostRunFailure::from)
         .and_then(keld_core::app_session::run_guarded);
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    let retains_main_custody = result
+        .as_ref()
+        .err()
+        .is_some_and(keld_core::app_session::HostRunFailure::retains_main_custody);
     let mut failed = false;
-    if let Err(error) = result {
-        eprintln!("{error}");
+    if let Err(error) = &result {
+        // Reporting failure must not unwind/drop an owned main-custody payload.
+        let mut output = std::io::stderr().lock();
+        let _ = writeln!(output, "{error}");
+        let _ = output.flush();
         failed = true;
     }
     #[cfg(any(target_os = "macos", target_os = "linux"))]
-    if let Some(root) = dev_stage_cleanup
+    if !retains_main_custody
+        && let Some(root) = dev_stage_cleanup
         && let Err(source) = fs::remove_dir_all(&root)
         && source.kind() != std::io::ErrorKind::NotFound
     {
@@ -127,6 +136,8 @@ fn main() {
         failed = true;
     }
     if failed {
+        // The result and any !Send unproved-custody payload are still owned.
+        // This existing fatal exit is failure, never a physical-drain receipt.
         process::exit(1);
     }
 }

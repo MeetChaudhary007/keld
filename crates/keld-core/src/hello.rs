@@ -1050,6 +1050,21 @@ mod auth_config_tests {
     }
 
     #[test]
+    fn static_auth_carries_as_return_without_registration_validation() {
+        let config = auth_configuration_from_config_ts(
+            "export default { auth: { 'entra-common': { asRedirect: 'not-a-valid-registration' } } };",
+        )
+        .expect("AS registration semantics remain post-Allow");
+        let profile = config.get("entra-common").expect("closed profile");
+        assert!(profile.client_id.is_none());
+        assert!(profile.fixed_redirect.is_none());
+        assert_eq!(
+            profile.as_redirect.as_deref(),
+            Some("not-a-valid-registration")
+        );
+    }
+
+    #[test]
     fn static_auth_ignores_comment_string_and_nested_mentions() {
         let config = auth_configuration_from_config_ts(
             r#"

@@ -97,6 +97,9 @@ pub enum AppWindowCommand {
     Quit,
     /// The primary app session failed; close windows and exit with an error.
     Fatal,
+    /// Wake the existing macOS main-owned authentication presentation service.
+    #[cfg(target_os = "macos")]
+    MacAuthWake,
 }
 
 /// Observable UI-owned milestone delivered to the host session coordinator.

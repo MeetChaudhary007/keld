@@ -28,6 +28,12 @@ const BROWSER_LAUNCH_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 
 #[cfg(target_os = "macos")]
 mod macos_http;
+#[cfg(target_os = "macos")]
+mod macos_session;
+#[cfg(target_os = "macos")]
+pub use macos_session::{
+    AsMainOwner, AsMainProgress, AsMainStop, AsWorkerPort, prepare_as_presentation,
+};
 
 #[cfg(target_os = "macos")]
 mod registry;
@@ -176,7 +182,7 @@ pub fn provider_profile(key: &str) -> Option<&'static ProviderProfile> {
 
 /// Per-application operator credentials from `auth.<profileKey>`.
 ///
-/// Configuration field names are `clientId` and `fixedRedirect` in
+/// Configuration fields are `clientId`, `fixedRedirect`, and `asRedirect` in
 /// `keld.config.ts` and `keld.boot.json`. They are distinct from the
 /// `snake_case` auth CALL/REPLY payload fields.
 #[derive(Default, Serialize, Deserialize)]
@@ -192,6 +198,14 @@ pub struct AuthProfileConfiguration {
         skip_serializing_if = "Option::is_none"
     )]
     pub fixed_redirect: Option<String>,
+    /// Operator-registered macOS AS return binding; validation is post-Allow.
+    /// Omission or boot JSON null retains the existing loopback configuration.
+    #[serde(
+        rename = "asRedirect",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub as_redirect: Option<String>,
 }
 
 impl std::fmt::Debug for AuthProfileConfiguration {
@@ -377,6 +391,7 @@ mod tests {
         let config = AuthProfileConfiguration {
             client_id: Some("private-configuration-marker".to_owned()),
             fixed_redirect: None,
+            as_redirect: None,
         };
         assert_eq!(format!("{request:?}"), "AuthRequest::Begin { .. }");
         assert_eq!(format!("{token_request:?}"), "AuthRequest::Token { .. }");
@@ -588,6 +603,7 @@ mod tests {
                 AuthProfileConfiguration {
                     client_id: Some("operator-client".to_owned()),
                     fixed_redirect: Some("http://localhost:4321/callback".to_owned()),
+                    as_redirect: None,
                 },
             ),
             ("google".to_owned(), AuthProfileConfiguration::default()),
@@ -620,6 +636,55 @@ mod tests {
                 .expect("known config retained")
                 .client_id
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn as_redirect_shape_accepts_literal_operator_binding() {
+        let value = serde_json::json!({
+            "clientId": "operator-client",
+            "fixedRedirect": "http://localhost:4321/callback",
+            "asRedirect": "msaloperator-client://auth"
+        });
+        let config: AuthProfileConfiguration = serde_json::from_value(value.clone())
+            .expect("registered AS binding is configuration data");
+        assert_eq!(
+            serde_json::to_value(config).expect("serialize config"),
+            value
+        );
+    }
+
+    #[test]
+    fn as_redirect_shape_preserves_null_absence_and_closed_fields() {
+        for value in [
+            serde_json::json!({"clientId": "operator-client"}),
+            serde_json::json!({"clientId": "operator-client", "asRedirect": null}),
+        ] {
+            let config: AuthProfileConfiguration = serde_json::from_value(value)
+                .expect("absent AS binding preserves existing configuration");
+            assert_eq!(
+                serde_json::to_value(config).expect("serialize config"),
+                serde_json::json!({"clientId": "operator-client"})
+            );
+        }
+        for value in [
+            serde_json::json!({"asRedirect": true}),
+            serde_json::json!({"asRedirect": []}),
+            serde_json::json!({"asRedirect": 42}),
+            serde_json::json!({"asRedirect": "value", "extra": "value"}),
+        ] {
+            assert!(serde_json::from_value::<AuthProfileConfiguration>(value).is_err());
+        }
+    }
+
+    #[test]
+    fn as_redirect_shape_defers_registration_semantics() {
+        let value = serde_json::json!({"asRedirect": "not-a-valid-registration"});
+        let config: AuthProfileConfiguration = serde_json::from_value(value.clone())
+            .expect("registration semantics follow guard Allow, not shape loading");
+        assert_eq!(
+            serde_json::to_value(config).expect("serialize config"),
+            value
         );
     }
 }

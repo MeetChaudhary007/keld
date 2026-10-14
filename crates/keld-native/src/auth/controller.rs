@@ -4,8 +4,11 @@ use super::browser::{BrowserDeadlines, BrowserLaunch, BrowserProgress};
 use super::errors::AuthError;
 use super::loopback::{LoopbackFlow, LoopbackProgress};
 use super::macos_http::{HttpDeadlines, HttpError, HttpOperation, HttpProgress, HttpResponse};
+use super::macos_session::{
+    AsFault, AsOutcome, AsStartRequest, AsSubmit, AsWorkerPort, AsWorkerProgress,
+};
 use super::primitives::{
-    CorrelatedAuthorization, PendingAuthorization, PrimitiveError, RedirectPlan,
+    AsRedirect, CorrelatedAuthorization, PendingAuthorization, PrimitiveError, RedirectPlan,
     refresh_token_form, validate_login_hint,
 };
 use super::registry::{
@@ -124,6 +127,8 @@ pub enum HostFault {
     BrowserCleanupUnproven(Arc<CallError>),
     /// Actual HTTP callback/delegate quiescence is not proved; retain its owner.
     HttpCleanupUnproven(Arc<CallError>),
+    /// AS presentation/authority cleanup is unproved; keep its original lease.
+    AsPresentation(AsFault),
 }
 impl fmt::Debug for HostFault {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -136,6 +141,7 @@ impl fmt::Debug for HostFault {
             Self::MissingTokenOwner => "MissingTokenOwner",
             Self::BrowserCleanupUnproven(_) => "BrowserCleanupUnproven",
             Self::HttpCleanupUnproven(_) => "HttpCleanupUnproven",
+            Self::AsPresentation(_) => "AsPresentation",
         };
         f.debug_struct(name).finish_non_exhaustive()
     }
@@ -198,13 +204,39 @@ pub enum Progress {
     HostFault(HostFault),
 }
 
+/// Trusted internal flow fact, never child/config/provider-derived in v0.
+/// The public handler always supplies Unclassified; no runtime classifier exists.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TrustedFlowClass {
+    Unclassified,
+    KnownRequiresDeviceCompliance,
+}
+
 struct Prompt {
     flow: LoopbackFlow,
     browser: BrowserLaunch,
     callback: Option<Result<CorrelatedAuthorization, Arc<CallError>>>,
     browser_done: bool,
 }
+struct AsPrompt {
+    port: AsWorkerPort,
+    request: Option<AsStartRequest>,
+    pending: Option<PendingAuthorization>,
+    redirect: AsRedirect,
+    native_done: bool,
+}
+// Borrowed construction inputs only; no new identity, state or ownership rule.
+#[derive(Clone, Copy)]
+struct BeginInputs<'a> {
+    profile: &'static ProviderProfile,
+    client_id: &'a str,
+    scopes: Option<&'a [String]>,
+    hint: Option<&'a str>,
+    end: Instant,
+    cancelled: &'a Arc<AtomicBool>,
+}
 enum BeginPhase {
+    As(Box<AsPrompt>),
     Prompt(Box<Prompt>),
     Http(HttpOperation),
 }
@@ -212,6 +244,7 @@ struct BeginJob {
     profile: &'static ProviderProfile,
     client_id: String,
     scopes: Option<Vec<String>>,
+    hint: Option<String>,
     end: Instant,
     cancelled: Arc<AtomicBool>,
     phase: BeginPhase,
@@ -242,6 +275,7 @@ enum Job {
 pub struct AuthBroker {
     prepared_digest: [u8; 32],
     configuration: AuthConfiguration,
+    as_port: Option<AsWorkerPort>,
     registry: SessionRegistry,
     owner: Arc<()>,
     next_operation: u64,
@@ -264,6 +298,7 @@ impl AuthBroker {
         Self {
             prepared_digest: verified.verified_sha256(),
             configuration,
+            as_port: None,
             registry: SessionRegistry::new(),
             owner: Arc::new(()),
             next_operation: 0,
@@ -271,6 +306,18 @@ impl AuthBroker {
             #[cfg(test)]
             test_token_endpoint: None,
         }
+    }
+    /// Prepares the existing guarded broker with its primitive-only AS main port.
+    /// No SDK object, guard decision or OS work occurs during construction.
+    #[must_use]
+    pub fn prepare_with_as(
+        verified: &VerifiedManifest,
+        configuration: AuthConfiguration,
+        as_port: AsWorkerPort,
+    ) -> Self {
+        let mut broker = Self::prepare(verified, configuration);
+        broker.as_port = Some(as_port);
+        broker
     }
     /// Handles one Core-admitted decoded auth request with exactly one guard
     /// decision. Only unknown Begin provider002 refuses before that decision.
@@ -295,6 +342,24 @@ impl AuthBroker {
         request: AuthRequest,
         admit: impl FnOnce() -> Option<A>,
     ) -> HandleState<A> {
+        self.handle_classified_manifest_request(
+            manifest,
+            principal,
+            request,
+            TrustedFlowClass::Unclassified,
+            admit,
+        )
+    }
+    // Same owning Guard dispatcher. The additional fact is private and trusted;
+    // it neither grants authority nor evaluates a second policy decision.
+    fn handle_classified_manifest_request<A>(
+        &mut self,
+        manifest: &PermissionsManifest,
+        principal: Principal,
+        request: AuthRequest,
+        flow_class: TrustedFlowClass,
+        admit: impl FnOnce() -> Option<A>,
+    ) -> HandleState<A> {
         match request {
             AuthRequest::Begin {
                 provider,
@@ -316,6 +381,7 @@ impl AuthBroker {
                             profile,
                             scopes,
                             login_hint.as_deref(),
+                            flow_class,
                             Instant::now(),
                             admit,
                         )
@@ -376,9 +442,17 @@ impl AuthBroker {
         profile: &'static ProviderProfile,
         scopes: Option<Vec<String>>,
         hint: Option<&str>,
+        flow_class: TrustedFlowClass,
         admitted_at: Instant,
         admit: impl FnOnce() -> Option<A>,
     ) -> HandleState<A> {
+        // AC7b: actual Allow has already occurred. A supplied known policy
+        // class fails before config validation, RNG, admission or any AS/T3 work.
+        if flow_class == TrustedFlowClass::KnownRequiresDeviceCompliance {
+            return HandleState::Ready(ReadyResponse::error(
+                &AuthError::DeviceComplianceUnsupported,
+            ));
+        }
         if !self.registry.admission_open() {
             return HandleState::Ready(ReadyResponse::error(&AuthError::State(
                 StateFault::Stopping,
@@ -391,13 +465,28 @@ impl AuthBroker {
         if let Err(e) = validate_login_hint(hint) {
             return HandleState::Ready(ReadyResponse::error(&AuthError::Primitive(e)));
         }
-        let fixed = self
+        let as_redirect = match self
             .configuration
             .get(profile.key)
-            .and_then(|value| value.fixed_redirect.as_deref());
-        let plan = match RedirectPlan::new(profile, fixed) {
-            Ok(value) => value,
-            Err(e) => return HandleState::Ready(ReadyResponse::error(&AuthError::Primitive(e))),
+            .and_then(|value| value.as_redirect.as_deref())
+        {
+            None => None,
+            Some(value) => match AsRedirect::new(value, &client_id) {
+                Some(value) => Some(value),
+                None => {
+                    return HandleState::Ready(ReadyResponse::error(
+                        &AuthError::InvalidAsRedirect(profile),
+                    ));
+                }
+            },
+        };
+        let plan = if as_redirect.is_none() {
+            match self.redirect_plan(profile) {
+                Ok(value) => Some(value),
+                Err(e) => return HandleState::Ready(ReadyResponse::error(&e)),
+            }
+        } else {
+            None
         };
         let Some(end) = admitted_at.checked_add(BEGIN_HOST_TIMEOUT) else {
             return HandleState::HostFault(HostFault::ClockOverflow);
@@ -414,30 +503,24 @@ impl AuthBroker {
             Ok(value) => value,
             Err(e) => return HandleState::Ready(ReadyResponse::error(&AuthError::Primitive(e))),
         };
-        let flow = match LoopbackFlow::bind(plan, pending, end, Arc::clone(&cancelled)) {
-            Ok(value) => value,
-            Err(e) => return HandleState::Ready(ReadyResponse::error(&AuthError::Loopback(e))),
-        };
-        let url = match flow.authorization_url(profile, &client_id, scopes.as_deref(), hint) {
-            Ok(value) => value,
-            Err(e) => return HandleState::Ready(ReadyResponse::error(&AuthError::Loopback(e))),
-        };
-        let Some(launch) = Instant::now()
-            .checked_add(BROWSER_LAUNCH_TIMEOUT)
-            .map(|bound| bound.min(end))
-        else {
-            return HandleState::HostFault(HostFault::ClockOverflow);
-        };
-        let Some(cleanup) = launch.checked_add(OWNER_CLEANUP_TIMEOUT) else {
-            return HandleState::HostFault(HostFault::ClockOverflow);
-        };
-        let browser = match BrowserLaunch::start(
-            &url,
-            BrowserDeadlines { launch, cleanup },
-            Arc::clone(&cancelled),
+        let phase = match self.make_begin_phase(
+            &id,
+            (as_redirect, plan),
+            pending,
+            BeginInputs {
+                profile,
+                client_id: &client_id,
+                scopes: scopes.as_deref(),
+                hint,
+                end,
+                cancelled: &cancelled,
+            },
         ) {
-            Ok(value) => value,
-            Err(e) => return HandleState::Ready(ReadyResponse::error(&AuthError::Browser(e))),
+            Ok(phase) => phase,
+            Err(PromptFailure::Auth(error)) => {
+                return HandleState::Ready(ReadyResponse::error(&error));
+            }
+            Err(PromptFailure::Host(fault)) => return HandleState::HostFault(fault),
         };
         self.jobs.push((
             id.serial,
@@ -445,14 +528,10 @@ impl AuthBroker {
                 profile,
                 client_id,
                 scopes,
+                hint: hint.map(str::to_owned),
                 end,
                 cancelled,
-                phase: BeginPhase::Prompt(Box::new(Prompt {
-                    flow,
-                    browser,
-                    callback: None,
-                    browser_done: false,
-                })),
+                phase,
                 forced: None,
                 logical_done: false,
             })),
@@ -460,6 +539,65 @@ impl AuthBroker {
         HandleState::Pending {
             operation: id,
             admission: Some(admission),
+        }
+    }
+    fn make_begin_phase(
+        &self,
+        id: &OperationId,
+        redirect_choice: (Option<AsRedirect>, Option<RedirectPlan>),
+        pending: PendingAuthorization,
+        inputs: BeginInputs<'_>,
+    ) -> Result<BeginPhase, PromptFailure> {
+        let (as_redirect, plan) = redirect_choice;
+        let BeginInputs {
+            profile,
+            client_id,
+            scopes,
+            hint,
+            end,
+            cancelled,
+        } = inputs;
+        if let Some(redirect) = as_redirect {
+            let Some(port) = self.as_port.clone() else {
+                return Err(PromptFailure::Host(HostFault::AsPresentation(
+                    AsFault::Stopping,
+                )));
+            };
+            let url = pending
+                .authorization_uri(profile, client_id, redirect.uri(), scopes, hint)
+                .map_err(|error| PromptFailure::Auth(AuthError::Primitive(error)))?;
+            let cleanup = end
+                .checked_add(OWNER_CLEANUP_TIMEOUT)
+                .ok_or(PromptFailure::Host(HostFault::ClockOverflow))?;
+            let request = AsStartRequest::after_allow(
+                id.clone(),
+                url.as_str().to_owned(),
+                redirect.scheme().to_owned(),
+                end,
+                cleanup,
+                Arc::clone(cancelled),
+            );
+            Ok(BeginPhase::As(Box::new(AsPrompt {
+                port,
+                request: Some(request),
+                pending: Some(pending),
+                redirect,
+                native_done: false,
+            })))
+        } else {
+            let plan = plan.ok_or(PromptFailure::Host(HostFault::AsPresentation(
+                AsFault::Identity,
+            )))?;
+            make_prompt(
+                profile,
+                client_id,
+                (scopes, hint),
+                plan,
+                pending,
+                end,
+                cancelled,
+            )
+            .map(|prompt| BeginPhase::Prompt(Box::new(prompt)))
         }
     }
     fn token_allowed<A>(
@@ -568,6 +706,7 @@ impl AuthBroker {
                         prompt.flow.cancel();
                         prompt.browser.cancel();
                     }
+                    BeginPhase::As(prompt) => prompt.port.cancel(id),
                     BeginPhase::Http(http) => http.cancel(),
                 }
             }
@@ -623,6 +762,9 @@ impl AuthBroker {
         job: &mut BeginJob,
         emit: &mut impl FnMut(ResponseEvent),
     ) -> Progress {
+        if matches!(job.phase, BeginPhase::As(_)) {
+            return self.poll_as_begin(id, job, emit);
+        }
         match &mut job.phase {
             BeginPhase::Prompt(prompt) => {
                 match Self::poll_prompt(prompt) {
@@ -665,30 +807,9 @@ impl AuthBroker {
                         return Progress::Drained;
                     }
                 };
-                let deadlines = match http_deadlines(job.end) {
-                    Ok(value) => value,
-                    Err(fault) => return Progress::HostFault(fault),
-                };
-                match HttpOperation::start(
-                    job.profile.key,
-                    body,
-                    deadlines,
-                    Arc::clone(&job.cancelled),
-                ) {
-                    Ok(http) => {
-                        job.phase = BeginPhase::Http(http);
-                        Progress::Pending
-                    }
-                    Err(error) => {
-                        emit(ResponseEvent {
-                            operation: id.clone(),
-                            response: ReadyResponse::error(&AuthError::Http(error)),
-                        });
-                        job.logical_done = true;
-                        Progress::Drained
-                    }
-                }
+                Self::start_begin_http(id, job, body, emit)
             }
+            BeginPhase::As(_) => Progress::HostFault(HostFault::AsPresentation(AsFault::Identity)),
             BeginPhase::Http(http) => match http.poll() {
                 HttpProgress::Pending => Progress::Pending,
                 HttpProgress::CleanupUnproven(error) => Progress::HostFault(
@@ -696,6 +817,180 @@ impl AuthBroker {
                 ),
                 HttpProgress::Complete(result) => self.finish_begin_http(id, job, result, emit),
             },
+        }
+    }
+    fn redirect_plan(&self, profile: &'static ProviderProfile) -> Result<RedirectPlan, AuthError> {
+        let fixed = self
+            .configuration
+            .get(profile.key)
+            .and_then(|value| value.fixed_redirect.as_deref());
+        RedirectPlan::new(profile, fixed).map_err(AuthError::Primitive)
+    }
+    fn finish_begin_error(
+        id: &OperationId,
+        job: &mut BeginJob,
+        error: Arc<CallError>,
+        emit: &mut impl FnMut(ResponseEvent),
+    ) -> Progress {
+        if !job.logical_done {
+            emit(ResponseEvent {
+                operation: id.clone(),
+                response: ReadyResponse::wire_error(error),
+            });
+            job.logical_done = true;
+        }
+        Progress::Drained
+    }
+    fn start_begin_http(
+        id: &OperationId,
+        job: &mut BeginJob,
+        body: Vec<u8>,
+        emit: &mut impl FnMut(ResponseEvent),
+    ) -> Progress {
+        let deadlines = match http_deadlines(job.end) {
+            Ok(value) => value,
+            Err(fault) => return Progress::HostFault(fault),
+        };
+        match HttpOperation::start(job.profile.key, body, deadlines, Arc::clone(&job.cancelled)) {
+            Ok(http) => {
+                job.phase = BeginPhase::Http(http);
+                Progress::Pending
+            }
+            Err(error) => {
+                emit(ResponseEvent {
+                    operation: id.clone(),
+                    response: ReadyResponse::error(&AuthError::Http(error)),
+                });
+                job.logical_done = true;
+                Progress::Drained
+            }
+        }
+    }
+    fn poll_as_begin(
+        &mut self,
+        id: &OperationId,
+        job: &mut BeginJob,
+        emit: &mut impl FnMut(ResponseEvent),
+    ) -> Progress {
+        let BeginPhase::As(prompt) = &mut job.phase else {
+            return Progress::HostFault(HostFault::AsPresentation(AsFault::Identity));
+        };
+        if Instant::now() >= job.end && job.forced.is_none() {
+            job.forced = Some(AuthError::Deadline.wire());
+            job.cancelled.store(true, Ordering::Release);
+        }
+        if prompt.native_done {
+            if let Some(error) = job.forced.clone() {
+                return Self::finish_begin_error(id, job, error, emit);
+            }
+            return Progress::HostFault(HostFault::AsPresentation(AsFault::Identity));
+        }
+        if let Some(request) = prompt.request.take() {
+            if let Some(error) = job.forced.clone() {
+                prompt.native_done = true;
+                return Self::finish_begin_error(id, job, error, emit);
+            }
+            match prompt.port.submit(request) {
+                AsSubmit::Pending(request) => {
+                    prompt.request = Some(request);
+                    return Progress::Pending;
+                }
+                AsSubmit::Rejected(fault) => {
+                    prompt.native_done = true;
+                    return Progress::HostFault(HostFault::AsPresentation(fault));
+                }
+                AsSubmit::Submitted => {}
+            }
+        }
+        let outcome = match prompt.port.poll(id) {
+            AsWorkerProgress::Pending => return Progress::Pending,
+            AsWorkerProgress::Unproved(fault) => {
+                return Progress::HostFault(HostFault::AsPresentation(fault));
+            }
+            AsWorkerProgress::Drained(reply) => {
+                if &reply.operation != id {
+                    return Progress::HostFault(HostFault::AsPresentation(AsFault::Identity));
+                }
+                prompt.native_done = true;
+                reply.outcome
+            }
+        };
+        if let Some(error) = job.forced.clone() {
+            return Self::finish_begin_error(id, job, error, emit);
+        }
+        match outcome {
+            AsOutcome::StartUnavailable(_) => self.start_as_fallback(id, job, emit),
+            AsOutcome::CallbackUri(uri) => {
+                let Some(pending) = prompt.pending.take() else {
+                    return Progress::HostFault(HostFault::AsPresentation(AsFault::Identity));
+                };
+                let form =
+                    match prompt
+                        .redirect
+                        .correlate(pending, uri.as_str())
+                        .and_then(|correlated| {
+                            correlated.token_form_uri(&job.client_id, prompt.redirect.uri())
+                        }) {
+                        Ok(form) => form,
+                        Err(error) => {
+                            return Self::finish_begin_error(
+                                id,
+                                job,
+                                AuthError::Primitive(error).wire(),
+                                emit,
+                            );
+                        }
+                    };
+                Self::start_begin_http(id, job, form.as_str().as_bytes().to_vec(), emit)
+            }
+            AsOutcome::CanceledLogin => {
+                Self::finish_begin_error(id, job, AuthError::AsCanceled.wire(), emit)
+            }
+            AsOutcome::HostStopped => Self::finish_begin_error(
+                id,
+                job,
+                AuthError::State(StateFault::Stopping).wire(),
+                emit,
+            ),
+            AsOutcome::Fault(fault) => Progress::HostFault(HostFault::AsPresentation(fault)),
+        }
+    }
+    fn start_as_fallback(
+        &self,
+        id: &OperationId,
+        job: &mut BeginJob,
+        emit: &mut impl FnMut(ResponseEvent),
+    ) -> Progress {
+        // Pre-start context unavailable or selected SDK API/start refusal;
+        // never accepted/canceled login replay. Use fresh state/verifier,
+        // original Begin deadline and the same physical admission lease.
+        let plan = match self.redirect_plan(job.profile) {
+            Ok(plan) => plan,
+            Err(error) => return Self::finish_begin_error(id, job, error.wire(), emit),
+        };
+        let pending = match PendingAuthorization::generate() {
+            Ok(pending) => pending,
+            Err(error) => {
+                return Self::finish_begin_error(id, job, AuthError::Primitive(error).wire(), emit);
+            }
+        };
+        match make_prompt(
+            job.profile,
+            &job.client_id,
+            (job.scopes.as_deref(), job.hint.as_deref()),
+            plan,
+            pending,
+            job.end,
+            &job.cancelled,
+        ) {
+            Ok(prompt) => {
+                job.phase = BeginPhase::Prompt(Box::new(prompt));
+                Progress::Pending
+            }
+            Err(PromptFailure::Auth(error)) => {
+                Self::finish_begin_error(id, job, error.wire(), emit)
+            }
+            Err(PromptFailure::Host(fault)) => Progress::HostFault(fault),
         }
     }
     fn poll_prompt(prompt: &mut Prompt) -> Result<bool, HostFault> {
@@ -1039,6 +1334,10 @@ impl AuthBroker {
                             p.flow.cancel();
                             p.browser.cancel();
                         }
+                        BeginPhase::As(prompt) => prompt.port.cancel(&OperationId {
+                            owner: Arc::clone(&self.owner),
+                            serial: *serial,
+                        }),
                         BeginPhase::Http(http) => http.cancel(),
                     }
                 }
@@ -1054,6 +1353,45 @@ impl AuthBroker {
             }
         }
     }
+}
+enum PromptFailure {
+    Auth(AuthError),
+    Host(HostFault),
+}
+fn make_prompt(
+    profile: &'static ProviderProfile,
+    client_id: &str,
+    scope_hint: (Option<&[String]>, Option<&str>),
+    plan: RedirectPlan,
+    pending: PendingAuthorization,
+    end: Instant,
+    cancelled: &Arc<AtomicBool>,
+) -> Result<Prompt, PromptFailure> {
+    let (scopes, hint) = scope_hint;
+    let flow = LoopbackFlow::bind(plan, pending, end, Arc::clone(cancelled))
+        .map_err(|error| PromptFailure::Auth(AuthError::Loopback(error)))?;
+    let url = flow
+        .authorization_url(profile, client_id, scopes, hint)
+        .map_err(|error| PromptFailure::Auth(AuthError::Loopback(error)))?;
+    let launch = Instant::now()
+        .checked_add(BROWSER_LAUNCH_TIMEOUT)
+        .ok_or(PromptFailure::Host(HostFault::ClockOverflow))?
+        .min(end);
+    let cleanup = launch
+        .checked_add(OWNER_CLEANUP_TIMEOUT)
+        .ok_or(PromptFailure::Host(HostFault::ClockOverflow))?;
+    let browser = BrowserLaunch::start(
+        &url,
+        BrowserDeadlines { launch, cleanup },
+        Arc::clone(cancelled),
+    )
+    .map_err(|error| PromptFailure::Auth(AuthError::Browser(error)))?;
+    Ok(Prompt {
+        flow,
+        browser,
+        callback: None,
+        browser_done: false,
+    })
 }
 fn http_deadlines(end: Instant) -> Result<HttpDeadlines, HostFault> {
     let request = Instant::now()

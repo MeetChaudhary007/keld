@@ -6461,6 +6461,14 @@ match the crate that already emits the code. Do not invent a third spelling.
 - fix: For a bind failure, free the configured port or correct its registration; for a browser-launch failure, configure a working default browser. Name which operation failed.
 - status: Implemented T3 macOS loopback-bind and system-browser-launch failure source; qualification is limited to recorded predicates. Other OS-broker paths remain targets.
 
+## KELD-AUTH-006
+
+- crate: keld-native
+- module: auth
+- message: Entra device-compliance Conditional Access requires a broker that this macOS host does not integrate.
+- fix: Use a broker-capable managed-device application with Intune Company Portal / Enterprise SSO. ASWebAuthenticationSession or external-browser fallback cannot satisfy this supplied policy class.
+- status: Implemented T4 private supplied-class refusal after Guard Allow. Public v0 requests remain unclassified; this entry makes no runtime classifier, managed-device or broker-compliance outcome claim.
+
 ## KELD-AUTH-007
 
 - crate: keld-native
@@ -6489,9 +6497,9 @@ match the crate that already emits the code. Do not invent a third spelling.
 
 - crate: keld-native
 - module: auth
-- message: The resolved provider profile has no clientId configured for this application; this is refused only after guard Allow.
-- fix: Add clientId under the named profile in the keld.config.ts auth section. Name the profile/configuration location without account or session detail.
-- status: Implemented T3 macOS post-Allow missing-client refusal source; qualification is limited to recorded admission and denial-equality predicates. Other OS-broker paths remain targets.
+- message: The resolved provider profile has no clientId, or its present asRedirect is invalid for the selected client/profile; both are refused only after Guard Allow.
+- fix: Add the missing clientId or correct the invalid asRedirect registration under the named profile in the keld.config.ts auth section, then rebuild the boot descriptor. Name only the profile/configuration location, without account or session detail.
+- status: Implemented T3 missing-client and T4 invalid-present-AS-binding refusal sources on macOS. Qualification is limited to recorded admission, denial-equality and registration predicates. Other OS-broker paths remain targets.
 
 ---
 
