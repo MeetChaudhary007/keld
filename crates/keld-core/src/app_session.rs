@@ -179,22 +179,24 @@ const SESSION_HANDOVER: u8 = 3;
 /// `Quit` before the session is ended under [`SESSION_HANDOVER`].
 ///
 /// Rule: the larger of 10 s and four times the maximum the reference application was
-/// measured to take from the host's `LastWindowClosed` write to its `Quit` frame, on
-/// the host's monotonic clock, through the §7 h11 cell on the KEL-254/KEL-135 signed
-/// fixture host. A D that is too small force-ends an application still persisting its
+/// measured to take from the return of the host's `LastWindowClosed` write to the
+/// lifecycle-Quit handler's entry for the frame, recorded only for the `Quit` that
+/// claims the session, on the host's monotonic clock, through the §7 h11 cell on the
+/// KEL-254/KEL-135 signed fixture host. A D that is too small force-ends an application still persisting its
 /// state; one that is too large only delays an update whose application ignores
 /// `LastWindowClosed`, so the rule errs large and the floor rules.
 ///
 /// Measured 2026-10-14, Windows 11 10.0.26300 (RAMANI, Ryzen 7 5800H, 16 logical
-/// cores), the S6c2a debug host at commit `045b4a45` (later commits of that branch
-/// change only evidence plumbing and documentation), Bun 1.4.2, `WebView2` runtime
-/// 155.0.4283.45:
+/// cores), the S6c2a debug host of <https://github.com/gyldlab/keld/pull/722> (built at
+/// that pull request's handover commit; its later commits leave the measured path
+/// unchanged), Bun 1.4.2, `WebView2` runtime 155.0.4283.45:
 /// - idle: 30 runs, median 0.6 ms, max 1.1 ms;
 /// - full-core load (16 busy-loop burners on 16 logical cores, the F55 method): 30 runs,
 ///   median 1.0 ms, max 218.5 ms.
 ///
 /// 4 x 218.5 ms is below the 10 s floor, so D is the floor (source: the samples and
-/// run logs in the keld-benches artifact named by the KEL-270 T4d S6c2a pull request).
+/// run logs in the keld-benches artifact named by
+/// <https://github.com/gyldlab/keld/pull/722>).
 #[cfg(any(target_os = "linux", windows))]
 const HANDOVER_QUIT_DEADLINE: Duration = Duration::from_secs(10);
 
@@ -230,9 +232,10 @@ struct SessionShutdownState {
     generation_reader_stops: Arc<Mutex<Vec<Arc<AtomicBool>>>>,
     tail_started: Arc<AtomicBool>,
     /// A profile handover has ended the UI loop (KEL-53 §4 "Profile handover", step
-    /// 3a). Set under `transition` right before the handover's `Quit` reaches the loop,
-    /// whose wake bridge drops its command receiver on the first terminal command, and
-    /// read under `transition` by `finish_tail`, whose UI step is then a no-op.
+    /// 3a). Set in the same `transition` hold as the handover's `Quit` send, after that
+    /// send succeeds (the loop's wake bridge drops its command receiver on the first
+    /// terminal command), and read under `transition` by `finish_tail`, whose UI step is
+    /// then a no-op.
     handover_requested: Arc<AtomicBool>,
     /// The claimant's tail has ended, with or without success. Cleared by the reserve
     /// that starts a tail; the main thread awaits it after the loop has returned.
@@ -240,11 +243,18 @@ struct SessionShutdownState {
     /// The direct path's handover instants; macOS runs no handover.
     #[cfg(any(target_os = "linux", windows))]
     handover_clock: Arc<HandoverClock>,
+    /// The session runs under a CLI dev lease: set when `start_direct_dev_lease_tail`
+    /// attaches the lease tail to the session's router, before the session's window and
+    /// event coordinator exist, and read by `request_handover`, which refuses such a
+    /// session because its lease tail would run beside the handover's teardown.
+    #[cfg(any(target_os = "linux", windows))]
+    under_dev_lease: Arc<AtomicBool>,
 }
 
 /// The handover's instants on the host's monotonic clock, each set once: the request,
-/// the UI loop's return, the `LastWindowClosed` write (D runs from it), the admitted
-/// `Quit` frame (the D sample) and the forced claim at D.
+/// the UI loop's return, the `LastWindowClosed` write (D runs from it), the
+/// lifecycle-Quit handler's entry for the `Quit` frame that claims the session (the D
+/// sample) and the forced claim at D.
 #[cfg(any(target_os = "linux", windows))]
 #[derive(Default)]
 struct HandoverClock {
@@ -2197,6 +2207,8 @@ impl SessionShutdownState {
             tail_ended: Arc::new(AtomicBool::new(false)),
             #[cfg(any(target_os = "linux", windows))]
             handover_clock: Arc::new(HandoverClock::default()),
+            #[cfg(any(target_os = "linux", windows))]
+            under_dev_lease: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -2220,6 +2232,12 @@ impl SessionShutdownState {
     fn mark_handover_requested_guarded(&self) {
         let _ = self.handover_clock.requested.set(Instant::now());
         self.handover_requested.store(true, Ordering::Release);
+    }
+
+    /// Records that a CLI dev lease's tail runs beside this session.
+    #[cfg(any(target_os = "linux", windows))]
+    fn mark_under_dev_lease(&self) {
+        self.under_dev_lease.store(true, Ordering::Release);
     }
 
     /// The claimant's tail has ended, with or without success.
@@ -2263,8 +2281,8 @@ impl SessionShutdownState {
     /// Waits until the claimant's tail has ended (the forced tail ends on this thread;
     /// the lifecycle-Quit tail ends on its reader thread). A CLI-lease-loss claim has no
     /// tail this thread may await: the lease observer runs it concurrently with the
-    /// teardown, as before a handover existed, and a handover is never requested under
-    /// a dev lease.
+    /// teardown, as before a handover existed, and `request_handover` refuses a session
+    /// under a dev lease.
     #[cfg(any(target_os = "linux", windows))]
     fn await_tail_end(&self) {
         let mut transition = self.transition_guard();
@@ -3330,7 +3348,8 @@ fn complete_profile_handover(
 impl HandoverClock {
     /// The seam's evidence line for one completed handover: the cause and the three
     /// intervals in microseconds (request to loop return; `LastWindowClosed` write to
-    /// the admitted `Quit` frame, the D sample; write to the forced claim at D).
+    /// the lifecycle-Quit handler's entry for the frame that claimed the session, the D
+    /// sample; write to the forced claim at D).
     fn evidence_json(&self, cause: u8) -> String {
         let micros = |from: Option<&Instant>, to: Option<&Instant>| match (from, to) {
             (Some(from), Some(to)) => to.saturating_duration_since(*from).as_micros().to_string(),
@@ -4099,6 +4118,7 @@ fn start_direct_dev_lease_tail(
     let Some(mut lease) = lease else {
         return Ok(None);
     };
+    router.shutdown.mark_under_dev_lease();
     let (error_tx, error_rx) = mpsc::channel();
     thread::Builder::new()
         .name("keld-core-linux-dev-lease".to_owned())
@@ -4149,6 +4169,7 @@ fn start_direct_dev_lease_tail(
     let Some(monitor) = monitor else {
         return Ok(None);
     };
+    router.shutdown.mark_under_dev_lease();
     let (error_tx, error_rx) = mpsc::channel();
     let _handle = thread::Builder::new()
         .name("keld-core-windows-dev-lease-tail".to_owned())
@@ -5781,8 +5802,10 @@ impl PrimaryRouterHandle {
     /// session under [`SESSION_HANDOVER`] (`complete_profile_handover`). This is the
     /// production entry the `PerUserDirect` coordinator calls; in S6c2a only the
     /// debug-only evidence seam calls it. The request is refused (`Ok(false)`) once the
-    /// session is ending or a handover was already requested. A session under a dev
-    /// lease must not request one: its lease tail would run beside the teardown.
+    /// session is ending or a handover was already requested. A session under a CLI dev
+    /// lease fails it typed (`KELD-CORE-037`), before anything reaches the loop: its
+    /// lease tail would run beside the handover's teardown, which the main thread does
+    /// not await (`await_tail_end`).
     #[cfg(any(target_os = "linux", windows))]
     #[cfg_attr(
         not(any(all(debug_assertions, windows), test)),
@@ -5793,6 +5816,14 @@ impl PrimaryRouterHandle {
     )]
     fn request_handover(&self) -> Result<bool, HostAppError> {
         let _transition = self.shutdown.transition_guard();
+        if self.shutdown.under_dev_lease.load(Ordering::Acquire) {
+            return Err(HostAppError::new(
+                "KELD-CORE-037",
+                "profile handover",
+                "a session under a CLI dev lease cannot hand over its profile",
+                "Hand over only from an installed host launched without `keld dev`; a dev-stage session ends through its CLI lease.",
+            ));
+        }
         if !self.shutdown.is_running() || self.shutdown.handover_requested() {
             return Ok(false);
         }
@@ -6549,8 +6580,8 @@ impl PrimaryRouterHandle {
                 Ok(())
             };
         }
-        // The admitted Quit frame: the D sample at a handover, from the
-        // `LastWindowClosed` write to here.
+        // This Quit claims the session: its frame's entry instant ends the D sample at
+        // a handover (from the `LastWindowClosed` write).
         #[cfg(any(target_os = "linux", windows))]
         let _ = self.shutdown.handover_clock.quit_frame.set(quit_frame);
         #[cfg(target_os = "macos")]
@@ -8667,6 +8698,64 @@ mod tests {
         assert!(ended.shutdown.claim(SESSION_LIFECYCLE_QUIT));
         assert!(!ended.request_handover().expect("refused after a claim"));
         assert!(ended_window_rx.try_recv().is_err());
+    }
+
+    /// A session under a CLI dev lease fails the handover typed and leaves the session
+    /// untouched: nothing reaches the loop, no handover is recorded and the session
+    /// still runs, so its lease tail stays the only forced end.
+    #[test]
+    #[cfg(any(target_os = "linux", windows))]
+    fn request_handover_refuses_a_session_under_a_dev_lease() {
+        let (handle, _client, _owner_rx, window_rx) = initial_ready_router_with_window_loop();
+        handle.shutdown.mark_under_dev_lease();
+        let error = handle
+            .request_handover()
+            .expect_err("a dev-lease session never hands over");
+        assert_eq!(error.code, "KELD-CORE-037");
+        assert!(error.to_string().contains("CLI dev lease"), "{error}");
+        assert!(!handle.shutdown.handover_requested());
+        assert!(handle.shutdown.handover_clock.requested.get().is_none());
+        assert!(handle.shutdown.is_running(), "the session still runs");
+        assert!(window_rx.try_recv().is_err(), "nothing reaches the loop");
+    }
+
+    /// The lease fact comes from the session's lease itself: attaching a dev lease's
+    /// tail to the router makes the handover refuse, and a session without a lease
+    /// attaches none and still hands over.
+    #[test]
+    #[cfg(windows)]
+    fn attaching_a_dev_lease_tail_makes_the_handover_refuse() {
+        let (leased, _client, _owner_rx, leased_window_rx) =
+            initial_ready_router_with_window_loop();
+        let (observation_tx, observations) = mpsc::channel();
+        let monitor = WindowsDevLeaseMonitor {
+            observations,
+            #[cfg(debug_assertions)]
+            raw_handle_value: 0,
+        };
+        let lease_errors = start_direct_dev_lease_tail(Some(monitor), leased.clone())
+            .expect("start the lease tail");
+        assert!(lease_errors.is_some());
+        let error = leased
+            .request_handover()
+            .expect_err("the leased session refuses");
+        assert_eq!(error.code, "KELD-CORE-037");
+        assert!(leased_window_rx.try_recv().is_err());
+        // Ends the tail thread without an observation: its receive fails and it returns.
+        drop(observation_tx);
+
+        let (plain, _plain_client, _plain_owner_rx, plain_window_rx) =
+            initial_ready_router_with_window_loop();
+        assert!(
+            start_direct_dev_lease_tail(None, plain.clone())
+                .expect("no lease, no tail")
+                .is_none()
+        );
+        assert!(plain.request_handover().expect("a lease-less session"));
+        assert_eq!(
+            plain_window_rx.recv_timeout(Duration::from_secs(2)),
+            Ok(AppWindowCommand::Quit)
+        );
     }
 
     /// Each application session of a process takes the sole broker once; the next
