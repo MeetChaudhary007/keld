@@ -235,13 +235,15 @@ struct SessionShutdownState {
     /// The claimant's tail has ended, with or without success. Cleared by the reserve
     /// that starts a tail; the main thread awaits it after the loop has returned.
     tail_ended: Arc<AtomicBool>,
+    /// The direct path's handover instants; macOS runs no handover.
+    #[cfg(any(target_os = "linux", windows))]
     handover_clock: Arc<HandoverClock>,
 }
 
 /// The handover's instants on the host's monotonic clock, each set once: the request,
 /// the UI loop's return, the `LastWindowClosed` write (D runs from it), the admitted
 /// `Quit` frame (the D sample) and the forced claim at D.
-#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+#[cfg(any(target_os = "linux", windows))]
 #[derive(Default)]
 struct HandoverClock {
     requested_at: OnceLock<Instant>,
@@ -2184,6 +2186,7 @@ impl SessionShutdownState {
             tail_started: Arc::new(AtomicBool::new(false)),
             handover_requested: Arc::new(AtomicBool::new(false)),
             tail_ended: Arc::new(AtomicBool::new(false)),
+            #[cfg(any(target_os = "linux", windows))]
             handover_clock: Arc::new(HandoverClock::default()),
         }
     }
@@ -2197,6 +2200,7 @@ impl SessionShutdownState {
     }
 
     /// Caller holds `transition` and has just sent the handover's `Quit` to the UI loop.
+    #[cfg(any(target_os = "linux", windows))]
     fn mark_handover_requested_guarded(&self) {
         let _ = self.handover_clock.requested_at.set(Instant::now());
         self.handover_requested.store(true, Ordering::Release);
@@ -5745,6 +5749,7 @@ impl PrimaryRouterHandle {
         self.last_window_closed.store(true, Ordering::Release);
         let written = self.write_event_guarded(LifecycleEvent::LastWindowClosed);
         // The quit deadline D runs from the return of this write.
+        #[cfg(any(target_os = "linux", windows))]
         let _ = self
             .shutdown
             .handover_clock
@@ -6523,11 +6528,14 @@ impl PrimaryRouterHandle {
         }
         // The admitted Quit frame: the D sample at a handover, from the
         // `LastWindowClosed` write to here.
+        #[cfg(any(target_os = "linux", windows))]
         let _ = self
             .shutdown
             .handover_clock
             .quit_frame_at
             .set(quit_frame_at);
+        #[cfg(target_os = "macos")]
+        let _ = quit_frame_at;
         drop(current_guard);
         drop(transition);
         // Ends the tail on every return below, so a main thread awaiting it after a
