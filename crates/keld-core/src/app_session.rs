@@ -248,11 +248,11 @@ struct SessionShutdownState {
 #[cfg(any(target_os = "linux", windows))]
 #[derive(Default)]
 struct HandoverClock {
-    requested_at: OnceLock<Instant>,
-    ui_returned_at: OnceLock<Instant>,
-    last_window_closed_at: OnceLock<Instant>,
-    quit_frame_at: OnceLock<Instant>,
-    forced_at: OnceLock<Instant>,
+    requested: OnceLock<Instant>,
+    ui_returned: OnceLock<Instant>,
+    last_window_closed_written: OnceLock<Instant>,
+    quit_frame: OnceLock<Instant>,
+    forced: OnceLock<Instant>,
 }
 
 /// Ends the claimant's tail on drop, so every return path of the tail, including a
@@ -2204,7 +2204,7 @@ impl SessionShutdownState {
     /// Caller holds `transition` and has just sent the handover's `Quit` to the UI loop.
     #[cfg(any(target_os = "linux", windows))]
     fn mark_handover_requested_guarded(&self) {
-        let _ = self.handover_clock.requested_at.set(Instant::now());
+        let _ = self.handover_clock.requested.set(Instant::now());
         self.handover_requested.store(true, Ordering::Release);
     }
 
@@ -3287,10 +3287,10 @@ fn complete_profile_handover(
     shutdown: &SessionShutdownState,
 ) -> Result<(), HostAppError> {
     let clock = &shutdown.handover_clock;
-    let _ = clock.ui_returned_at.set(Instant::now());
+    let _ = clock.ui_returned.set(Instant::now());
     let written = router.signal_last_window_closed();
     let written_at = clock
-        .last_window_closed_at
+        .last_window_closed_written
         .get()
         .copied()
         .unwrap_or_else(Instant::now);
@@ -3301,7 +3301,7 @@ fn complete_profile_handover(
     };
     let tail = match shutdown.await_quit_or_claim_handover(deadline) {
         HandoverWait::ClaimedHandover => {
-            let _ = clock.forced_at.set(Instant::now());
+            let _ = clock.forced.set(Instant::now());
             router.cli_lease_lost()
         }
         HandoverWait::ClaimedByOther => {
@@ -3328,12 +3328,12 @@ impl HandoverClock {
             SESSION_CLI_LEASE_LOST => "cli-lease-lost",
             _ => "running",
         };
-        let written = self.last_window_closed_at.get();
+        let written = self.last_window_closed_written.get();
         format!(
             "{{\"cause\":\"{cause}\",\"ui_end_us\":{},\"quit_wait_us\":{},\"forced_after_us\":{},\"deadline_us\":{}}}",
-            micros(self.requested_at.get(), self.ui_returned_at.get()),
-            micros(written, self.quit_frame_at.get()),
-            micros(written, self.forced_at.get()),
+            micros(self.requested.get(), self.ui_returned.get()),
+            micros(written, self.quit_frame.get()),
+            micros(written, self.forced.get()),
             HANDOVER_QUIT_DEADLINE.as_micros()
         )
     }
@@ -5755,7 +5755,7 @@ impl PrimaryRouterHandle {
         let _ = self
             .shutdown
             .handover_clock
-            .last_window_closed_at
+            .last_window_closed_written
             .set(Instant::now());
         written.map_err(Into::into)
     }
@@ -6474,7 +6474,7 @@ impl PrimaryRouterHandle {
         reply: &[u8],
         reader: &mut BootstrapStream,
     ) -> Result<(), HostAppError> {
-        let quit_frame_at = Instant::now();
+        let quit_frame = Instant::now();
         {
             let transition = self.shutdown.transition_guard();
             let mut current_guard = self.current.lock().map_err(|_| {
@@ -6531,13 +6531,9 @@ impl PrimaryRouterHandle {
         // The admitted Quit frame: the D sample at a handover, from the
         // `LastWindowClosed` write to here.
         #[cfg(any(target_os = "linux", windows))]
-        let _ = self
-            .shutdown
-            .handover_clock
-            .quit_frame_at
-            .set(quit_frame_at);
+        let _ = self.shutdown.handover_clock.quit_frame.set(quit_frame);
         #[cfg(target_os = "macos")]
-        let _ = quit_frame_at;
+        let _ = quit_frame;
         drop(current_guard);
         drop(transition);
         // Ends the tail on every return below, so a main thread awaiting it after a
@@ -8600,21 +8596,20 @@ mod tests {
     fn request_handover_ends_the_loop_once_and_finish_tail_then_sends_nothing() {
         let (handle, _client, owner_rx, window_rx) = initial_ready_router_with_window_loop();
         drop(owner_rx); // `finish_tail`'s guardian step succeeds at once without an owner.
-        assert_eq!(handle.request_handover().expect("a running session"), true);
+        assert!(handle.request_handover().expect("a running session"));
         assert_eq!(
             window_rx.recv_timeout(Duration::from_secs(2)),
             Ok(AppWindowCommand::Quit)
         );
         assert!(handle.shutdown.handover_requested());
         assert!(
-            handle.shutdown.handover_clock.requested_at.get().is_some(),
+            handle.shutdown.handover_clock.requested.get().is_some(),
             "the request instant is recorded"
         );
-        assert_eq!(
-            handle
+        assert!(
+            !handle
                 .request_handover()
-                .expect("a second request is refused, not failed"),
-            false
+                .expect("a second request is refused, not failed")
         );
         assert!(
             window_rx.try_recv().is_err(),
@@ -8649,10 +8644,7 @@ mod tests {
         let (ended, _ended_client, _ended_owner_rx, ended_window_rx) =
             initial_ready_router_with_window_loop();
         assert!(ended.shutdown.claim(SESSION_LIFECYCLE_QUIT));
-        assert_eq!(
-            ended.request_handover().expect("refused after a claim"),
-            false
-        );
+        assert!(!ended.request_handover().expect("refused after a claim"));
         assert!(ended_window_rx.try_recv().is_err());
     }
 
