@@ -897,6 +897,14 @@ impl AuthBroker {
                 }
                 AsSubmit::Rejected(fault) => {
                     prompt.native_done = true;
+                    if fault == AsFault::Stopping {
+                        return Self::finish_begin_error(
+                            id,
+                            job,
+                            AuthError::State(StateFault::Stopping).wire(),
+                            emit,
+                        );
+                    }
                     return Progress::HostFault(HostFault::AsPresentation(fault));
                 }
                 AsSubmit::Submitted => {}

@@ -764,33 +764,53 @@ fn spawn_app_wake_bridge(
     thread::Builder::new()
         .name("keld-wv-macos-app-wake".to_owned())
         .spawn(move || {
-            loop {
-                if stop.load(Ordering::Acquire) {
-                    return;
-                }
-                match commands.recv_timeout(Duration::from_millis(100)) {
-                    Ok(command) => {
-                        mark_terminal_intent(&terminal_intent, command);
-                        if command == AppWindowCommand::Fatal {
-                            fatal_outcome.store(true, Ordering::Release);
-                        }
-                        let _ = proxy.send_event(WkUserEvent::App(command));
-                        // Terminal intent closes normal admission; the same bridge
-                        // continues delivering main-owner stop/callback wakes until
-                        // the UI loop observes its physical owner drained.
-                    }
-                    Err(RecvTimeoutError::Timeout) if stop.load(Ordering::Acquire) => return,
-                    Err(RecvTimeoutError::Timeout) => {}
-                    Err(RecvTimeoutError::Disconnected) => {
-                        mark_terminal_intent(&terminal_intent, AppWindowCommand::Fatal);
-                        fatal_outcome.store(true, Ordering::Release);
-                        let _ = proxy.send_event(WkUserEvent::App(AppWindowCommand::Fatal));
-                        return;
-                    }
-                }
-            }
+            run_app_wake_bridge(
+                &commands,
+                &stop,
+                &terminal_intent,
+                &fatal_outcome,
+                |command| {
+                    let _ = proxy.send_event(WkUserEvent::App(command));
+                },
+            );
         })
         .map_err(|error| WvError::EventLoop(format!("failed to start app wake bridge: {error}")))
+}
+
+fn run_app_wake_bridge(
+    commands: &Receiver<AppWindowCommand>,
+    stop: &AtomicBool,
+    terminal_intent: &AtomicBool,
+    fatal_outcome: &AtomicBool,
+    mut forward: impl FnMut(AppWindowCommand),
+) {
+    let mut terminal_forwarded = false;
+    loop {
+        if stop.load(Ordering::Acquire) {
+            return;
+        }
+        match commands.recv_timeout(Duration::from_millis(100)) {
+            Ok(command) => {
+                terminal_forwarded |= mark_terminal_intent(terminal_intent, command);
+                if command == AppWindowCommand::Fatal {
+                    fatal_outcome.store(true, Ordering::Release);
+                }
+                forward(command);
+                // Terminal intent closes normal admission; the same bridge
+                // continues delivering main-owner stop/callback wakes until
+                // the UI loop observes its physical owner drained.
+            }
+            Err(RecvTimeoutError::Timeout) if stop.load(Ordering::Acquire) => return,
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) if terminal_forwarded => return,
+            Err(RecvTimeoutError::Disconnected) => {
+                mark_terminal_intent(terminal_intent, AppWindowCommand::Fatal);
+                fatal_outcome.store(true, Ordering::Release);
+                forward(AppWindowCommand::Fatal);
+                return;
+            }
+        }
+    }
 }
 
 fn spawn_renderer_outcome_bridge(
@@ -915,7 +935,8 @@ mod startup_tests {
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
-    use super::{page_load_trace_handler, wry_page_load};
+    use super::{page_load_trace_handler, run_app_wake_bridge, wry_page_load};
+    use crate::AppWindowCommand;
     use crate::startup::{PageLoad, StartupPhase, StartupTrace, phase_for_page_load};
 
     #[test]
@@ -1049,6 +1070,53 @@ mod startup_tests {
             super::app_loop_result(true, false, 0),
             Err(super::WvError::Navigate(_))
         ));
+    }
+
+    #[test]
+    fn app_wake_bridge_disconnect_after_quit_does_not_emit_fatal() {
+        let (commands, receiver) = std::sync::mpsc::channel();
+        commands
+            .send(AppWindowCommand::Quit)
+            .expect("receiver is still live");
+        drop(commands);
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let terminal_intent = std::sync::atomic::AtomicBool::new(false);
+        let fatal_outcome = std::sync::atomic::AtomicBool::new(false);
+        let mut forwarded = Vec::new();
+        run_app_wake_bridge(
+            &receiver,
+            &stop,
+            &terminal_intent,
+            &fatal_outcome,
+            |command| {
+                forwarded.push(command);
+            },
+        );
+        assert_eq!(forwarded, [AppWindowCommand::Quit]);
+        assert!(terminal_intent.load(std::sync::atomic::Ordering::Acquire));
+        assert!(!fatal_outcome.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[test]
+    fn app_wake_bridge_disconnect_before_terminal_remains_fatal() {
+        let (commands, receiver) = std::sync::mpsc::channel();
+        drop(commands);
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let terminal_intent = std::sync::atomic::AtomicBool::new(false);
+        let fatal_outcome = std::sync::atomic::AtomicBool::new(false);
+        let mut forwarded = Vec::new();
+        run_app_wake_bridge(
+            &receiver,
+            &stop,
+            &terminal_intent,
+            &fatal_outcome,
+            |command| {
+                forwarded.push(command);
+            },
+        );
+        assert_eq!(forwarded, [AppWindowCommand::Fatal]);
+        assert!(terminal_intent.load(std::sync::atomic::Ordering::Acquire));
+        assert!(fatal_outcome.load(std::sync::atomic::Ordering::Acquire));
     }
 }
 

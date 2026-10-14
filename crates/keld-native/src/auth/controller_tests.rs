@@ -1345,6 +1345,44 @@ fn host_tail_closes_auth_and_native_admission_permanently() {
 }
 
 #[test]
+fn host_tail_native_stop_before_submit_finishes_begin_stopping_result() {
+    use super::super::macos_session::{AsMainStop, test_apply_main_stop};
+    let (mut owner, port, manifest, _) = anchor_domain_fixture();
+    let operation = match owner.handle_manifest_request(
+        &manifest,
+        Principal::AppProcess,
+        AuthRequest::Begin {
+            provider: "entra-common".to_owned(),
+            scopes: None,
+            login_hint: None,
+        },
+        || Some(()),
+    ) {
+        HandleState::Pending {
+            operation,
+            admission: Some(()),
+        } => operation,
+        other => panic!("actual granted Begin: {other:?}"),
+    };
+    assert!(!test_apply_main_stop(&port, AsMainStop::HostTail));
+    let mut events = Vec::new();
+    assert_eq!(
+        owner.poll(&operation, |event| events.push(event)),
+        Progress::Drained,
+        "a submit rejected by the already-closed host port is a normal stop result"
+    );
+    assert_eq!(events.len(), 1);
+    let error = events
+        .pop()
+        .expect("one terminal Begin result")
+        .response
+        .into_response()
+        .expect_err("host tail cannot complete sign-in");
+    assert_eq!(error.code, "KELD-AUTH-016");
+    assert!(owner.jobs.is_empty());
+}
+
+#[test]
 fn contended_anchor_stop_registers_before_claim_and_survives_running_drive() {
     let (mut owner, port, manifest, account) = anchor_domain_fixture();
     let operation = match owner.handle_manifest_request(
