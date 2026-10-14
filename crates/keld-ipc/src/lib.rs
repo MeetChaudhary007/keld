@@ -37,11 +37,11 @@ pub use attempt::fuzz_attempt_records;
 #[cfg(windows)]
 pub use attempt::{
     ATTEMPT_HEALTH_WINDOW, AttemptFailureClass, AttemptHealthWindowFailure, AttemptReadPosition,
-    AttemptRecordError, AttemptRecordKind, AttemptTranscript, WindowsAttemptClaimantChannel,
-    WindowsAttemptClient, WindowsAttemptCloseWait, WindowsAttemptEndpoint,
-    WindowsAttemptEndpointError, WindowsAttemptEndpointSecurity, WindowsAttemptExchangeError,
-    WindowsAttemptLocatorError, WindowsAttemptLocatorInput, WindowsAttemptOwnerChannel,
-    WindowsAttemptRollBack, windows_attempt_connect_back_endpoint,
+    AttemptRecordError, AttemptRecordKind, AttemptTranscript, WindowsAttemptClaimCanceller,
+    WindowsAttemptClaimantChannel, WindowsAttemptClient, WindowsAttemptCloseWait,
+    WindowsAttemptEndpoint, WindowsAttemptEndpointError, WindowsAttemptEndpointSecurity,
+    WindowsAttemptExchangeError, WindowsAttemptLocatorError, WindowsAttemptLocatorInput,
+    WindowsAttemptOwnerChannel, WindowsAttemptRollBack, windows_attempt_connect_back_endpoint,
 };
 #[cfg(any(unix, windows))]
 pub use bootstrap::{

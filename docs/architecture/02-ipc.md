@@ -143,8 +143,21 @@ connection, under the landed per-connection deadline clamped to the claim deadli
 reads the client's process ID and session, `KELD-AH1`, the claim writer's
 identification-level token and the retained process pin that the caller's claimant
 policy returns, disconnects and re-arms on any refusal, and consumes its one-shot
-before `KELD-AR1`. After `KELD-AR1` the owner reads `KELD-AB1` and `KELD-AY1` by
-position, decides the health window (30 seconds plus a margin G, which the caller
+before `KELD-AR1`. The claim wait ends without a claimant at the claim deadline
+(`KELD-IPC-018`) or when the endpoint's claim canceller, a `Send` handle taken before
+the wait that the owner's watcher on its retained launch handle drives, ends it
+(`KELD-IPC-028`); both close the endpoint. The cancel and the one-shot are serialised
+on the instance:
+- A cancel that acts before the one-shot is taken refuses it. This includes a cancel
+  already in flight when the owner reaches the one-shot. No `KELD-AR1` is then sent,
+  and the claimant reads end of file.
+- A cancel after the one-shot is a no-op that aborts none of the accepted channel's
+  I/O.
+- The app-link bootstrap listener follows the same rule. A `shutdown` in flight at
+  admission's one-shot yields `Cancelled`, never an authenticated stream that has been
+  aborted.
+
+After `KELD-AR1` the owner reads `KELD-AB1` and `KELD-AY1` by position, decides the health window (30 seconds plus a margin G, which the caller
 passes until KEL-53 §6 S6c fixes it from its measurement) as a state machine over an
 injected clock, and then either writes `KELD-AK1` accepted and waits for the
 candidate's end of file before it closes, or writes `KELD-AK1` rolled back once without

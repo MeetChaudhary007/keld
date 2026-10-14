@@ -196,6 +196,12 @@ match the crate that already emits the code. Do not invent a third spelling.
 - message: too many unanswered calls; the link was closed rather than track another abandoned id
 - fix: The host is not answering this role's calls. Check the host log for the stalled handler; raise call deadlines only if the host is slow rather than stuck. The role's link is gone and cannot reconnect.
 
+## KELD-IPC-028
+
+- crate: keld-ipc
+- message: the keld-attempt claim wait was cancelled by its owner before a claimant was accepted (the launched candidate's handle signaled, or the owner ended the wait); the endpoint is closed
+- fix: Roll the attempt back: health cannot commit, and end the candidate family if any of it still runs.
+
 ## KELD-WV-001
 
 - crate: keld-wv
