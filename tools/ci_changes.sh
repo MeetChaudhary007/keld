@@ -754,6 +754,15 @@ classify_path() {
             ;;
     esac
 
+    # KEL-270 F56: tools/ci_workflow_security.ts pins the reviewed SHA-256 of the
+    # Windows media oracle, and the hosted bun "Contract tests" step that checks
+    # that pin runs only when hygiene is true. Additive: owners below still apply.
+    case "$changed_file" in
+        crates/keld-wv/tests/windows_media_guard.ps1)
+            hygiene="$TRUE"
+            ;;
+    esac
+
     case "$changed_file" in
         # Agent instruction and assembly changes must run both generated-doc
         # freshness and the merge-blocking instruction-context/hygiene gates.
