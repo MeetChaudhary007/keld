@@ -581,6 +581,7 @@ fn create_suspended_process(
         thread: Some(unsafe { OwnedHandle::from_raw_handle(process.hThread.cast()) }),
         pid: process.dwProcessId,
         terminated: false,
+        detached: false,
         launch,
     })
 }
@@ -612,6 +613,9 @@ pub struct WindowsSuspendedChild {
     thread: Option<OwnedHandle>,
     pid: u32,
     terminated: bool,
+    /// Set by the one detach, [`Self::detach`]: the child is a released
+    /// candidate that this owner keeps running when it drops.
+    detached: bool,
     launch: SuspendedLaunch,
 }
 
@@ -696,6 +700,17 @@ impl WindowsSuspendedChild {
     /// Whether the one resume was already spent.
     pub(crate) const fn is_resumed(&self) -> bool {
         self.thread.is_none()
+    }
+
+    /// Keeps the child running and closes this owner's handles to it: the
+    /// detach of a released candidate (KEL-53 §4 "Candidate release after
+    /// commit", *Launch-record detach*). The one caller is
+    /// [`crate::windows_job::WindowsLaunchedProcess::detach`], which admits only
+    /// a resumed child bound to a host-death census; that check is the record's,
+    /// so it is made once. Closing the process handle ends nothing: the child
+    /// continues by identity only, and the kernel keeps its object alive.
+    pub(crate) fn detach(mut self) {
+        self.detached = true;
     }
 
     /// A refusal of an operation on this child, coded for the launch that made it.
@@ -867,11 +882,16 @@ impl WindowsSuspendedChild {
 
 impl Drop for WindowsSuspendedChild {
     fn drop(&mut self) {
-        if self.terminated {
+        if self.terminated || self.detached {
             return;
         }
-        // SAFETY: this owner never detaches. Termination prevents a suspended
-        // or failed-evidence child from escaping when callers unwind.
+        // SAFETY: the process handle is live and owned here until this body
+        // returns, and the call reads no caller memory. The child was neither
+        // reaped nor terminated through this owner (`terminated`), nor released
+        // by the one detach there is, `WindowsLaunchedProcess::detach` of a
+        // resumed child bound to a host-death census (`detached`), so it is
+        // still this owner's suspended or failed-evidence child, and terminating
+        // it keeps it from escaping when callers unwind.
         let _ = unsafe { TerminateProcess(self.process.as_raw_handle().cast(), 1) };
     }
 }
