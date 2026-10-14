@@ -68,8 +68,9 @@ use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_PIPE_BUSY};
 use crate::bootstrap::WindowsNamedPipeBootstrapStream;
 #[cfg(windows)]
 use crate::windows_named_pipe::{
-    PIPE_ACCESS_MASK, PipeDescriptorReadback, PipeSecuritySections, WindowsNamedPipeServer,
-    WindowsNamedPipeStream, WindowsPipeSecurityFact, current_process_session_id,
+    PIPE_ACCESS_MASK, PipeDescriptorReadback, PipeSecuritySections, WindowsNamedPipeCanceller,
+    WindowsNamedPipeServer, WindowsNamedPipeStream, WindowsPipeSecurityFact,
+    current_process_session_id,
 };
 
 /// Explicit Medium mandatory label with `SYSTEM_MANDATORY_LABEL_NO_WRITE_UP`,
@@ -339,6 +340,71 @@ impl WindowsAttemptEndpoint {
     #[must_use]
     pub fn endpoint(&self) -> &str {
         &self.endpoint
+    }
+
+    /// A handle that ends this endpoint's claim wait early (KEL-53 §4
+    /// *Margin and deadlines*: the wait is bounded by the claim deadline and
+    /// by the retained launch handle; the owner's watcher on that handle
+    /// drives this). Taken before [`Self::accept_claim`] consumes the
+    /// endpoint and given to the watcher; it is `Send`, `Clone`, and holds
+    /// no authority beyond cancelling this one endpoint's claim wait.
+    #[must_use]
+    pub fn claim_canceller(&self) -> WindowsAttemptClaimCanceller {
+        WindowsAttemptClaimCanceller {
+            server: self.server.canceller(),
+        }
+    }
+}
+
+/// Ends one [`WindowsAttemptEndpoint`]'s claim wait early, from any thread
+/// (KEL-53 §4 *Margin and deadlines*). [`Self::cancel`] makes a pending or
+/// later [`WindowsAttemptEndpoint::accept_claim`] on that endpoint return
+/// [`WindowsAttemptExchangeError::ClaimCancelled`] promptly; it is idempotent,
+/// a no-op once a claimant was accepted or the endpoint ended or dropped, and
+/// it reaches no other endpoint.
+///
+/// It is a weak view of the endpoint's instance: it keeps nothing alive, and
+/// it exposes no accept, read, write or handle, so it cannot be used to admit
+/// or observe a claimant:
+///
+/// ```compile_fail,E0599
+/// use std::os::windows::io::AsRawHandle as _;
+/// fn raw(canceller: &keld_ipc::WindowsAttemptClaimCanceller) {
+///     let _ = canceller.as_raw_handle();
+/// }
+/// ```
+///
+/// It is `Send` and `Sync`, so a watcher thread may hold it while the
+/// endpoint's owner waits:
+///
+/// ```
+/// fn is_send_and_sync<T: Send + Sync>() {}
+/// is_send_and_sync::<keld_ipc::WindowsAttemptClaimCanceller>();
+/// ```
+#[cfg(windows)]
+#[derive(Debug, Clone)]
+pub struct WindowsAttemptClaimCanceller {
+    server: WindowsNamedPipeCanceller,
+}
+
+#[cfg(windows)]
+impl WindowsAttemptClaimCanceller {
+    /// Ends the endpoint's claim wait: a pending wait returns
+    /// [`WindowsAttemptExchangeError::ClaimCancelled`] promptly, and a wait
+    /// started later returns it at once. Idempotent; a no-op after a claimant
+    /// was accepted, after the wait ended, and after the endpoint dropped.
+    ///
+    /// # Errors
+    ///
+    /// [`WindowsAttemptEndpointError::Os`] when Windows cannot signal the
+    /// cancel or abort the instance's pending I/O; the call may be repeated.
+    pub fn cancel(&self) -> Result<(), WindowsAttemptEndpointError> {
+        self.server
+            .cancel()
+            .map_err(|source| WindowsAttemptEndpointError::Os {
+                operation: "cancel the claim wait",
+                source,
+            })
     }
 }
 

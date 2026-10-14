@@ -95,6 +95,13 @@ struct ServerInner {
     connect_event: OwnedEvent,
     connected: AtomicBool,
     consumed: AtomicBool,
+    /// Set by [`WindowsNamedPipeServer::cancel`] while the instance is not yet
+    /// consumed, and never cleared. The event above wakes a pending accept and
+    /// `CancelIoEx` aborts pending stream I/O, but neither reaches I/O that a
+    /// waiter issues after the cancel; this flag does: an unconsumed server
+    /// stream refuses to start new I/O once it is set, and a waiter that
+    /// re-arms after a refusal reads it before it waits again.
+    cancelled: AtomicBool,
     #[cfg(test)]
     accept_pending: AtomicBool,
     #[cfg(test)]
@@ -341,6 +348,7 @@ impl WindowsNamedPipeServer {
                 connect_event,
                 connected: AtomicBool::new(false),
                 consumed: AtomicBool::new(false),
+                cancelled: AtomicBool::new(false),
                 #[cfg(test)]
                 accept_pending: AtomicBool::new(false),
                 #[cfg(test)]
@@ -443,6 +451,12 @@ impl WindowsNamedPipeServer {
         self.inner.consumed.store(true, Ordering::Release);
     }
 
+    /// Ends this instance's pending and future accept and stream waits until it
+    /// is consumed: it is a no-op on a consumed instance, so a cancel that
+    /// races an admission never touches the admitted stream. The order is the
+    /// flag, then the event, then `CancelIoEx`: I/O issued after the flag is
+    /// refused at once, a pending accept wakes on the event, and pending stream
+    /// I/O is aborted. Idempotent.
     pub(crate) fn cancel(&self) -> io::Result<()> {
         let _lifecycle = self
             .inner
@@ -452,11 +466,19 @@ impl WindowsNamedPipeServer {
         if self.inner.consumed.load(Ordering::Acquire) {
             return Ok(());
         }
+        self.inner.cancelled.store(true, Ordering::Release);
         // SAFETY: the cancellation event handle remains live in `inner`.
         if unsafe { SetEvent(self.raw_cancel_event()) } == 0 {
             return Err(io::Error::last_os_error());
         }
         self.cancel_pending_io()
+    }
+
+    /// Whether [`Self::cancel`] ran before this instance was consumed. A waiter
+    /// that re-arms after a refusal reads this before it waits again, because
+    /// a synchronous connect completion bypasses the cancel event.
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.inner.cancelled.load(Ordering::Acquire)
     }
 
     pub(crate) fn canceller(&self) -> WindowsNamedPipeCanceller {
@@ -567,6 +589,7 @@ impl WindowsNamedPipeServer {
                 connect_event,
                 connected: AtomicBool::new(true),
                 consumed: AtomicBool::new(true),
+                cancelled: AtomicBool::new(false),
                 #[cfg(test)]
                 accept_pending: AtomicBool::new(false),
                 #[cfg(test)]
@@ -932,6 +955,23 @@ impl WindowsNamedPipeStream {
         self.inner.force_cancel_error.store(true, Ordering::Release);
     }
 
+    /// Refuses to start I/O on a cancelled, not yet consumed server instance
+    /// with `ERROR_OPERATION_ABORTED`, the code a cancelled pending operation
+    /// reports. `CancelIoEx` reaches only the operations pending at the
+    /// cancel; without this gate an operation issued afterwards would wait out
+    /// its own deadline. An admitted (consumed) stream and a client stream are
+    /// never refused: their `consumed` is set before or at creation.
+    fn refuse_if_cancelled(&self) -> io::Result<()> {
+        if self.inner.cancelled.load(Ordering::Acquire)
+            && !self.inner.consumed.load(Ordering::Acquire)
+        {
+            return Err(io::Error::from_raw_os_error(
+                ERROR_OPERATION_ABORTED.cast_signed(),
+            ));
+        }
+        Ok(())
+    }
+
     fn raw_pipe(&self) -> io::Result<*mut core::ffi::c_void> {
         self.inner
             .pipe
@@ -1227,6 +1267,7 @@ impl Read for WindowsNamedPipeStream {
         if buf.is_empty() {
             return Ok(0);
         }
+        self.refuse_if_cancelled()?;
         let timeout = effective_timeout(
             *self
                 .read_timeout
@@ -1263,6 +1304,7 @@ impl Write for WindowsNamedPipeStream {
         if buf.is_empty() {
             return Ok(0);
         }
+        self.refuse_if_cancelled()?;
         let timeout = effective_timeout(
             *self
                 .write_timeout

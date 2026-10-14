@@ -143,7 +143,11 @@ connection, under the landed per-connection deadline clamped to the claim deadli
 reads the client's process ID and session, `KELD-AH1`, the claim writer's
 identification-level token and the retained process pin that the caller's claimant
 policy returns, disconnects and re-arms on any refusal, and consumes its one-shot
-before `KELD-AR1`. After `KELD-AR1` the owner reads `KELD-AB1` and `KELD-AY1` by
+before `KELD-AR1`. The claim wait ends without a claimant at the claim deadline
+(`KELD-IPC-018`) or when the endpoint's claim canceller, a `Send` handle taken before
+the wait that the owner's watcher on its retained launch handle drives, ends it
+(`KELD-IPC-028`); both close the endpoint, and a cancel that races the one-shot is a
+no-op. After `KELD-AR1` the owner reads `KELD-AB1` and `KELD-AY1` by
 position, decides the health window (30 seconds plus a margin G, which the caller
 passes until KEL-53 §6 S6c fixes it from its measurement) as a state machine over an
 injected clock, and then either writes `KELD-AK1` accepted and waits for the

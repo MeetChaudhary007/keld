@@ -1285,6 +1285,60 @@ impl WindowsLaunchedProcess {
             }
         })
     }
+
+    /// Waits on the retained launch handle for at most `timeout` and reports
+    /// whether it signaled, so the launched process has exited (KEL-53 §4
+    /// *Margin and deadlines*: the claim wait is bounded by the deadline and by
+    /// the launch handle). This is the watcher's primitive: a thread that holds
+    /// a shared borrow of the record waits here while the record's owner runs
+    /// the claim wait, and on `true` drives the attempt endpoint's claim
+    /// canceller.
+    ///
+    /// Like [`Self::has_exited`] it consumes nothing: it neither reaps nor
+    /// terminates the child, leaves the retained handle open, and may be asked
+    /// any number of times, from any thread, through the shared borrow; the
+    /// record is `Sync`:
+    ///
+    /// ```
+    /// fn is_sync<T: Sync>() {}
+    /// is_sync::<keld_runtime::windows_job::WindowsLaunchedProcess>();
+    /// ```
+    ///
+    /// It waits on the kernel object the record retains, never on a process
+    /// ID, so a reused ID cannot be observed; and it borrows the record, so a
+    /// watcher cannot outlive the record's detach or drop and holds no handle
+    /// of its own:
+    ///
+    /// ```compile_fail,E0521
+    /// fn watch(launched: &keld_runtime::windows_job::WindowsLaunchedProcess) {
+    ///     std::thread::spawn(move || {
+    ///         launched.wait_until_exited(std::time::Duration::from_millis(50))
+    ///     });
+    /// }
+    /// ```
+    ///
+    /// The wait is bounded and finite, never `INFINITE`, and nothing but the
+    /// handle or the timeout ends it: a watcher that must also end when the
+    /// wait it serves has ended loops on short slices and reads its stop
+    /// condition between them, so it outlives that end by at most one slice.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `timeout` does not fit the monotonic clock or
+    /// Windows cannot wait on the retained launch handle.
+    pub fn wait_until_exited(&self, timeout: Duration) -> Result<bool, WindowsHostJobError> {
+        let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
+            WindowsHostJobError::contract(
+                "launch handle wait",
+                "the timeout does not fit the monotonic clock",
+            )
+        })?;
+        wait_handle_bounded(
+            self.child.process_handle().as_raw_handle().cast(),
+            deadline,
+            "launch handle wait",
+        )
+    }
 }
 
 /// The released candidate by identity only, after

@@ -4490,6 +4490,54 @@ socket.end();
         );
     }
 
+    /// A cancelled, not yet consumed server instance refuses I/O issued after
+    /// the cancel at once with `ERROR_OPERATION_ABORTED` (995), the code a
+    /// cancelled pending operation reports: `CancelIoEx` reaches only the
+    /// operations pending at the cancel, so without the gate such a read
+    /// would wait out its own deadline. Consuming the instance lifts the
+    /// gate, so an admitted stream is never refused. Oracles: the raw code,
+    /// the elapsed time against the read deadline, and the byte the client
+    /// wrote.
+    #[test]
+    fn a_cancelled_unconsumed_server_stream_refuses_new_io_until_consumed() {
+        let endpoint = super::random_pipe_endpoint().expect("mint pipe endpoint");
+        let server = WindowsNamedPipeServer::bind(&endpoint).expect("bind pipe server");
+        let mut client = WindowsNamedPipeServer::connect_client(&endpoint).expect("client");
+        assert_eq!(
+            server
+                .accept_until(Some(Instant::now() + Duration::from_secs(5)))
+                .expect("accept the client"),
+            WaitOutcome::Ready
+        );
+        let mut stream = server.stream().expect("server stream");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("read deadline");
+        server.cancel().expect("cancel the unconsumed instance");
+        let refused_at = Instant::now();
+        let mut byte = [0_u8; 1];
+        let read = stream
+            .read(&mut byte)
+            .expect_err("a read issued after the cancel is refused");
+        assert_eq!(read.raw_os_error(), Some(995), "{read}");
+        let write = stream
+            .write(&[1])
+            .expect_err("a write issued after the cancel is refused");
+        assert_eq!(write.raw_os_error(), Some(995), "{write}");
+        assert!(
+            refused_at.elapsed() < Duration::from_secs(1),
+            "refused at once, not at the read deadline"
+        );
+        server.consume();
+        client.write_all(&[7]).expect("client write");
+        assert_eq!(
+            stream.read(&mut byte).expect("an admitted stream reads"),
+            1,
+            "consuming the instance lifts the gate"
+        );
+        assert_eq!(byte, [7]);
+    }
+
     #[test]
     fn cancellation_handle_does_not_keep_dropped_listener_alive() {
         let listener = WindowsNamedPipeBootstrapListener::bind().expect("bind");

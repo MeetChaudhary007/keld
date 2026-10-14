@@ -297,6 +297,51 @@ fn the_launch_liveness_check_reads_the_retained_handle_without_consuming_it() {
     );
 }
 
+/// The bounded wait on the retained launch handle (KEL-53 §4 *Margin and deadlines*,
+/// the watcher's primitive): a live launch does not signal within the slice, a timeout
+/// past the monotonic clock is refused before any wait, the exit signals it, it keeps
+/// signaling every time it is asked, and it consumes nothing, so the exit code is still
+/// reaped afterwards.
+#[test]
+fn the_launch_wait_reports_the_retained_handle_within_its_bound_without_consuming_it() {
+    let (_job, mut launched, membership) = launched_member();
+    assert!(
+        !launched
+            .wait_until_exited(Duration::from_millis(100))
+            .expect("wait on the suspended launch"),
+        "a suspended launch does not signal within the slice"
+    );
+    let overflow = launched
+        .wait_until_exited(Duration::MAX)
+        .expect_err("a timeout past the monotonic clock is refused before any wait");
+    assert!(
+        overflow.to_string().contains("launch handle wait"),
+        "{overflow}"
+    );
+    launched.resume(&membership).expect("resume the launch");
+    assert!(
+        launched
+            .wait_until_exited(Duration::from_millis(u64::from(WAIT_MS)))
+            .expect("wait on the resumed launch"),
+        "the exit signals the handle within the bound"
+    );
+    for _ in 0..2 {
+        assert!(
+            launched
+                .wait_until_exited(Duration::ZERO)
+                .expect("ask the exited launch again"),
+            "an exited launch is signaled, every time it is asked"
+        );
+    }
+    assert_eq!(
+        launched
+            .wait(0)
+            .expect("the retained handle still reports the exit"),
+        COMMAND_EXIT,
+        "the bounded wait consumed nothing"
+    );
+}
+
 #[test]
 fn the_owner_binds_only_its_launched_candidate_and_only_while_it_lives() {
     let (_job, mut launched, membership) = launched_member();
