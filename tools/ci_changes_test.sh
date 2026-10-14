@@ -225,6 +225,7 @@ allocations_flags=$'rust=true\ndocs=true\nhygiene=true\ngui=false\nmsrv=false\nd
 channel_table_flags=$'rust=true\ndocs=false\nhygiene=true\ngui=true\nmsrv=true\ndeny=false\nts=true\nwebkitgtk=true'
 allocations_and_table_flags=$'rust=true\ndocs=true\nhygiene=true\ngui=true\nmsrv=true\ndeny=false\nts=true\nwebkitgtk=true'
 crate_text_flags=$'rust=true\ndocs=true\nhygiene=false\ngui=false\nmsrv=false\ndeny=false\nts=false\nwebkitgtk=true'
+media_oracle_flags=$'rust=true\ndocs=false\nhygiene=true\ngui=true\nmsrv=true\ndeny=false\nts=false\nwebkitgtk=true'
 
 # A developer checkout can contain unknown inputs. Prove the live fallback,
 # then run clean-path exclusion controls in a separate tracked-byte snapshot.
@@ -498,6 +499,8 @@ allocations_and_table_classification="$(result_for_paths crates/keld-ipc/src/cha
 expect_flags "a renumber of table and baseline together selects the hygiene check" "$allocations_and_table_flags" "$allocations_and_table_classification"
 crate_text_classification="$(result_for_paths crates/keld-ipc/notes.txt)"
 expect_flags "another crate-local text file does not select hygiene" "$crate_text_flags" "$crate_text_classification"
+media_oracle_classification="$(result_for_paths crates/keld-wv/tests/windows_media_guard.ps1)"
+expect_flags "the digest-pinned Windows media oracle selects the hosted hygiene pin check" "$media_oracle_flags" "$media_oracle_classification"
 
 compat_classification="$(result_for_paths crates/keld-compat/src/lib.rs)"
 expect_flags "compat-only change skips GUI smoke but installs GTK for its selected test closure" "$compat_flags" "$compat_classification"
