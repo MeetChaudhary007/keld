@@ -2876,12 +2876,16 @@ impl WebView2Engine {
     ///
     /// It may be called again on that thread after a previous engine's session
     /// ended, that is after [`WebView2Engine::run_app_until_quit`] or
-    /// [`WebView2Engine::run_until_closed`] returned: that engine wrote `idle`
-    /// and released its profile lease behind the `BrowserProcessExited`
+    /// [`WebView2Engine::run_until_closed`] returned `Ok`. That engine wrote
+    /// `idle` and released its profile lease behind the `BrowserProcessExited`
     /// barrier, dropped its event loop (whose proxies never outlive the run)
     /// and uninitialised its COM apartment, so the next engine re-acquires the
     /// same persistent profile, initialises a fresh apartment and builds a new
-    /// event loop. tao 0.35.3 imposes no once-per-process rule on
+    /// event loop. An `Err` return may leave the profile record non-idle under
+    /// this live process (a release fault skips the `idle` write); a later call
+    /// in the same process then fails closed with
+    /// [`ProfileErrorKind::ProfileInUse`] until a later launch's recovery
+    /// quarantines and probes the profile. tao 0.35.3 imposes no once-per-process rule on
     /// `EventLoopBuilder::build`, only the main thread
     /// (`platform_impl/windows/event_loop.rs`); it parks one wait thread per
     /// built loop. The per-monitor DPI policy is a process fact and is accepted

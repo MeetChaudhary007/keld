@@ -245,11 +245,15 @@ fn kel270_s6c_two_consecutive_sessions_in_one_host_process() {
         LifecycleObservation::idle(),
         "the profile is released after the second session"
     );
-    let engine_constructions = count_engine_constructions(&stdout);
+    let (prepared_folders, environments) = engine_constructions(&stdout);
     assert_eq!(
-        engine_constructions,
+        (prepared_folders.len(), environments),
         (2, 2),
         "two engine constructions in one process\nstdout:\n{stdout}"
+    );
+    assert_eq!(
+        prepared_folders[0], prepared_folders[1],
+        "both engines prepared the same persistent profile folder"
     );
     println!(
         "KELD_KEL270_H5 {}",
@@ -261,7 +265,8 @@ fn kel270_s6c_two_consecutive_sessions_in_one_host_process() {
             "bun_2_creation": bun_2_times.creation,
             "window_handles": [window_1["handle"], window_2["handle"]],
             "host_threads_at_ready": [threads_1, threads_2],
-            "engine_constructions": engine_constructions.0,
+            "engine_constructions": prepared_folders.len(),
+            "user_data_folder": prepared_folders[0],
         })
     );
     drop(installed);
@@ -278,13 +283,15 @@ fn assert_first_exited_before_second(first: ProcessTimes, second: ProcessTimes) 
     );
 }
 
-/// The debug profile fixture prints one `KELD_PROFILE_TEST_PREPARED` and one
-/// `KELD_PROFILE_TEST_ENVIRONMENT_READY` line per `WebView2Engine::new`.
-fn count_engine_constructions(stdout: &str) -> (usize, usize) {
+/// The debug profile fixture prints one `KELD_PROFILE_TEST_PREPARED <user-data folder>`
+/// and one `KELD_PROFILE_TEST_ENVIRONMENT_READY` line per `WebView2Engine::new`;
+/// returns each construction's prepared folder and the count of ready environments.
+fn engine_constructions(stdout: &str) -> (Vec<&str>, usize) {
     let prepared = stdout
         .lines()
-        .filter(|line| line.starts_with("KELD_PROFILE_TEST_PREPARED "))
-        .count();
+        .filter_map(|line| line.strip_prefix("KELD_PROFILE_TEST_PREPARED "))
+        .map(str::trim_end)
+        .collect();
     let environments = stdout
         .lines()
         .filter(|line| line.trim_end() == "KELD_PROFILE_TEST_ENVIRONMENT_READY")

@@ -2126,8 +2126,8 @@ S6d). A second session in one process is
 admitted by the libraries: tao 0.35.3 imposes no
 once-per-process rule on `EventLoopBuilder::build` and requires only the main thread
 (`tao-0.35.3/src/platform_impl/windows/event_loop.rs:180-185`; the workspace pin is
-`Cargo.lock:2774-2775`), the DPI-awareness setter accepts an already-set equal context
-(`mod.rs:317-342`), and COM is initialized per engine (`mod.rs:296-300`). S6c1 proved
+`Cargo.lock:2781-2783`), the DPI-awareness setter accepts an already-set equal context
+(`mod.rs:438-465`), and COM is initialized per engine (`mod.rs:427-436`). S6c1 proved
 it with the two-sessions cell of the §7 row before any composition. The stop rule
 therefore did not fire. That rule was: if the cell could not pass, S6c stopped and this
 specification was amended under the public-API gate, with the recorded alternative of
@@ -2146,10 +2146,17 @@ and its broker are per session.
   session's filesystem calls have not drained.
 
 tao also parks one wait thread per built event loop for the life of the process
-(`tao-0.35.3/src/platform_impl/windows/event_loop.rs`, `wait_thread`). The h5 runs
-recorded the host's thread count at `Ready` as 19 in the first session and 22 in the
-second. That parked thread accounts for one of the three; the other two are not
-attributed. S6c2's ten-update row measures the growth across sessions.
+(`tao-0.35.3/src/platform_impl/windows/event_loop.rs`: `EventLoop::new` spawns
+`wait_thread`, which exits only on `WM_QUIT`, and nothing in tao posts one). The h5
+runs recorded the host's thread count at `Ready` as 19 in the first session in all
+25 runs, and as 22 (20 runs) or 21 (5 runs) in the second. No thread census attributed
+the added threads; the source shows only that the parked wait thread exists. S6c2's ten-update row asserts a per-session bound
+on that growth, not only a measurement.
+
+An `Err` from a session's engine run may leave the profile record non-idle under the
+live host, because a release fault skips the `idle` write. A next session in the same
+process then fails closed with `ProfileInUse`, as the h5 mutant that skips the `idle`
+write shows, and the loop runs another session only after an `Ok` session.
 
 Rejected: exiting for a relaunch, which
 needs a relaunched host that outlives the old host and therefore a second attempt Job,
@@ -3411,7 +3418,13 @@ Must not touch in Slice A:
 
         Evidence: the h5 cell, its failure-first run and two mutants (the `idle` write
         skipped; the first session's claimed shutdown state reused).
-      - S6c2 is the rest of this bullet.
+      - S6c2 is the rest of this bullet. Two obligations follow from S6c1's review:
+        - The coordinator's restore, the second requester of the loop, keeps the
+          dev-lease refusal at its own boundary, because `next_direct_session` knows
+          nothing of the lease.
+        - One restore cell runs after a first session that recovered a filesystem
+          generation, so the per-session dispatch reset is exercised end to end. h5
+          covers only the broker's re-preparation; a unit test covers the reset.
 
       Its "real host coordinator" cells run an
       operator-signed debug build (§5). Gates: public API (the coordinator entry, the
@@ -3674,12 +3687,12 @@ source SHA, package/signature identity and raw crash cuts. Other OS results are 
   S6b4: proof-only. The detach skips an existing `TerminateProcess` on a Drop path, and
   that block's `SAFETY` proof (`crates/keld-runtime/src/windows_lpac.rs:824-826`, "this
   owner never detaches") is amended to admit the census-bound detach of a resumed
-  child; no production call, block, scope or crate is added. The only new `unsafe` is
-  one test-only `GetProcessHandleCount` read for the §7 d5 handle census. S6b4's final
+  child; no production call, block, scope or crate is added. S6b4's only new `unsafe`
+  is one test-only `GetProcessHandleCount` read for the §7 d5 handle census. S6b4's final
   diff needs independent unsafe-gate review evidence. S6c adds none in production: the
   handover reuses the landed session tails, barrier and profile recovery, and no
   production FFI call or `unsafe` block is added or changed (coordinator decisions
-  under the owner's delegation of 2026-10-08). The only new `unsafe` is S6c1's
+  under the owner's delegation of 2026-10-08). S6c's only new `unsafe` is S6c1's
   test-only `GetProcessTimes` read in the `keld-host` Windows test support, for the h5
   census of process creation and exit times, under the `keld-host` test allowance.
   The helper crate holds none. Elsewhere, conditional on each exact native/helper
