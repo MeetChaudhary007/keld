@@ -48,9 +48,27 @@ class PureReportContracts(unittest.TestCase):
         grow = budget.assess_change("M", "legacy.rs", "legacy.rs",
                                     original, bigger, census.CANDIDATE)
         self.assertFalse(shrink["hypothetical_block"])
+        self.assertEqual("grandfathered-shrink", shrink["finding"])
         self.assertTrue(shrink["legacy_over_proposed_cap"])
         self.assertEqual("grandfathered-growth", grow["finding"])
         self.assertTrue(grow["hypothetical_block"])
+
+    def test_review_thresholds_follow_existing_test_entry_owner(self):
+        entry = row("crates/keld-update/src/windows_baseline/tests.rs", 101, 3000, "C")
+        result = budget.assess_change("M", entry["path"], entry["path"],
+                                      entry, entry, census.CANDIDATE)
+        self.assertEqual("review-trigger", result["finding"])
+        self.assertTrue(result["test_layout_owner_review"])
+        self.assertTrue(result["review_over_owner_threshold"])
+        self.assertFalse(result["hypothetical_block"])
+
+    def test_legacy_recovered_within_proposal(self):
+        old = row("legacy.rs", 1300, 72000)
+        new = row("legacy.rs", 100, 1000)
+        result = budget.assess_change("M", "legacy.rs", "legacy.rs",
+                                      old, new, census.CANDIDATE)
+        self.assertEqual("legacy-now-within-proposal", result["finding"])
+        self.assertFalse(result["hypothetical_block"])
 
     def test_only_bytes_can_trigger_proposed_budget(self):
         result = budget.assess_change("M", "code.rs", "code.rs",

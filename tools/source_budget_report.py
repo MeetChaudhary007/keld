@@ -53,6 +53,16 @@ def growth(before, after):
                  or (after["bytes"] or 0) > (before["bytes"] or 0)))
 
 
+def review_trigger(current, policy):
+    """Reuse source_census's one test-entry/review threshold owner."""
+    if current is None or current["category"] not in policy:
+        return False
+    c = current["category"]
+    entry = next(r for r in census.policy_impact([current], policy, "simulation")
+                 if r["category"] == c)
+    return bool(entry["review_over_lines"] or entry["review_over_bytes"])
+
+
 def assess_change(kind, old_path, new_path, old, current, policy):
     category = current["category"] if current is not None else old["category"]
     limits = policy.get(category)
@@ -73,15 +83,33 @@ def assess_change(kind, old_path, new_path, old, current, policy):
         finding = "new-above-proposed-cap"
     elif old is not None and old_over and grew:
         finding = "grandfathered-growth"
+    elif old is not None and old_over and not new_over:
+        finding = "legacy-now-within-proposal"
+    elif old is not None and old_over and (
+        (current["physical_lines"] or 0) < (old["physical_lines"] or 0)
+        or (current["bytes"] or 0) < (old["bytes"] or 0)
+    ):
+        finding = "grandfathered-shrink"
+    elif old_over:
+        finding = "grandfathered-no-growth"
     elif not old_over and new_over:
         finding = "newly-over-proposed-cap"
-    elif current is not None and exceeds(current, review_lines, review_bytes):
+    elif review_trigger(current, policy):
         finding = "review-trigger"
     else:
         finding = "within-proposal"
 
-    # Existing test-layout rules have separate entry-module triggers.
-    # This generic candidate review signal never replaces those owner rules.
+    guidance = {
+        "new-above-proposed-cap": "Evaluate real responsibilities; caps are not adopted.",
+        "grandfathered-growth": "A future no-growth rule would require human review/exception; no rejection now.",
+        "newly-over-proposed-cap": "Assess the ownership seam or reviewed exception before enforcing.",
+        "grandfathered-shrink": "Reduction is welcome; a future protected-main ratchet could lower the ceiling.",
+        "grandfathered-no-growth": "Existing over-limit file was not enlarged; do not force a split.",
+        "legacy-now-within-proposal": "Legacy file is now below the simulated caps.",
+        "review-trigger": "Human cohesion/test-layout review only; do not reject regression tests for size.",
+        "within-proposal": "No size action; standard correctness review still applies.",
+        "removed": "Removed tracked path; no size violation.",
+    }
     return {
         "path": new_path, "old_path": old_path if kind == "R" else None,
         "change_kind": kind, "category": category, "finding": finding,
@@ -93,7 +121,13 @@ def assess_change(kind, old_path, new_path, old, current, policy):
         "currently_over_proposed_cap": new_over,
         "grew_on_either_axis": grew,
         "review_over_generic_threshold": exceeds(current, review_lines, review_bytes),
-        "test_layout_owner_review": category == "C",
+        "review_over_owner_threshold": review_trigger(current, policy),
+        "test_layout_owner_review": category == "C" and review_trigger(current, policy),
+        "proposed_review_lines": review_lines,
+        "proposed_review_bytes": review_bytes,
+        "proposed_hard_lines": hard_lines,
+        "proposed_hard_bytes": hard_bytes,
+        "suggested_next_step": guidance[finding],
         "hypothetical_block": finding in (
             "new-above-proposed-cap", "grandfathered-growth", "newly-over-proposed-cap"),
     }
