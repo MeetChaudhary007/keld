@@ -1627,11 +1627,18 @@ fn pipe_flags(handle: &OwnedHandle) -> io::Result<u32> {
     Ok(flags)
 }
 
+/// The wait timeout for `timeout`, in whole milliseconds rounded up, so a wait
+/// bounded by a deadline never reports that deadline elapsed before it has
+/// (a truncated fraction would end the wait early by up to one millisecond);
+/// `None` is `INFINITE`.
 fn duration_to_wait_ms(timeout: Option<Duration>) -> u32 {
     let Some(timeout) = timeout else {
         return INFINITE;
     };
-    let millis = timeout.as_millis().max(1).min(u128::from(INFINITE - 1));
+    let fraction = u128::from(timeout.subsec_nanos() % 1_000_000 != 0);
+    let millis = (timeout.as_millis() + fraction)
+        .max(1)
+        .min(u128::from(INFINITE - 1));
     u32::try_from(millis).unwrap_or(INFINITE - 1)
 }
 
@@ -1742,7 +1749,29 @@ pub(crate) fn current_process_query_token() -> io::Result<OwnedHandle> {
 
 #[cfg(test)]
 mod cancellation_tests {
-    use super::{CancelledOperation, timeout_io_result};
+    use std::time::Duration;
+
+    use windows_sys::Win32::System::Threading::INFINITE;
+
+    use super::{CancelledOperation, duration_to_wait_ms, timeout_io_result};
+
+    /// A deadline-bounded wait never ends before its deadline: a fractional
+    /// millisecond rounds up, a whole one stays exact, zero waits one
+    /// millisecond (never a busy poll), an unbounded wait is `INFINITE`, and
+    /// an overlong one saturates below it. Oracle: literal millisecond values.
+    #[test]
+    fn a_wait_timeout_rounds_a_fractional_millisecond_up_and_never_down() {
+        assert_eq!(
+            duration_to_wait_ms(Some(Duration::from_micros(4_999_900))),
+            5_000
+        );
+        assert_eq!(duration_to_wait_ms(Some(Duration::from_micros(1_001))), 2);
+        assert_eq!(duration_to_wait_ms(Some(Duration::from_secs(5))), 5_000);
+        assert_eq!(duration_to_wait_ms(Some(Duration::from_nanos(1))), 1);
+        assert_eq!(duration_to_wait_ms(Some(Duration::ZERO)), 1);
+        assert_eq!(duration_to_wait_ms(None), INFINITE);
+        assert_eq!(duration_to_wait_ms(Some(Duration::MAX)), INFINITE - 1);
+    }
 
     #[test]
     fn timeout_preserves_bytes_from_a_racing_normal_completion() {
