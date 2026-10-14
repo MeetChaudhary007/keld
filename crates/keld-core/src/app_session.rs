@@ -238,15 +238,17 @@ struct SessionShutdownState {
     handover_clock: Arc<HandoverClock>,
 }
 
-/// The handover's three instants on the host's monotonic clock, each set once: the
-/// request, the `LastWindowClosed` write (D runs from it) and the admitted `Quit`
-/// frame (the D sample).
+/// The handover's instants on the host's monotonic clock, each set once: the request,
+/// the UI loop's return, the `LastWindowClosed` write (D runs from it), the admitted
+/// `Quit` frame (the D sample) and the forced claim at D.
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[derive(Default)]
 struct HandoverClock {
     requested_at: OnceLock<Instant>,
+    ui_returned_at: OnceLock<Instant>,
     last_window_closed_at: OnceLock<Instant>,
     quit_frame_at: OnceLock<Instant>,
+    forced_at: OnceLock<Instant>,
 }
 
 /// Ends the claimant's tail on drop, so every return path of the tail, including a
@@ -3264,33 +3266,22 @@ impl TestSessionSeam {
     }
 }
 
-/// Debug evidence of one completed handover on the host's monotonic clock, printed by
-/// the evidence seam as `KELD_TEST_WINDOWS_HANDOVER {json}`.
-#[cfg(any(target_os = "linux", windows))]
-struct HandoverEnd {
-    cause: u8,
-    /// From the handover request to the UI loop's return.
-    ui_end: Option<Duration>,
-    /// From the `LastWindowClosed` write to the admitted `Quit` frame (the D sample).
-    quit_wait: Option<Duration>,
-    /// From the `LastWindowClosed` write to the handover claim at D.
-    forced_after: Option<Duration>,
-}
-
 /// Steps 3a to 3c of KEL-53 §4 "Profile handover" once the UI loop has returned under
 /// a handover request: the host writes `LastWindowClosed` itself (the `Quit` path of the
 /// loop emits none), waits up to [`HANDOVER_QUIT_DEADLINE`] for the application's `Quit`,
 /// and otherwise claims [`SESSION_HANDOVER`] and runs the forced tail on this thread;
 /// when the application's `Quit` won, this thread awaits that tail's end before the
 /// teardown, as it awaited the loop's return before. A `LastWindowClosed` write that
-/// fails ends the session at once under the handover cause (fail closed, no D).
+/// fails ends the session at once under the handover cause (fail closed, no D). The
+/// instants of the loop's return and of the forced claim join the session's
+/// [`HandoverClock`].
 #[cfg(any(target_os = "linux", windows))]
 fn complete_profile_handover(
     router: &PrimaryRouterHandle,
     shutdown: &SessionShutdownState,
-) -> Result<HandoverEnd, HostAppError> {
+) -> Result<(), HostAppError> {
     let clock = &shutdown.handover_clock;
-    let ui_end = clock.requested_at.get().map(Instant::elapsed);
+    let _ = clock.ui_returned_at.set(Instant::now());
     let written = router.signal_last_window_closed();
     let written_at = clock
         .last_window_closed_at
@@ -3302,49 +3293,41 @@ fn complete_profile_handover(
     } else {
         Instant::now()
     };
-    let (tail, forced_after) = match shutdown.await_quit_or_claim_handover(deadline) {
+    let tail = match shutdown.await_quit_or_claim_handover(deadline) {
         HandoverWait::ClaimedHandover => {
-            let forced_after = written_at.elapsed();
-            (router.cli_lease_lost(), Some(forced_after))
+            let _ = clock.forced_at.set(Instant::now());
+            router.cli_lease_lost()
         }
         HandoverWait::ClaimedByOther => {
             shutdown.await_tail_end();
-            (Ok(()), None)
+            Ok(())
         }
     };
-    let end = HandoverEnd {
-        cause: shutdown.cause(),
-        ui_end,
-        quit_wait: clock
-            .quit_frame_at
-            .get()
-            .map(|quit_frame_at| quit_frame_at.saturating_duration_since(written_at)),
-        forced_after,
-    };
-    collapse_app_results([written, tail]).map(|()| end)
+    collapse_app_results([written, tail])
 }
 
 #[cfg(all(debug_assertions, windows))]
-impl HandoverEnd {
-    /// The seam's evidence line: the cause and the three intervals in microseconds.
-    fn evidence_json(&self) -> String {
-        let micros = |interval: Option<Duration>| {
-            interval.map_or_else(
-                || String::from("null"),
-                |interval| interval.as_micros().to_string(),
-            )
+impl HandoverClock {
+    /// The seam's evidence line for one completed handover: the cause and the three
+    /// intervals in microseconds (request to loop return; `LastWindowClosed` write to
+    /// the admitted `Quit` frame, the D sample; write to the forced claim at D).
+    fn evidence_json(&self, cause: u8) -> String {
+        let micros = |from: Option<&Instant>, to: Option<&Instant>| match (from, to) {
+            (Some(from), Some(to)) => to.saturating_duration_since(*from).as_micros().to_string(),
+            _ => String::from("null"),
         };
-        let cause = match self.cause {
+        let cause = match cause {
             SESSION_LIFECYCLE_QUIT => "lifecycle-quit",
             SESSION_HANDOVER => "forced",
             SESSION_CLI_LEASE_LOST => "cli-lease-lost",
             _ => "running",
         };
+        let written = self.last_window_closed_at.get();
         format!(
             "{{\"cause\":\"{cause}\",\"ui_end_us\":{},\"quit_wait_us\":{},\"forced_after_us\":{},\"deadline_us\":{}}}",
-            micros(self.ui_end),
-            micros(self.quit_wait),
-            micros(self.forced_after),
+            micros(self.requested_at.get(), self.ui_returned_at.get()),
+            micros(written, self.quit_frame_at.get()),
+            micros(written, self.forced_at.get()),
             HANDOVER_QUIT_DEADLINE.as_micros()
         )
     }
@@ -3693,20 +3676,22 @@ fn run_direct_app_session(
     // A handover ended the loop: the application session is still live and ends here
     // (KEL-53 §4 "Profile handover", steps 3a to 3c). A loop that returned an error
     // under a handover is a failed tail: no step follows, the session fails.
-    let handover = match (&window_result, shutdown.handover_requested()) {
-        (Ok(()), true) => Some(complete_profile_handover(&router.handle(), shutdown)),
-        _ => None,
+    let handover_result = match (&window_result, shutdown.handover_requested()) {
+        (Ok(()), true) => complete_profile_handover(&router.handle(), shutdown),
+        _ => Ok(()),
     };
     #[cfg(all(debug_assertions, windows))]
-    if handover_at_ready && let Some(Ok(end)) = handover.as_ref() {
-        println!("KELD_TEST_WINDOWS_HANDOVER {}", end.evidence_json());
+    if handover_at_ready && window_result.is_ok() && handover_result.is_ok() {
+        println!(
+            "KELD_TEST_WINDOWS_HANDOVER {}",
+            shutdown.handover_clock.evidence_json(shutdown.cause())
+        );
     }
     let session_end = if shutdown.handover_requested() {
         DirectSessionEnd::Handover
     } else {
         DirectSessionEnd::Ordinary
     };
-    let handover_result = handover.map_or(Ok(()), |end| end.map(|_| ()));
     let event_result = event_coordinator
         .join()
         .map_err(|_| app_detail("direct window event coordinator", "thread panicked"))
