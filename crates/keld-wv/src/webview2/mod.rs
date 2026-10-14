@@ -2568,6 +2568,31 @@ struct ProfileReleaseWait {
     observed: Cell<bool>,
     fault: Cell<Option<ProfileReleaseFault>>,
     post_exit_deadline: Cell<Option<Instant>>,
+    /// The KEL-53 §7 h9 fault fixture: a drained release event is lost instead
+    /// of proving release, so the exited browser faults at the post-exit grace
+    /// as if `WebView2` never raised the event.
+    #[cfg(feature = "profile-test-hooks")]
+    withhold_release_event: bool,
+}
+
+/// `KELD_TEST_WINDOWS_BARRIER_GRACE_EXPIRY=1` makes the host site's barrier lose
+/// its `BrowserProcessExited` event under a 1 s post-exit grace, so the handover's
+/// UI end fails typed with `GraceExpired` (KEL-53 §7 "8, 20 (profile handover)",
+/// cell h9). A deterministic fault fixture of the `profile-test-hooks` class,
+/// never in a release build; `keld-core` removes it from the Bun child's
+/// environment through this name.
+#[cfg(feature = "profile-test-hooks")]
+pub const TEST_WINDOWS_BARRIER_GRACE_EXPIRY_ENV: &str = "KELD_TEST_WINDOWS_BARRIER_GRACE_EXPIRY";
+
+/// The post-exit grace the h9 fixture substitutes for [`BROWSER_EXIT_GRACE`]: long
+/// enough to prove the fault is the grace, short enough for a cell.
+#[cfg(feature = "profile-test-hooks")]
+const TEST_BARRIER_GRACE_EXPIRY_GRACE: Duration = Duration::from_secs(1);
+
+#[cfg(feature = "profile-test-hooks")]
+fn barrier_grace_expiry_requested() -> bool {
+    std::env::var_os(TEST_WINDOWS_BARRIER_GRACE_EXPIRY_ENV).as_deref()
+        == Some(std::ffi::OsStr::new("1"))
 }
 
 impl ProfileReleaseWait {
@@ -2602,6 +2627,28 @@ impl ProfileReleaseWait {
             observed: Cell::new(false),
             fault: Cell::new(None),
             post_exit_deadline: Cell::new(None),
+            #[cfg(feature = "profile-test-hooks")]
+            withhold_release_event: false,
+        }
+    }
+
+    /// The h9 fault fixture: loses the release event and bounds the exited
+    /// browser by `grace` alone.
+    #[cfg(feature = "profile-test-hooks")]
+    fn withholding_release_event(mut self, grace: Duration) -> Self {
+        self.withhold_release_event = true;
+        self.grace = grace;
+        self
+    }
+
+    const fn release_event_withheld(&self) -> bool {
+        #[cfg(feature = "profile-test-hooks")]
+        {
+            self.withhold_release_event
+        }
+        #[cfg(not(feature = "profile-test-hooks"))]
+        {
+            false
         }
     }
 
@@ -2650,6 +2697,10 @@ impl ProfileReleaseWait {
         // The barrier observable is drained first: a queued event is proof of
         // release whatever the process handle or the grace say.
         match receiver.try_recv() {
+            Ok(Ok(())) if self.release_event_withheld() => {
+                // The h9 fault fixture: the event is consumed and lost, and the
+                // exited browser is judged by the grace alone below.
+            }
             Ok(Ok(())) => {
                 self.observed.set(true);
                 #[cfg(all(feature = "media-acceptance", test))]
@@ -3214,10 +3265,14 @@ impl WebView2Engine {
         let browser = remember_browser_process_id(&views, &expected_browser_pid)?;
         let stop_transition = PersistentStopTransition::from_profile(self.profile.as_ref());
         let stop_in_loop = stop_transition.clone();
-        let release = Rc::new(
-            ProfileReleaseWait::new(self.browser_exit.take(), browser, ReleaseSite::Host)
-                .with_loop_wake(event_loop.create_proxy())?,
-        );
+        let release = ProfileReleaseWait::new(self.browser_exit.take(), browser, ReleaseSite::Host);
+        #[cfg(feature = "profile-test-hooks")]
+        let release = if barrier_grace_expiry_requested() {
+            release.withholding_release_event(TEST_BARRIER_GRACE_EXPIRY_GRACE)
+        } else {
+            release
+        };
+        let release = Rc::new(release.with_loop_wake(event_loop.create_proxy())?);
         let release_in_loop = Rc::clone(&release);
         let mut exit_requested = false;
         let code = event_loop.run_return(move |event, _, control_flow| {
@@ -3939,6 +3994,60 @@ mod tests {
         let handle = open_browser_process(child.id()).expect("open fixture child");
         assert!(child.wait().expect("fixture child exit").success());
         handle
+    }
+
+    /// The KEL-53 §7 h9 fault fixture: with the release event withheld, a queued
+    /// event no longer proves release and the exited browser faults at the
+    /// (zero) grace; the same queued event without the fixture is observed at
+    /// the arming poll and nothing faults (the negative control).
+    #[cfg(feature = "profile-test-hooks")]
+    #[test]
+    fn withheld_release_event_faults_at_the_grace_despite_a_queued_event() {
+        let hang_guard = std::time::Duration::from_hours(1);
+        let (sender, receiver) = release_channel();
+        sender.send(Ok(())).expect("queue the release event");
+        let withheld = ProfileReleaseWait::with_bounds(
+            Some(receiver),
+            Some(exited_process_handle()),
+            ReleaseSite::Host,
+            hang_guard,
+            hang_guard,
+        )
+        .withholding_release_event(std::time::Duration::ZERO);
+        withheld.arm();
+        assert_eq!(
+            withheld.fault(),
+            Some(ProfileReleaseFault::GraceExpired),
+            "the lost event leaves the exited browser to the grace"
+        );
+        assert!(
+            !withheld.observed.get(),
+            "a withheld event never proves release"
+        );
+        assert_eq!(
+            withheld
+                .fault()
+                .map(|fault| fault.context(ReleaseSite::Host)),
+            Some(
+                "the host browser process exited without raising BrowserProcessExited within the post-exit grace"
+            )
+        );
+
+        let (sender, receiver) = release_channel();
+        sender.send(Ok(())).expect("queue the release event");
+        let plain = ProfileReleaseWait::with_bounds(
+            Some(receiver),
+            Some(exited_process_handle()),
+            ReleaseSite::Host,
+            std::time::Duration::ZERO,
+            hang_guard,
+        );
+        plain.arm();
+        assert!(
+            plain.observed.get(),
+            "the same event proves release without the fixture"
+        );
+        assert_eq!(plain.fault(), None);
     }
 
     /// KEL-132 regression: while the expected browser process is alive no

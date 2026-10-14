@@ -89,7 +89,11 @@ pub struct WebviewSpec {
 /// Command delivered from the primary app-link owner to the platform UI loop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppWindowCommand {
-    /// Correlated Quit reply has been written; close windows and exit.
+    /// The session is ending: close windows and exit the loop. Sent after the
+    /// correlated Quit reply has been written, or by the host itself at a profile
+    /// handover, where the application keeps running and the host writes
+    /// `LastWindowClosed` once the loop has returned (the loop emits none on this
+    /// command; KEL-53 §4 "Profile handover", step 3a).
     Quit,
     /// The primary app session failed; close windows and exit with an error.
     Fatal,

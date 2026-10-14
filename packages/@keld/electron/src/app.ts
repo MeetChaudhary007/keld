@@ -65,6 +65,10 @@ function removeAppListener(event: string, listener: AppListener): void {
   if (list.length === 0) listeners.delete(event);
 }
 
+// A `window-all-closed` listener that does not quit keeps the app alive, except at a
+// Keld profile handover (an in-session update), where the host closes the window,
+// delivers this event and ends the application session 10 s later if it has not
+// requested quit by then (KEL-53 §4 "Profile handover", the quit deadline D).
 function onLastWindowClosed(): void {
   if (hasListeners("window-all-closed")) {
     emit("window-all-closed");
