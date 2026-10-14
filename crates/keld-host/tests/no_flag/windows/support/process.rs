@@ -1,7 +1,9 @@
 //! Native process wait, signal, identity and test-owned termination observers.
 
+use std::io::Read;
 use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
-use std::process::{Child, Command, ExitStatus};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::{FILETIME, HANDLE, WAIT_OBJECT_0};
@@ -146,17 +148,97 @@ pub(crate) fn process_tree_report(root_pid: u32) -> String {
          ' browser_processes=' + $browser.Count + \
          ' descendants=' + (($desc | ForEach-Object {{ $_.Name + ':' + $_.ProcessId + '<' + $_.ParentProcessId }}) -join ',')"
     );
-    match Command::new("powershell.exe")
-        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-        .output()
-    {
+    match bounded_output(
+        Command::new("powershell.exe").args(["-NoProfile", "-NonInteractive", "-Command", &script]),
+        Instant::now() + DIAGNOSTIC_QUERY_KILL_SWITCH,
+    ) {
         Ok(output) => format!(
             "process tree of {root_pid}: {}{}",
-            String::from_utf8_lossy(&output.stdout).trim(),
-            String::from_utf8_lossy(&output.stderr).trim()
+            output.stdout.trim(),
+            output.stderr.trim()
         ),
         Err(error) => format!("process tree of {root_pid}: query failed: {error}"),
     }
+}
+
+/// Kill switch for one diagnostic or cleanup helper process (a `PowerShell` query, a
+/// `taskkill`): a cold `PowerShell` start with a CIM query takes seconds, never this long.
+pub(crate) const DIAGNOSTIC_QUERY_KILL_SWITCH: Duration = Duration::from_secs(30);
+
+/// What a helper process run by [`bounded_output`] wrote and how it exited.
+pub(crate) struct BoundedOutput {
+    pub(crate) status: ExitStatus,
+    pub(crate) stdout: String,
+    pub(crate) stderr: String,
+}
+
+/// Runs `command` with null input and piped output until the kill switch `deadline`:
+/// a stalled helper (a hung CIM provider, a blocked console) is killed and reported,
+/// so a diagnostic never hangs the cell it reports on. Each pipe is read on its own
+/// thread, so neither can fill and stall the helper while the other is read.
+pub(crate) fn bounded_output(
+    command: &mut Command,
+    deadline: Instant,
+) -> Result<BoundedOutput, String> {
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("start: {error}"))?;
+    let stdout = child.stdout.take().map(read_pipe_on_thread);
+    let stderr = child.stderr.take().map(read_pipe_on_thread);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => {
+                thread::park_timeout(Duration::from_millis(10));
+            }
+            outcome => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(match outcome {
+                    Err(error) => format!("observe exit: {error}"),
+                    _ => "still running at its kill switch; killed".to_owned(),
+                });
+            }
+        }
+    };
+    // The helper exited; a grandchild that inherited a pipe could still hold it.
+    let drained = Instant::now() + PIPE_DRAIN_KILL_SWITCH;
+    Ok(BoundedOutput {
+        status,
+        stdout: stdout.map_or_else(String::new, |reader| pipe_text_by(&reader, drained)),
+        stderr: stderr.map_or_else(String::new, |reader| pipe_text_by(&reader, drained)),
+    })
+}
+
+/// Kill switch for reading a pipe to its end once its process has exited or been killed.
+pub(crate) const PIPE_DRAIN_KILL_SWITCH: Duration = Duration::from_secs(10);
+
+/// Reads `pipe` to its end on its own thread; the receiver yields the text then.
+pub(crate) fn read_pipe_on_thread(mut pipe: impl Read + Send + 'static) -> Receiver<String> {
+    let (text_tx, text_rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let read = pipe.read_to_end(&mut bytes);
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        let text = match read {
+            Ok(_) => text,
+            Err(error) => format!("{text}\n<pipe read failed: {error}>"),
+        };
+        let _ = text_tx.send(text);
+    });
+    text_rx
+}
+
+/// The text of a pipe [`read_pipe_on_thread`] reads, or a marker when the pipe is still
+/// open at `deadline` (a live process holds its write end). The reader thread is then
+/// left blocked on the pipe; it ends when the last write end closes.
+pub(crate) fn pipe_text_by(reader: &Receiver<String>, deadline: Instant) -> String {
+    reader
+        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        .unwrap_or_else(|_| "<pipe still open at its kill switch>".to_owned())
 }
 
 pub(crate) fn process_exists(pid: u32) -> bool {

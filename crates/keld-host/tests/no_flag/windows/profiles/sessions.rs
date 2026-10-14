@@ -17,8 +17,9 @@ use crate::PRODUCT_DEADLINE;
 use crate::support::control::{accept_ready_generation, read_control_line};
 use crate::support::installed::{INSTALLER_ENV, InstalledApp, SIGNED_HOST_A_P1, fixture_env};
 use crate::support::process::{
-    ProcessTimes, open_process_for_wait, process_exists, process_times, wait_child,
-    wait_for_process_signal,
+    DIAGNOSTIC_QUERY_KILL_SWITCH, PIPE_DRAIN_KILL_SWITCH, ProcessTimes, bounded_output,
+    open_process_for_wait, pipe_text_by, process_exists, process_times, read_pipe_on_thread,
+    wait_child, wait_for_process_signal,
 };
 use crate::support::product::ProductFixture;
 use crate::support::profile_run::{ProfileTestRoot, assert_profile_test_root_feature};
@@ -199,20 +200,30 @@ impl Drop for SeamedHost {
     /// Harness cleanup after a failed assertion only: every passing path has already
     /// observed the orderly exit through `finish`. A host left alive would hold the
     /// runner's inherited output pipe open past the test, so it is terminated and
-    /// reported, never counted as product cleanup.
+    /// reported, never counted as product cleanup. The host's whole process tree is
+    /// terminated first (`taskkill /T`, which needs the live host to find its
+    /// descendants), and each output pipe is read on its own thread under a kill
+    /// switch, because a descendant that inherited a pipe can hold it open past the
+    /// host and the report must not hang the failing cell.
     fn drop(&mut self) {
         if matches!(self.host.try_wait(), Ok(None)) {
+            let stdout = self.host.stdout.take().map(read_pipe_on_thread);
+            let stderr = self.host.stderr.take().map(read_pipe_on_thread);
+            // The child handle keeps the PID from reuse until the wait below.
+            let tree_kill = bounded_output(
+                Command::new("taskkill.exe").args(["/PID", &self.pid.to_string(), "/T", "/F"]),
+                Instant::now() + DIAGNOSTIC_QUERY_KILL_SWITCH,
+            )
+            .map_or_else(
+                |error| format!("taskkill failed: {error}"),
+                |output| format!("taskkill {}: {}", output.status, output.stdout.trim()),
+            );
             let _ = self.host.kill();
             let _ = self.host.wait();
             // Diagnostics for the failed assertion: the host's own output, bounded.
-            let mut stdout = String::new();
-            let mut stderr = String::new();
-            if let Some(mut pipe) = self.host.stdout.take() {
-                let _ = pipe.read_to_string(&mut stdout);
-            }
-            if let Some(mut pipe) = self.host.stderr.take() {
-                let _ = pipe.read_to_string(&mut stderr);
-            }
+            let drained = Instant::now() + PIPE_DRAIN_KILL_SWITCH;
+            let stdout = stdout.map_or_else(String::new, |reader| pipe_text_by(&reader, drained));
+            let stderr = stderr.map_or_else(String::new, |reader| pipe_text_by(&reader, drained));
             let tail = |text: &str| {
                 text.lines()
                     .rev()
@@ -224,7 +235,7 @@ impl Drop for SeamedHost {
                     .join("\n")
             };
             eprintln!(
-                "KELD_KEL270_HOST_KILLED_ON_DROP pid={}\nhost stdout (tail):\n{}\nhost stderr (tail):\n{}",
+                "KELD_KEL270_HOST_KILLED_ON_DROP pid={} {tree_kill}\nhost stdout (tail):\n{}\nhost stderr (tail):\n{}",
                 self.pid,
                 tail(&stdout),
                 tail(&stderr)

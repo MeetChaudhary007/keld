@@ -19,7 +19,8 @@ use crate::PRODUCT_DEADLINE;
 use crate::support::control::{accept_ready_generation, try_read_control_line};
 use crate::support::installed::{INSTALLER_ENV, InstalledApp, SIGNED_HOST_A_P1, fixture_env};
 use crate::support::process::{
-    open_process_for_wait, process_times, process_tree_report, wait_for_process_signal,
+    DIAGNOSTIC_QUERY_KILL_SWITCH, PIPE_DRAIN_KILL_SWITCH, bounded_output, open_process_for_wait,
+    pipe_text_by, process_times, process_tree_report, read_pipe_on_thread, wait_for_process_signal,
 };
 use crate::support::product::ProductFixture;
 use crate::support::profile_run::{ProfileTestRoot, assert_profile_test_root_feature};
@@ -172,6 +173,59 @@ fn elapsed_ms(since: Instant) -> u64 {
     u64::try_from(since.elapsed().as_millis()).expect("elapsed ms fits u64")
 }
 
+/// Harness self-test for the cells' diagnostics (PR #722 review finding P3): a helper
+/// process that stalls is killed at its kill switch and reported, a prompt one is read
+/// in full, and a pipe whose write end outlives the reader's kill switch yields a
+/// marker instead of hanging the report.
+#[test]
+fn handover_diagnostics_are_bounded() {
+    let started = Instant::now();
+    let stalled = bounded_output(
+        Command::new("powershell.exe").args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Start-Sleep -Seconds 120",
+        ]),
+        Instant::now() + Duration::from_secs(2),
+    );
+    let stalled_for = started.elapsed();
+    assert!(
+        matches!(&stalled, Err(error) if error.contains("kill switch")),
+        "a stalled helper is reported: {:?}",
+        stalled.as_ref().map(|output| output.stdout.clone())
+    );
+    assert!(
+        stalled_for < DIAGNOSTIC_QUERY_KILL_SWITCH,
+        "the stalled helper ended at its kill switch, not its own end: {stalled_for:?}"
+    );
+
+    let prompt = bounded_output(
+        Command::new("powershell.exe").args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "'ready'",
+        ]),
+        Instant::now() + DIAGNOSTIC_QUERY_KILL_SWITCH,
+    )
+    .expect("a prompt helper");
+    assert!(prompt.status.success(), "{}", prompt.stderr);
+    assert_eq!(prompt.stdout.trim(), "ready");
+
+    let (pipe, write_end) = std::io::pipe().expect("anonymous pipe");
+    let text = read_pipe_on_thread(pipe);
+    assert_eq!(
+        pipe_text_by(&text, Instant::now() + Duration::from_millis(200)),
+        "<pipe still open at its kill switch>"
+    );
+    drop(write_end);
+    assert_eq!(
+        pipe_text_by(&text, Instant::now() + PIPE_DRAIN_KILL_SWITCH),
+        ""
+    );
+}
+
 /// The host's main window handle as the OS reports it now, `0` when it has none.
 fn host_main_window(pid: u32) -> u64 {
     host_main_window_with_title(pid).0
@@ -179,19 +233,19 @@ fn host_main_window(pid: u32) -> u64 {
 
 /// The host's main window handle and title as the OS reports them now.
 fn host_main_window_with_title(pid: u32) -> (u64, String) {
-    let output = Command::new("powershell.exe")
-        .args([
+    let output = bounded_output(
+        Command::new("powershell.exe").args([
             "-NoProfile",
             "-NonInteractive",
             "-Command",
             &format!(
                 "$p=Get-Process -Id {pid} -ErrorAction SilentlyContinue; if ($p) {{ [string]([uint64]$p.MainWindowHandle.ToInt64()) + '|' + $p.MainWindowTitle }} else {{ '0|' }}"
             ),
-        ])
-        .output()
-        .expect("query host main window");
-    let text = String::from_utf8_lossy(&output.stdout);
-    let text = text.trim();
+        ]),
+        Instant::now() + DIAGNOSTIC_QUERY_KILL_SWITCH,
+    )
+    .unwrap_or_else(|error| panic!("query host main window: {error}"));
+    let text = output.stdout.trim();
     let (handle, title) = text.split_once('|').unwrap_or(("0", ""));
     (handle.parse().unwrap_or(0), title.to_owned())
 }
