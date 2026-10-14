@@ -1300,6 +1300,52 @@ fn local_anchor_close_stops_active_owner_without_fallback_or_revoking_accounts()
 }
 
 #[test]
+fn accepted_as_context_callback_error_does_not_replay_loopback() {
+    let (mut owner, port, manifest, account) = anchor_domain_fixture();
+    let operation = match owner.handle_manifest_request(
+        &manifest,
+        Principal::AppProcess,
+        AuthRequest::Begin {
+            provider: "entra-common".to_owned(),
+            scopes: None,
+            login_hint: None,
+        },
+        || Some(()),
+    ) {
+        HandleState::Pending {
+            operation,
+            admission: Some(()),
+        } => operation,
+        other => panic!("actual granted Begin: {other:?}"),
+    };
+    assert_eq!(owner.poll(&operation, |_| {}), Progress::Pending);
+    let mut events = Vec::new();
+    super::super::macos_session::test_deliver_callback_error(&port, &operation, 2);
+    assert_eq!(
+        owner.poll(&operation, |event| events.push(event)),
+        Progress::Drained
+    );
+    assert_eq!(events.len(), 1);
+    let error = events
+        .pop()
+        .expect("one terminal callback error")
+        .response
+        .into_response()
+        .expect_err("presentation completion error cannot be a successful login");
+    assert_eq!(
+        error.code, "KELD-AUTH-017",
+        "a callback after session start must not enter the trapped loopback fallback"
+    );
+    assert!(owner.registry.admission_open());
+    assert_eq!(
+        owner.registry.issuer_for(&account),
+        Some("https://login.microsoftonline.com/common")
+    );
+    assert!(owner.jobs.is_empty());
+    assert_eq!(owner.next_operation, 1);
+}
+
+#[test]
 fn host_tail_closes_auth_and_native_admission_permanently() {
     use super::super::macos_session::{AsMainStop, test_apply_main_stop};
     let (mut owner, port, manifest, _) = anchor_domain_fixture();

@@ -939,8 +939,11 @@ Only AS pre-start presentation unavailability or an actual API/start failure
 may start a fresh loopback flow with its own redirect, state and PKCE custody.
 An absent or retiring initial anchor is a pre-start unavailable presentation
 context; it does not turn a completed or canceled login into a fresh attempt.
-User cancellation, provider rejection,
-and callback-correlation failure do not trigger fallback. `fixedRedirect`
+AS completion errors for a missing or invalid presentation context (SDK codes
+2/3) are terminal after the callback and return `KELD-AUTH-017`; they MUST NOT
+replay through loopback. User cancellation,
+provider rejection, and callback-correlation failure do not trigger fallback.
+`fixedRedirect`
 retains its existing fixed-port HTTP loopback meaning. Static TypeScript
 configuration accepts a string literal; boot omission/null remain absence,
 and the shared Native DTO still rejects unknown inner fields and non-string
@@ -1304,6 +1307,7 @@ compact `KELD-AUTH001`; that spelling is withdrawn.
 | `KELD-AUTH-014` | Silent acquisition needs interaction (`UserInteractionRequired` / `0xCAA10001` / `interaction_required`) | Windows rung 1, `auth.token`; 241 §4.3/§4.4 `[fact]` | That the caller must run a fresh interactive `auth.begin`; MUST NOT auto-escalate to a UI |
 | `KELD-AUTH-015` | The resolved provider profile has no `clientId` configured (D14), or its present `asRedirect` is invalid for the selected client/profile. **Post-Allow**, so neither is a pre-Allow discriminator | §4 profile table, T4 return binding, AC14(c) | Name the profile's `keld.config.ts` `auth` section: add a missing `clientId`, or correct the invalid `asRedirect` registration and rebuild. **No** account or session detail |
 | `KELD-AUTH-016` | Local authentication processing failed in entropy, encoding, a checked processing bound/conversion, clock, or internal flow state, without an existing `KELD-AUTH-001`–`015` condition | T3 implementation extension; the finite Native producer union has independent source review under §8 recorded delegated approval and is recorded with the Native source and canonical registry in the same PR. Runtime qualification is predicate-specific | A static resource-free local-processing condition and its corrective action, with no automatic retry; no raw OS/provider text, credential, account id, issuer or request value; never an unresolved-account discriminator |
+| `KELD-AUTH-017` | macOS reports a missing or invalid presentation context through the AS completion callback after an authentication attempt has started | T4 `ASWebAuthenticationSession` callback; terminal result, never a fresh loopback attempt | Ensure the Keld window remains available and start a new user-initiated sign-in; no raw OS error text and no automatic retry |
 
 **T3 implementation decision — local-processing error (reviewed source; runtime qualification scoped).**
 The AUTH016 row is a bounded implementation extension to AUTH001–015. The same
@@ -1677,6 +1681,7 @@ No permanent refresh lifetimes. No durable refresh custody in v0. This spec
 | 11b (D17 canonical key) | unit | the single-flight key is table-driven over pairs that MUST coalesce and pairs that MUST NOT. Coalesce: `["b","a"]` vs `["a","b"]` (order), `["a","a","b"]` vs `["a","b"]` (duplicates), absent vs `[]` (absent ≡ empty). Do **not** coalesce: `["a"]` vs `["A"]` (case-sensitive per RFC 6749 §3.3), `["a"]` vs `["a","b"]` (superset), same scopes under a different `account_id`. Negative control: an implementation keyed on the raw sequence fails the order and duplicate rows, and one that lowercases fails the case row — so the test distinguishes the rule from both neighbouring rules |
 | 11c (D17 pass-through) | integration | a `Token` request whose `scopes` exceed the establishing `begin`'s `granted_scopes` is **not** refused by the host: assert the outbound token-endpoint request carries the requested set byte-for-byte, that no host-side comparison against `granted_scopes` occurs, and that an IdP refusal surfaces as `KELD-AUTH-013` carrying the provider's error. Assert `AuthResponse::Token` has no scope field, pinning the §4 non-claim rather than leaving it prose |
 | 12 | unit | cancel-class result → non-terminal typed error; no automatic re-invocation |
+| T4 AS callback context errors | Native/controller integration | After the AS completion callback reports presentation-context-not-provided or invalid (SDK codes 2/3), return `KELD-AUTH-017` and never enter the fresh T3 loopback rung. Negative control: classifying either callback result as pre-start `StartUnavailable` must fail by reaching the loopback fallback trap. Keep pre-start missing-anchor and actual `start()==false` cases on their existing fallback path. |
 
 Bind port 0; await conditions; no fixed ports; no wall-clock sleeps
 (`.agents/testing.md`).

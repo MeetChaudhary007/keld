@@ -50,7 +50,7 @@ pub enum AsUnavailable {
     CallbackApi,
     /// The actual SDK start returned false.
     StartRefused,
-    /// No live context was available before start, or the SDK reported it invalid.
+    /// No live presentation context was available before the SDK start call.
     PresentationContext,
 }
 /// Owned callback text. Its bytes remain private to Native correlation.
@@ -71,6 +71,8 @@ pub enum AsOutcome {
     CallbackUri(AsCallbackUri),
     /// Exact AS error-domain/canceledLogin result, never automatic retry.
     CanceledLogin,
+    /// AS completion reported a missing or invalid presentation context; never retry via T3.
+    PresentationContextFailed,
     /// Pre-start context unavailability or API/start refusal; not an absent configuration binding.
     StartUnavailable(AsUnavailable),
     /// Host stop/cancellation, whose cause remains owned by the Native job.
@@ -83,6 +85,7 @@ impl fmt::Debug for AsOutcome {
         match self {
             Self::CallbackUri(_) => f.write_str("CallbackUri([redacted])"),
             Self::CanceledLogin => f.write_str("CanceledLogin"),
+            Self::PresentationContextFailed => f.write_str("PresentationContextFailed"),
             Self::StartUnavailable(reason) => {
                 f.debug_tuple("StartUnavailable").field(reason).finish()
             }
@@ -925,12 +928,16 @@ fn callback_value(url: Option<&NSURL>, error: Option<&NSError>) -> AsOutcome {
             if !error.domain().isEqualToString(expected_domain) {
                 return AsOutcome::Fault(AsFault::CallbackProtocol);
             }
-            match error.code() {
-                1 => AsOutcome::CanceledLogin,
-                2 | 3 => AsOutcome::StartUnavailable(AsUnavailable::PresentationContext),
-                _ => AsOutcome::Fault(AsFault::CallbackProtocol),
-            }
+            callback_error_outcome(error.code())
         }
+        _ => AsOutcome::Fault(AsFault::CallbackProtocol),
+    }
+}
+
+fn callback_error_outcome(code: isize) -> AsOutcome {
+    match code {
+        1 => AsOutcome::CanceledLogin,
+        2 | 3 => AsOutcome::PresentationContextFailed,
         _ => AsOutcome::Fault(AsFault::CallbackProtocol),
     }
 }
@@ -1062,6 +1069,37 @@ pub(super) fn test_deliver_canceled_login(port: &AsWorkerPort, operation: &Opera
 }
 
 #[cfg(test)]
+pub(super) fn test_deliver_callback_error(
+    port: &AsWorkerPort,
+    operation: &OperationId,
+    code: isize,
+) {
+    let context = port
+        .0
+        .slots
+        .try_lock()
+        .expect("primitive submitted queue")
+        .iter()
+        .find(|slot| &slot.operation == operation)
+        .cloned()
+        .expect("actual admitted operation context");
+    let mut state = context.try_lock().expect("actual request claim guard");
+    assert!(!state.claimed);
+    assert!(state.request.take().is_some());
+    state.claimed = true;
+    drop(state);
+    let execution = Execution::enter(Arc::clone(&context))
+        .expect("accepted session completion callback execution");
+    execution.publish(callback_error_outcome(code));
+    drop(execution);
+    let mut entry = MainEntry {
+        context,
+        roots: None,
+    };
+    assert!(entry.stop());
+}
+
+#[cfg(test)]
 pub(super) fn test_apply_main_stop(port: &AsWorkerPort, stop: AsMainStop) -> bool {
     port.0.apply_main_stop(stop);
     let contexts = port
@@ -1176,4 +1214,26 @@ pub(super) fn test_assert_unclaimed_host_priority(port: &AsWorkerPort, operation
         state.outcome.as_ref(),
         Some(AsOutcome::HostStopped)
     ));
+}
+
+#[cfg(test)]
+mod callback_error_tests {
+    use super::{AsOutcome, callback_error_outcome};
+
+    #[test]
+    fn accepted_session_presentation_errors_are_not_prestart_fallbacks() {
+        assert!(matches!(
+            callback_error_outcome(1),
+            AsOutcome::CanceledLogin
+        ));
+        for code in [2_isize, 3] {
+            assert!(
+                matches!(
+                    callback_error_outcome(code),
+                    AsOutcome::PresentationContextFailed
+                ),
+                "AS completion error {code} must not replay a fresh loopback login"
+            );
+        }
+    }
 }

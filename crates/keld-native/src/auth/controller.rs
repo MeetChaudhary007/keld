@@ -954,6 +954,9 @@ impl AuthBroker {
             AsOutcome::CanceledLogin => {
                 Self::finish_begin_error(id, job, AuthError::AsCanceled.wire(), emit)
             }
+            AsOutcome::PresentationContextFailed => {
+                Self::finish_begin_error(id, job, AuthError::AsPresentationFailed.wire(), emit)
+            }
             AsOutcome::HostStopped => Self::finish_begin_error(
                 id,
                 job,

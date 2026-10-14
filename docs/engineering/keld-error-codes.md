@@ -1184,9 +1184,18 @@ match the crate that already emits the code. Do not invent a third spelling.
 
 - crate: keld-native
 - module: auth
-- message: Authentication failed in local entropy, encoding, processing-bound, clock or internal-state processing; no existing AUTH001–015 condition applies.
-- fix: Start a new user-initiated auth.begin; if the failure persists, report the static Keld diagnostic. Keep message/fix resource-free and constant; do not include credentials, account ids, issuer/request values, provider text or raw OS errors.
-- status: Reviewed T3 local source contract, recorded in the same PR under §8 delegated approval. Runtime evidence is predicate-specific; unreachable/target conditions remain unqualified. Never use for unresolved/stale account or AC13(d).
+- message: Authentication failed during local entropy, encoding, processing-bound, clock or internal-state processing; no existing AUTH001–015 condition applies.
+- fix: Start a new user-initiated auth.begin. If the failure persists, report the static Keld diagnostic. Keep message/fix resource-free and constant; do not include credentials, account ids, issuer/request values, provider text or raw OS errors.
+- status: T3 local-source contract; runtime evidence is predicate-specific and exact-source-bound. Never use for unresolved/stale account or AC13(d).
+
+
+## KELD-AUTH-017
+
+- crate: keld-native
+- module: auth
+- message: macOS reported a missing or invalid presentation context through the AS completion callback after the authentication attempt started.
+- fix: Ensure the Keld window remains available and start a new user-initiated sign-in. Do not retry automatically, switch to loopback, or expose raw OS error text.
+- status: T4 terminal callback classification; source and route-specific macOS acceptance remain bound to the current PR evidence.
 
 ## KELD-AUTH-004
 
