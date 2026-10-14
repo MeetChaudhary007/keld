@@ -3326,11 +3326,13 @@ impl TestSessionSeam {
 /// teardown, as it awaited the loop's return before. A `LastWindowClosed` write that
 /// fails ends the session at once under the handover cause (fail closed, no D). The
 /// instants of the loop's return and of the forced claim join the session's
-/// [`HandoverClock`].
+/// [`HandoverClock`]. `quit_deadline` is D: [`HANDOVER_QUIT_DEADLINE`] in the host; the
+/// unit cells pass a shorter one.
 #[cfg(any(target_os = "linux", windows))]
 fn complete_profile_handover(
     router: &PrimaryRouterHandle,
     shutdown: &SessionShutdownState,
+    quit_deadline: Duration,
 ) -> Result<(), HostAppError> {
     let clock = &shutdown.handover_clock;
     let _ = clock.ui_returned.set(Instant::now());
@@ -3341,7 +3343,7 @@ fn complete_profile_handover(
         .copied()
         .unwrap_or_else(Instant::now);
     let deadline = if written.is_ok() {
-        written_at + HANDOVER_QUIT_DEADLINE
+        written_at + quit_deadline
     } else {
         Instant::now()
     };
@@ -3731,7 +3733,9 @@ fn run_direct_app_session(
     // under a handover is a failed tail: no step follows, the session fails.
     let ended_by_handover = shutdown.handover_requested_guarded();
     let handover_result = match (&window_result, ended_by_handover) {
-        (Ok(()), true) => complete_profile_handover(&router.handle(), shutdown),
+        (Ok(()), true) => {
+            complete_profile_handover(&router.handle(), shutdown, HANDOVER_QUIT_DEADLINE)
+        }
         _ => Ok(()),
     };
     #[cfg(all(debug_assertions, windows))]
@@ -8756,6 +8760,11 @@ mod tests {
         assert!(handle.shutdown.is_running(), "the session still runs");
         assert!(window_rx.try_recv().is_err(), "nothing reaches the loop");
     }
+
+    /// When the quit deadline D starts and what keeps a `Quit` admitted inside it its
+    /// claim (KEL-53 §4 "Profile handover", steps 3b and 3c).
+    #[cfg(any(target_os = "linux", windows))]
+    mod handover_quit_deadline;
 
     /// The lease fact comes from the session's lease itself: attaching a dev lease's
     /// tail to the router makes the handover refuse, and a session without a lease
