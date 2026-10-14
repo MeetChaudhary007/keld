@@ -1813,7 +1813,7 @@ health window (`crates/keld-ipc/src/attempt/window.rs:47-55`, the `EndOfFile` re
 thirty runs idle and thirty under load, as the S6b3 flake audit ran, with minimum,
 median and maximum recorded. G is the larger of 2 s and four times the observed
 maximum, rounded up to the next 500 ms. The record (machine, OS build, host build,
-harness commit and the sixty samples) is the keld-benches artifact that the S6c pull
+harness commit and the sixty samples) is the keld-benches artifact that the S6c2d pull
 request names with its hash, and the constant joins `ATTEMPT_HEALTH_WINDOW` in the
 `keld-ipc` attempt module (`crates/keld-ipc/src/attempt/window.rs:18-20`) as the margin
 that the owner passes to `await_health_window`
@@ -1823,8 +1823,10 @@ rule errs large. The candidate reads `AK1` (`await_health_accepted`,
 `channel.rs:556-575`) under a deadline of `ATTEMPT_HEALTH_WINDOW` + G + 15 s from its
 own `AY1` send, the allowance covering the owner's durable `HealthAccepted` write and
 its `AK1` write; past it the candidate stays unarmed, as the sequence above says. The
-owner's other deadlines follow one rule, each at least four times the maximum that the
-S6c pull request measures on the same harness, with a floor: `AB1` after `AR1` (the
+owner's other deadlines follow one rule, each at least four times the maximum that its
+own pull request measures on the same harness (S6c2d for the claim, `AB1`, `AY1`, the
+close-wait and `AK1`; S6c2e for the census; S6c2a for the quit deadline D below; §6),
+with a floor: `AB1` after `AR1` (the
 candidate's image verification, claimant location and candidate-boot read), floor
 30 s; `AY1` after `AB1` (the candidate's Bun start, engine, window and navigation),
 floor 60 s; the accept close-wait (`accept`, `channel.rs:282-290`),
@@ -1835,7 +1837,7 @@ floor 60 s; the accept close-wait (`accept`, `channel.rs:282-290`),
 signaled. The landed claim loop ends only at its deadline or on a cancel of the pipe
 wait (`claim.rs:141-168`; the `Cancelled` outcome returns `ClaimDeadline` at
 `:156-157`), and the canceller (`crates/keld-ipc/src/windows_named_pipe.rs:114`, `:462`)
-is crate-private and not exposed by `accept_claim`, so S6c adds a watcher on the
+is crate-private and not exposed by `accept_claim`, so S6c2b adds a watcher on the
 retained launch handle (`WindowsLaunchedProcess::has_exited`,
 `crates/keld-runtime/src/windows_job.rs:1233`) that drives the attempt endpoint's
 canceller through a public `keld-ipc` seam, under the public-API gate (§6, §8); the
@@ -1845,15 +1847,26 @@ candidate that dies before it connects therefore ends the wait at once, and one 
 never connects ends it at the floor, after which the owner rolls back and restores
 ("Profile handover", *Rollback and restore*); and the quit deadline D of the
 handover's step 3b, the time the application has after `LastWindowClosed` to request
-`Quit`, at least four times the maximum that the S6c pull request measures for the
+`Quit`, at least four times the maximum that the S6c2a pull request measures for the
 reference application on the same harness, floor 10 s, because no landed deadline
 bounds that wait (the loop waits for the application's `Quit` without one,
-`mod.rs:2594-2607`; `HOST_ANSWER_BUDGET` and `APP_LINK_IO_DEADLINE` bound single
+`mod.rs:3350-3359`; `HOST_ANSWER_BUDGET` and `APP_LINK_IO_DEADLINE` bound single
 writes and reads, not the application's decision). D is measured on the reference
 application only; a third-party application's time to persist its state is unknown
-to Keld, so an application that takes longer than D to quit is force-ended, and S6c
+to Keld, so an application that takes longer than D to quit is force-ended, and S6c2a
 records D where application authors read it, at the `@keld/electron`
-`window-all-closed` mapping (`packages/@keld/electron/src/app.ts:69-70`). A candidate
+`window-all-closed` mapping (`packages/@keld/electron/src/app.ts:68-75`). D's record
+(S6c2a): the interval runs on the host's monotonic clock from the return of the
+`LastWindowClosed` write (`app_session.rs:5743-5755`) to the admission of the
+application's `Quit` frame (`app_session.rs:6463`), measured through the §7 h11 cell on
+the KEL-254/KEL-135 signed fixture host with the reference application
+(`crates/keld-host/tests/fixtures/t1b_harness.ts`), thirty runs idle and thirty under
+full-core load (sixteen busy-loop burners on sixteen logical cores, the F55 method);
+the sixty samples, the machine, the builds and the load method are the keld-benches
+artifact the S6c2a pull request names with its hash, and the constant
+`HANDOVER_QUIT_DEADLINE` beside the session causes in `app_session.rs` carries the
+statistic in its documentation. Measured maximum: 218.5 ms; four times it is below the
+floor, so D = 10 s. A candidate
 whose session fails
 before `Ready` sends `AF1` class 3 before it exits, so the owner reads a record rather
 than end of file wherever the candidate can still write one.
@@ -2005,30 +2018,42 @@ mints the identities, writing nothing
 (`crates/keld-update/src/windows_baseline/activate.rs:170-186`); (2) the owner creates
 and holds its endpoint and reads the descriptor back ("Candidate connect-back",
 *Order*); (3) the handover, a cooperative quit in three parts: (3a) the host ends its
-UI through the existing `Quit` command of the UI loop (`mod.rs:2568-2573`: `stopping`
+UI through the existing `Quit` command of the UI loop (`mod.rs:3321-3326`: `stopping`
 is committed, the views are dropped, the loop waits for the barrier, writes `idle` and
 releases the lease; the command's documentation widens from "the correlated Quit reply
-has been written" to "the session is ending", a doc change on a public item), and the
-router writes `LastWindowClosed` to the application (`app_session.rs:4633-4638`), which
-is true once the loop has returned; (3b) the host waits up to the quit deadline D of
-*Margin and deadlines* for the application's `Quit`, which the landed lifecycle-Quit
-handler admits by claiming the session cause (`app_session.rs:5275`) and answers with
-the reply, the quiesce and drain, the peer close, the link close and the guardian
-reap (`app_session.rs:5275-5338`); `finish_tail`'s UI step (`app_session.rs:5542-5547`),
-which today fails on the closed window-commands channel (`:5544-5546`), becomes a
-no-op once the UI loop has returned, a session-loop state that S6c records, under
-whichever cause the tail runs; (3c) only when D passes without a `Quit`, the host
-claims a second session cause and runs the forced tail of CLI lease loss
-(`app_session.rs:5341-5361`: accepted-shutdown preparation, quiesce and drain, link
-close, guardian reap) under that cause; the first claim wins (`claim_guarded` is one
-compare-and-swap from the running state, `app_session.rs:1731-1735`, and `begin_tail`
-is one-shot, `:1770-1772`): an application whose `Quit` claims the session before the
-deadline's claim is answered, and a `Quit` read after the forced claim returns
-without a reply (`:5278-5282`); then the router and the primary owner are shut down
-(`app_session.rs:2774-2775`). Both tails are landed; S6c admits the second cause in
-the forced tail's gate, which today admits only CLI lease loss
-(`app_session.rs:5342`), and the UI-ended no-op in `finish_tail`, and lists both in
-its scope (§5); no `AppWindowCommand` variant is added
+has been written" to "the session is ending", a doc change on a public item), and,
+once the loop has returned, the host itself writes `LastWindowClosed` to the
+application through the router's `signal_last_window_closed`
+(`app_session.rs:5743-5755`), the same write a window's close triggers
+(`app_session.rs:4486`), because the `Quit` command's path emits no `LastWindowClosed`
+(`mod.rs:3321-3326`; only a window's close does, `:3356-3359`); (3b) the host waits
+up to the quit deadline D of *Margin and deadlines*, counted from that write, for the
+application's `Quit`, which the landed lifecycle-Quit handler admits by claiming the
+session cause (`app_session.rs:6515`) and answers with the reply, the quiesce and
+drain, the peer close, the link close and the guardian reap
+(`app_session.rs:6463-6607`); `finish_tail`'s UI step (`app_session.rs:7048-7064`),
+which before S6c2a failed on the closed window-commands channel (`:7058-7063`), is a
+no-op once a handover has ended the UI loop, under whichever cause the tail runs; that
+session fact is set under the session's transition guard before the handover's `Quit`
+is sent and read under the same guard by `finish_tail`, because the loop's wake bridge
+drops its command receiver on the first terminal command (`mod.rs:3455-3463`), so a
+`Quit` the application sends after the loop returned cannot race it; (3c) only when D
+passes without a `Quit`, the host claims the handover cause, the session's third
+(`SESSION_HANDOVER`, beside the lifecycle-Quit and CLI-lease-loss causes,
+`app_session.rs:166-175`), and runs the forced tail of CLI lease loss
+(`app_session.rs:6663-6740`: accepted-shutdown preparation, quiesce and drain, link
+close, guardian reap) under that cause on the thread that claimed it, the main thread
+(`complete_profile_handover`, `app_session.rs:3279-3312`; the bounded wait and the
+claim under one guard hold, `await_quit_or_claim_handover`, `:2223-2241`); the first
+claim wins (`claim_guarded` is one compare-and-swap from the running state,
+`app_session.rs:2285-2287`, and `begin_tail` is one-shot, `:2344-2346`): an application
+whose `Quit` claims the session before the deadline's claim is answered, and a `Quit`
+read after the forced claim returns without a reply (`:6481-6489`); then the router
+and the primary owner are shut down (`app_session.rs:3700-3701`), after the claimant's
+tail has ended, which the main thread awaits as it awaited the loop's return before.
+Both tails are landed; S6c2a admits the handover cause in the forced tail's gate, which
+before admitted only CLI lease loss (`app_session.rs:6665`), and the UI-ended no-op in
+`finish_tail`, and lists both in its scope (§5); no `AppWindowCommand` variant is added
 (`crates/keld-wv/src/engine.rs:91-96`). Rejected: a new
 `CloseAppWindows` command that keeps the loop alive windowless until the application's
 `Quit`, which adds a public variant and a live loop with no window for the same
@@ -2075,8 +2100,9 @@ second, shorter gap. During the handover gap a manual launch of the app refuses 
 `WriterActive` until the restored session holds `profile.lock`, and with
 `ProfileInUse` at its own engine after that, because the writer lease is released only
 after that acquisition (*Rollback and restore*); no launch races the restore for the
-profile. The gap's length is measured by the S6c pull request and not promised here;
-the barrier's own bound is PR #658's. Foreground and focus restoration for the new
+profile. The gap's length is measured by S6c2e, through the real host coordinator, and
+not promised here (S6c2a records only the seam-driven gap between two sessions of one
+host, §7 h8); the barrier's own bound is PR #658's. Foreground and focus restoration for the new
 window are not specified by this amendment (§10).
 
 *Rollback and restore.* On the rollback path the owner proceeds in this order, each
@@ -2946,29 +2972,34 @@ Implement in:
 - landed-code changes in `keld-core`, `keld-wv` and `keld-host` (slice S6c; "Profile
   handover"; "Candidate connect-back", *Health sequence* and *Margin and deadlines*;
   "Candidate release after commit"):
-  - `run_app_direct` (`crates/keld-core/src/app_session.rs:2543-2548`) becomes a loop
+  - `run_app_direct` (`crates/keld-core/src/app_session.rs:3387`) becomes a loop
     of application sessions in one process: a session ends by the user's Quit, a fatal,
     CLI lease loss or the handover; after a handover the main thread runs the
     coordinator (launch, claim, health, resolution), then either the committed exit
     path or the restore (R1 to R5 of "Profile handover": the restore's engine is
     constructed before `roll_back`, then the Bun start, the router and the window).
-    The handover is the cooperative quit of step 3: the existing `Quit` command ends
-    the UI (`crates/keld-wv/src/webview2/mod.rs:2568-2573`; its documentation widens to
-    the host-initiated session end), `LastWindowClosed` is written
-    (`app_session.rs:4633-4638`), the application's `Quit` is admitted and answered by
-    the landed lifecycle-Quit handler (`app_session.rs:5275-5338`), and past the quit
-    deadline D a second session cause runs the CLI-lease-loss tail
-    (`app_session.rs:5341-5361`). Two landed tails change: the forced tail's gate
-    admits the handover cause beside CLI lease loss (`app_session.rs:5342`), and
-    `finish_tail`'s UI step, which today fails on the closed window-commands channel
-    (`:5544-5546`), is a no-op once the UI loop has returned, under whichever cause
-    the tail runs. The claim wait is bounded by the deadline and by the launch
+    The handover is the cooperative quit of step 3: the router's crate-private
+    `request_handover` (`app_session.rs:5766-5776`; S6c2a; the entry the coordinator
+    calls) sends the existing
+    `Quit` command, which ends the UI (`crates/keld-wv/src/webview2/mod.rs:3321-3326`;
+    its documentation widens to the host-initiated session end) and emits no
+    `LastWindowClosed`, so once the loop has returned the main thread writes
+    `LastWindowClosed` itself through `signal_last_window_closed`
+    (`app_session.rs:5743-5755`); the application's `Quit` is admitted and answered
+    by the landed lifecycle-Quit handler (`app_session.rs:6463-6607`), and past the
+    quit deadline D the handover cause `SESSION_HANDOVER` (`app_session.rs:166-175`;
+    S6c2a) runs the CLI-lease-loss tail (`app_session.rs:6663-6740`) on the main
+    thread. Two landed tails change (S6c2a): the forced tail's gate admits the
+    handover cause beside CLI lease loss (`app_session.rs:6665`), and `finish_tail`'s
+    UI step, which before failed on the closed window-commands channel
+    (`:7058-7063`), is a no-op once a handover has ended the UI loop, under whichever
+    cause the tail runs. The claim wait is bounded by the deadline and by the launch
     handle: a watcher on `WindowsLaunchedProcess::has_exited`
     (`crates/keld-runtime/src/windows_job.rs:1233`) drives the attempt endpoint's
     canceller (`crates/keld-ipc/src/windows_named_pipe.rs:114`, `:462`, crate-private
-    today) through a public `keld-ipc` seam; no FFI call and no crate is added; no
-    `AppWindowCommand` variant is added (`crates/keld-wv/src/engine.rs:91-96`), and
-    `WebView2Engine::new` (`crates/keld-wv/src/webview2/mod.rs:2235-2244`) is
+    today) through a public `keld-ipc` seam (S6c2b); no FFI call and no crate is
+    added; no `AppWindowCommand` variant is added (`crates/keld-wv/src/engine.rs:91-96`),
+    and `WebView2Engine::new` (`crates/keld-wv/src/webview2/mod.rs:2235-2244`) is
     documented as constructible again on the main thread after a previous engine's
     session ended, which the two-sessions cell proves. The loop keeps per process the
     boot selection, the installed version-tree pin, the profile mode selected at boot,
@@ -2977,11 +3008,16 @@ Implement in:
     its guard snapshot filesystem state, which `GuardSnapshot::prepare_next_session`
     prepares before the next session's resources ("Profile handover", *Rollback and
     restore*). The post-session decision is one pure function: another session
-    follows only an `Ok` session under the lifecycle-Quit cause that a requester asked
-    to follow, so without a requester the loop runs exactly one session. In S6c1 the
-    only requester is the debug-only `KELD_TEST_WINDOWS_SECOND_SESSION` seam
-    (`cfg(all(debug_assertions, windows))`, refused under a dev lease, removed from the
-    Bun child's environment). S6c2 adds the coordinator's restore as a requester;
+    follows only an `Ok` session that a requester asked to follow, under the
+    lifecycle-Quit cause or, when the session's result carries the fact that a
+    handover ended it, under either of the handover's causes (S6c2a; the fact is never
+    inferred from the cause), so without a requester the loop runs exactly one
+    session. In S6c1 the only requester is the debug-only
+    `KELD_TEST_WINDOWS_SECOND_SESSION` seam (`cfg(all(debug_assertions, windows))`,
+    refused under a dev lease, removed from the Bun child's environment); S6c2a adds
+    `KELD_TEST_WINDOWS_HANDOVER` in the same shape, which requests a handover right
+    after the first session's `Ready` and one more session after it, and the two
+    triggers refuse each other. S6c2f adds the coordinator's restore as a requester;
   - the coordinator: its inputs are the host's `ActivePackageSelection` (identity and
     publisher scope, `crates/keld-update/src/windows_baseline.rs:204-207`), the
     `ExpectedAppIdentity` read from its verified image, and the signed package; it
@@ -2996,8 +3032,12 @@ Implement in:
     (`crates/keld-update/src/windows_baseline.rs:69`), but the host's selection has no
     source for it; the boot route derives it from the executable's volume
     (`crates/keld-update/src/windows_baseline/locate.rs:204-206`) and
-    `ActivePackageSelection` does not expose it. The host's boot `VerifiedWindowsImage`
-    is retained for `begin_activation`;
+    `ActivePackageSelection` does not expose it, so S6c2e exposes that same derivation
+    as `ActivePackageSelection::volume_guid()`, the one volume source. The host's boot
+    `VerifiedWindowsImage` is retained for `begin_activation`, and S6c2e adds an
+    own-process reader of the `AttemptOwner`/`InitiatingLogon` inputs, which have no
+    production source today (`windows_job.rs` keeps `process_token_facts` private and
+    the `uac_token.rs` reader is test-only), without a new FFI call (§8);
   - candidate mode in `app_session.rs`, selected only by an accepted claim:
     `signal_ready` (`app_session.rs:4601-4631`) sends `AY1` and requests no arm; a
     `health_accepted` flag set by the `AK1` reader replaces `window_ready` in the two
@@ -3426,6 +3466,61 @@ Must not touch in Slice A:
           generation, so the per-session dispatch reset is exercised end to end. h5
           covers only the broker's re-preparation; a unit test covers the reset.
 
+        S6c2 lands as six PRs (a coordinator decision under the owner's delegation of
+        2026-10-08, recorded by the S6c2a pull request), one concern each, none
+        production-reachable before S6d because no production caller of the
+        coordinator exists; S6c2a, S6c2b and S6c2c are independent of each other:
+        - S6c2a: the handover cause (a third session cause), the forced-tail gate
+          admitting it, the `finish_tail` UI no-op once a handover ended the loop, the
+          crate-private `request_handover` entry, the extended loop rule with the
+          handover fact carried by the session result, the measured quit deadline D,
+          the widened `AppWindowCommand::Quit` documentation, the debug seam
+          `KELD_TEST_WINDOWS_HANDOVER=1` (a handover after the first session's `Ready`,
+          then one more session) and the t1b fixture's mode that ignores
+          `LastWindowClosed`; crates `keld-core`, `keld-wv` (the documentation and the
+          `profile-test-hooks` barrier fault fixture of h9), `keld-host` (tests);
+          gates: public API (the `Quit` documentation; the feature-gated
+          `TEST_WINDOWS_BARRIER_GRACE_EXPIRY_ENV` constant), permission model none;
+          cells h11, h12, the tail half of h9, h8's window census and seam-driven gap
+          (record only), the D record; depends on S6c1.
+        - S6c2b: a claim-wait canceller seam (`WindowsAttemptEndpoint::claim_canceller()`
+          wrapping the crate-private canceller) and a launch-handle watcher
+          (`wait_until_exited`); crates `keld-ipc`, `keld-runtime`; gate public API;
+          cells: the two mechanism halves of h13 with their negatives, against child
+          stand-ins; no dependency.
+        - S6c2c: candidate mode (`AY1` without an arm; `health_accepted` replacing
+          `window_ready` at the three predicate reads; `AF1` class 3; the `AK1`
+          deadline) and the rendezvous argument (exact shape; it precedes
+          `install_host_death_job`); crates `keld-host`, `keld-core`; gates public API
+          and permission model (the claimant side); cells: row 17, the candidate-side
+          cells of "8 (health sequence)", the claimant-binding and endpoint-squatting
+          cells with the real host as claimant; no dependency. It needs a debug seam
+          `KELD_TEST_ATTEMPT_OWNER_IMAGE`, modelled on
+          `KELD_TEST_LIFECYCLE_SERVER_IMAGE`, plus a seeded `AwaitingHealth` journal;
+          that seam is security-sensitive and needs an independent security review.
+        - S6c2d: G, the claim, `AB1`, `AY1`, the close-wait and `AK1` deadlines, each by
+          the rule of *Margin and deadlines*, and their keld-benches artifact; crates
+          `keld-ipc` (constants), the `keld-host` harness; gate public API (the
+          constants); cells: "8 (margin G and deadlines)" except the census deadline,
+          and the owner-side health cells; depends on S6c2c.
+        - S6c2e: the coordinator's accept path, its trust inputs
+          (`ActivePackageSelection::volume_guid()`, the own-process
+          `AttemptOwner`/`InitiatingLogon` reader, the retained `VerifiedWindowsImage`),
+          the census deadline and the evidence seam; crates `keld-core`,
+          `keld-update`, `keld-runtime`; gates public API and permission model (end to
+          end); cells h1, h2, h5, h7, h8, the journal half of h9, h10, r1, r4, r8, r11
+          (ten updates and the thread bound), r12, r5 (the census deadline), d6, the
+          row-20 gap launches, and the connect-back and coordinator-image cells through
+          the real host; depends on S6c2a to S6c2d. Its signed candidate fixture is a
+          `--ignored` selector in the keld-update tests
+          (`kel270_signed_candidate_package_fixture`) that produces the same
+          operator-signed `keld-host.exe` bytes at a higher version with a release and
+          manifest signed by the in-tree test key, run by keld-host tests as the
+          `INSTALL_SELECTOR` is.
+        - S6c2f: the rollback restore R1 to R5 as the loop's second requester, with both
+          S6c1 obligations above; crates `keld-core`, `keld-wv`; no new gate; cells h3,
+          h4 with its negative, h6 (H2 to H8b), h6b, h13 end to end; depends on S6c2e.
+
       Its "real host coordinator" cells run an
       operator-signed debug build (§5). Gates: public API (the coordinator entry, the
       `keld-host` argument contract, the session loop's handover cause with the two
@@ -3644,7 +3739,7 @@ Must not touch in Slice A:
 | 8, 9 (candidate release) | ("Candidate release after commit"; S6b3, in child processes that stand in for the host and the candidate; the S6c cells are named) r1, survival: a candidate committed through the §4 order is alive, with an unsignaled handle, after the old host has exited; both Jobs read back `0` before that exit; the next launch of the installation selects the committed version with no journal (S6c cell: through the real host coordinator); r2, one negative control per single clear: with only the attempt Job cleared, with only the host-death Job cleared, and with neither, the same candidate's handle is signaled after the host exits; r3, rollback: no clear runs, both Jobs read back `0x2000` until the host exits (the test reads the attempt Job through the landed `WindowsProcessJob::duplicate_lifecycle_keeper_handle` duplicate, `crates/keld-runtime/src/windows_job.rs:1611`, a non-inheritable handle with the `JOB_OBJECT_QUERY` and `JOB_OBJECT_TERMINATE` rights, taken while the Job is live and before `terminate_and_wait` consumed it; the duplicate is a separate handle to the same Job object and survives that call), and the candidate family is gone when the host's handle is signaled; r4, crash cuts, the host killed at W0a, W0b, W1, W2 and W4: at W0a and W0b the candidate is gone, the journal reads `HealthAccepted` and recovery refuses with `JournalBoundRecoveryRequired` before S6d; at W1, W2 and W4 the candidate is gone, no journal exists and the next launch selects the committed version; after W3 the candidate survives (S6c cell: the journal and recovery through the real host coordinator); r5, a straggler held past the deadline (seam-injected: a member outside the family whose handle stays unsignaled after termination, as the `pending_io_family` fixture holds one): `release_for_exit` returns the typed refusal, the host-death Job reads back `0x2000`, the host exits, the candidate is gone, and the next launch selects the committed version (S6c cell: the measured deadline); r6, a Bun descendant parked after the Bun primary exited, in the host-death Job and not in the attempt Job, is terminated by the census through its own handle, that handle is signaled before the clear, the witness counts it, and the candidate survives; r7, negative control without the census: a build that clears the host-death Job without it leaves that parked descendant alive after the host exits, so the row detects the gap; r8, negative control that releases before `complete()`: a build that calls `release_family` first and whose host is then killed before journal removal leaves a `HealthAccepted` journal beside a running candidate, and recovery refuses while it runs, so the row detects the gap (S6c cell: the journal and recovery through the real host coordinator); r9, KEL-78/T3 regressions: the landed `windows_host_death_job.rs` rows pass unchanged against the capability; dropping or forgetting the capability never closes the handle, so the Job still reads back `0x2000` and an abnormal host death still reaps the enrolled tree; a `compile_fail` doctest shows that the capability yields no raw handle and is not `Clone`; r10, the released candidate's own host-death Job: it is installed and nested (`nested_under_existing_job`), and the candidate's abnormal death reaps its own parked descendant after the old host is gone; r11, an outer Job and ten updates: a host bounded by an outer kill-on-close Job that the test holds releases its candidate, which still ends when the test closes that outer Job; ten in-session updates in a row, each released, with every assignment succeeding and the last candidate alive (S6c cell: through the real host coordinator); r12, a `complete()` that returns `Err` (seam-injected failed durable step): `release_family` is never called, both Jobs read back `0x2000` until the host exits, the candidate is gone with it, and the journal still reads `HealthAccepted`, as at W0b (S6c cell: through the real host coordinator) |
 | 8, 20 (profile handover) | ("Profile handover"; S6c, through the real host coordinator unless a cell names a child process) h1, order: at the candidate's launch the old host holds the writer lease and its endpoint, has written `idle`, holds no `profile.lock` opener and no WebView2 process, and no process of its Bun generation exists; the journal is absent until after `idle` and present only from step 4; h2, acquisition: the candidate's engine acquires the same identity's folder (the old host's control directory) and reaches `Ready`; a negative control that launches the candidate while the old host still holds its lease refuses with `ProfileInUse` and never reaches `Ready`; h3, the gap: a no-argument launch started between the old host's `idle` and the candidate's acquisition refuses with `WriterActive` before any profile open, and `profile.lock` has no opener but the old host and then the candidate; a negative control that releases the profile before the writer lease is taken lets that launch acquire `profile.lock`, so the row detects the gap; h4, rollback restore in the R1 to R5 order: after a candidate that fails health (`AF1` before `AB1`, `AF1` after `AB1`, end of file after `AY1`, and a launch handle signaled after `AY1`, one cell each) the old host ends the family, its restore engine acquires the folder through the quarantine and the exclusive-UDF probe (the candidate's record read `running` under a dead process) while the writer lease is still held, `roll_back` then removes the journal, and the fresh session of the rollback target reaches `Ready` in the same process (same process ID and creation time); a no-argument launch started between R2 and R3 refuses with `WriterActive`, one started after R4 refuses with `ProfileInUse`, and a negative control that runs `roll_back` before the restore's engine lets such a launch acquire `profile.lock` and fail the restore, so the row detects the race; h5, two sessions: a host runs two consecutive application sessions in one process with no update, which S6c1 proves before the rest; h6, crash cuts H2, H3, H4, H4b, H5, H6, H8-pre, H8a and H8b of the crash table, each binary: the journal state and the next launch's outcome are those the table states, at H3, H8-pre and H8a the next launch quarantines and probes before `Ready`, and at H4b the next writer resumes the attempt through `resume_unlaunched`; h6b, R4 `Err` (seam-injected failed durable step, as r12 injects one): the restore continues to R5 and reaches `Ready` on the host's own tree, the journal stays authoritative, the restored session's own next in-session update refuses on the pending journal, and the next launch of the installation refuses with `JournalBoundRecoveryRequired` before S6d; h7, one instance: at `AB1` no process of the old generation is alive, and a negative control that keeps the old Bun primary alive through the handover fails this cell; h8, user-visible: the window census is zero during the gap and one after `Ready`, with the gap's length recorded, not asserted; h9, a failed tail (seam-injected barrier grace expiry): nothing is journaled, the lease is released, the host exits with the tail's error, and the next launch boots the current version; h10, F51: with the old host's stdout and stderr piped to the harness, the harness reads end of file on both when the old host's handle is signaled while the candidate runs; h11, cooperative quit: the reference application receives `LastWindowClosed` after the window closed and requests `Quit` within D, the host answers it and the session ends under the lifecycle-Quit cause, never the forced one; a negative control whose forced tail runs at 3a ends the reference application under the forced cause and fails this cell; h12, forced end: an application that ignores `LastWindowClosed` is ended at D under the handover cause, the candidate is then launched, and a negative control without the deadline never launches the candidate for that application within the test's kill switch, so the row detects a missing deadline; h13, claim deadline: a candidate killed after its resume and before it connects ends the claim wait by its signaled launch handle, before the floor, and a candidate that lives but never connects (a seam-injected claimant that never opens the endpoint) ends it at the claim deadline; each rolls back and the old host restores and reaches `Ready`; two negative controls, one mechanism each: with the handle check disabled, so that only the deadline ends the wait, the killed candidate's wait ends at the floor instead of at once; with the deadline disabled, so that only the handle ends the wait, the never-connecting candidate leaves the old host windowless, with every launch refused `WriterActive`, past the floor within the test's kill switch; so the row detects each missing mechanism on its own |
 | 8, 9 (launch-record detach) | ("Candidate release after commit", *Launch-record detach*; S6b4, in child processes that stand in for the host and the candidate) d1, after both clears and `detach`, the host exits in order and the candidate's handle stays unsignaled; d2, negative control: a build that drops the record without `detach` after both clears leaves the candidate's handle signaled after the host's orderly exit, so the row detects the gap; d3, a never-resumed child refuses `detach` at run time and is terminated as today; d4, a `compile_fail` doctest shows that `WindowsExitCensus` cannot be built, cloned or copied in safe code outside the crate, so `detach` is uncallable before `release_for_exit` and one census admits one detach; d5, after `detach` the host holds no handle to the candidate (a handle census of the host's own table); d6, S6c cell: r1 through the real host coordinator passes only with the detach |
-| 8 (margin G and deadlines) | (*Margin and deadlines*; S6c) the G record: sixty samples (thirty idle, thirty under load) of the revocation-to-end-of-file latency measured on the owner's monotonic clock through the real candidate host, with minimum, median and maximum, and G equal to the rule's value, recorded in the keld-benches artifact that the pull request names with its hash; an exit injected at the window's end minus G/2 fails health; a negative control that halves G lets an exit injected at the window's end minus the measured maximum commit, so the row detects an undersized margin; the candidate's `AK1` deadline equals `ATTEMPT_HEALTH_WINDOW` + G + 15 s, and an `AK1` arriving after it leaves the candidate unarmed; each owner deadline (the claim, the quit, `AB1`, `AY1`, the close-wait and the census) is at least four times its measured maximum with its floor, recorded with the measurement; a candidate whose session fails before `Ready` sends `AF1` class 3, which the owner reads as a record, not end of file |
+| 8 (margin G and deadlines) | (*Margin and deadlines*; S6c2a for D, S6c2d for G and the other owner deadlines, S6c2e for the census) the G record: sixty samples (thirty idle, thirty under load) of the revocation-to-end-of-file latency measured on the owner's monotonic clock through the real candidate host, with minimum, median and maximum, and G equal to the rule's value, recorded in the keld-benches artifact that the pull request names with its hash; an exit injected at the window's end minus G/2 fails health; a negative control that halves G lets an exit injected at the window's end minus the measured maximum commit, so the row detects an undersized margin; the candidate's `AK1` deadline equals `ATTEMPT_HEALTH_WINDOW` + G + 15 s, and an `AK1` arriving after it leaves the candidate unarmed; each owner deadline (the claim, the quit, `AB1`, `AY1`, the close-wait and the census) is at least four times its measured maximum with its floor, recorded with the measurement; the D record (S6c2a): sixty samples through h11 (thirty idle, thirty under full-core load) on the host's monotonic clock from the `LastWindowClosed` write to the admitted `Quit` frame, measured maximum 218.5 ms, so D is its 10 s floor, and the `HANDOVER_QUIT_DEADLINE` constant equals it; a candidate whose session fails before `Ready` sends `AF1` class 3, which the owner reads as a record, not end of file |
 | 8, 17 (D5 fallback) | when the Medium claimant cannot open the elevated owner, the claim binds on the `O:BA` owner and the session before sending and on the journaled owner process ID after acceptance; when the open is admitted, creation time and `helper_image_blake3` are checked as well |
 | 17 (D2 bootstrap) | the host creates the bootstrap endpoint with its two-SID DACL and its own user SID as owner before `ShellExecuteExW`, refuses when no `hProcess` is returned, accepts only a client whose process ID equals the `hProcess` process ID while `hProcess` is unsignaled, and impersonates no one; the helper opens with identification-level QoS and, before sending, verifies that the host process image is its installation's selected `keld-host.exe`, the session, and a descriptor owned by that host's user SID; it takes the initiating token only from that host process object and refuses an elevated or non-Medium initiating token before any protected write; a forged rendezvous argument, a squatting server that is not that `keld-host.exe` (same-user code is outside the boundary and is not claimed), a client that is not the launched helper and a second ordinary user's process each refuse; alternate-administrator consent is admitted with the initiating token unchanged once S1 shows the open works, and otherwise refuses with a typed `ProtectedStateUnchanged` before any protected write; source pinning runs under token impersonation, and a failed revert terminates the helper (seam-injected) |
 | 17 (argument shape) | the helper's single argument and the candidate's rendezvous argument are each refused before any open or write when they are a UNC or remote path, a `\\?\` path, another `keld-*` namespace, uppercase hex, a wrong length, or come with any extra argument; only the exact local `\\.\pipe\keld-attempt-<64 lowercase hex>` shape, or the helper's fixed recovery-role selector, is accepted |
@@ -3706,7 +3801,9 @@ source SHA, package/signature identity and raw crash cuts. Other OS results are 
   `WindowsRecoveryInspection::recover` and `resume_unlaunched` so that minting and the
   first name-revealing record are separate calls, with its `WindowsMintedAttempt` and
   `WindowsJournaledAttempt` handles and its `AttemptOwner` and `InitiatingLogon`
-  inputs (named for the KEL-270 T4d S3 public-API review), and whose coordinator input
+  inputs (named for the KEL-270 T4d S3 public-API review), the own-process reader of
+  those two inputs that S6c2e adds for the host coordinator (no new FFI call; §5),
+  and whose coordinator input
   is the owner's `VerifiedWindowsImage` rather than a raw digest (S6b2; KEL-270
   owner decision `740998f4`, item 3); Machine-UAC admission in
   `load_windows_activation_write_snapshot` and `load_windows_recovery_inspection`,
@@ -3741,11 +3838,16 @@ source SHA, package/signature identity and raw crash cuts. Other OS results are 
   `WindowsExitCensus`'s fields and removal of its `Clone` and `Copy`, with its new
   by-value `detach` and `WindowsDetachedLaunch` (design item F50, Linear KEL-270
   comment `fffd7f38`); and S6c's session loop with its handover cause and the two
-  tail changes, the widened documentation of `AppWindowCommand::Quit` and the
-  documented second construction of `WebView2Engine`, the `keld-ipc` attempt
-  endpoint's claim-wait canceller seam, the debug-only evidence seam, and the
-  volume-GUID source the coordinator's trust inputs need ("Profile handover";
-  coordinator decisions under the owner's delegation of 2026-10-08);
+  tail changes (S6c2a: the cause, the gate, the no-op and `request_handover` are
+  crate-private; the public items are the widened documentation of
+  `AppWindowCommand::Quit` and the `profile-test-hooks`-gated
+  `keld_wv::TEST_WINDOWS_BARRIER_GRACE_EXPIRY_ENV` constant of the h9 fault fixture,
+  which lib.rs refuses in release), the documented second construction of
+  `WebView2Engine` (S6c1), the `keld-ipc` attempt endpoint's claim-wait canceller seam
+  (S6c2b), the debug-only evidence seams, the volume-GUID source and the own-process
+  `AttemptOwner`/`InitiatingLogon` reader the coordinator's trust inputs need (S6c2e;
+  "Profile handover"; coordinator decisions under the owner's delegation of
+  2026-10-08);
 - permission model: yes — the install-mode protection profiles, UAC elevation and
   hostile-role denial decide who can mutate executable state, though no app grant is
   added. T4d adds the elevated helper principal, its recovery-only role and the

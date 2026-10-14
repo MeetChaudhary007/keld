@@ -186,12 +186,14 @@ const SESSION_HANDOVER: u8 = 3;
 /// `LastWindowClosed`, so the rule errs large and the floor rules.
 ///
 /// Measured 2026-10-14, Windows 11 10.0.26300 (RAMANI, Ryzen 7 5800H, 16 logical
-/// cores), debug host at the S6c2a head, Bun 1.4.2, `WebView2` runtime 155.0.4283.45:
-/// - idle: 30 runs, median __IDLE_MEDIAN__ ms, max __IDLE_MAX__ ms;
+/// cores), the S6c2a debug host at commit `045b4a45` (later commits of that branch
+/// change only evidence plumbing and documentation), Bun 1.4.2, `WebView2` runtime
+/// 155.0.4283.45:
+/// - idle: 30 runs, median 0.6 ms, max 1.1 ms;
 /// - full-core load (16 busy-loop burners on 16 logical cores, the F55 method): 30 runs,
-///   median __LOAD_MEDIAN__ ms, max __LOAD_MAX__ ms.
+///   median 1.0 ms, max 218.5 ms.
 ///
-/// 4 x __D_MAX__ ms is below the 10 s floor, so D is the floor (source: the samples and
+/// 4 x 218.5 ms is below the 10 s floor, so D is the floor (source: the samples and
 /// run logs in the keld-benches artifact named by the KEL-270 T4d S6c2a pull request).
 #[cfg(any(target_os = "linux", windows))]
 const HANDOVER_QUIT_DEADLINE: Duration = Duration::from_secs(10);
