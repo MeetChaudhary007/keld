@@ -4,6 +4,7 @@
 import argparse
 import csv
 import json
+import os
 import re
 import subprocess
 from collections import Counter
@@ -40,9 +41,17 @@ FIELDS = ("path", "blob_sha", "mode", "category", "classification_reason",
           "first_test_module_line", "module_tail_ratio")
 
 
+GIT_LOCATION_VARS = (
+    "GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_PREFIX",
+)
+
+
 def git(repo, *args, data=None):
+    # Hooks may inherit the caller's Git location. -C does not override GIT_DIR.
+    env = {key: value for key, value in os.environ.items() if key not in GIT_LOCATION_VARS}
     p = subprocess.run(["git", "-C", str(repo), *args], input=data,
-                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False, env=env)
     if p.returncode:
         raise RuntimeError("git command failed: " + p.stderr.decode("utf-8", "replace"))
     return p.stdout
@@ -63,6 +72,12 @@ def parse_tree(raw):
     if len({e["path"] for e in entries}) != len(entries):
         raise ValueError("duplicate Git tree path")
     return entries
+
+
+def change_counts(history):
+    # -z is required: Git may quote non-ASCII paths or embed LF in filenames.
+    return Counter(p.decode("utf-8", "surrogateescape")
+                   for p in history.split(b"\0") if p)
 
 
 def physical_lines(data):
@@ -318,8 +333,9 @@ def markdown(s):
             "- Do not impose file limits until their design implications and exceptions are independently reviewed.",
             "- Candidate priority for next stage: inspect ownership and test discovery of test-heavy modules, "
             "compare agents' before/after read-set, check active PRs, then choose cohesive families.",
-            "- The census does not measure live updater behavior, compiled test identities, "
-            "platform compatibility or change-frequency; independent evidence remains required.",
+            "- Commit-touch counts are a bounded change-frequency proxy, not evidence of "
+            "coupling or ownership; the census does not measure live updater behavior, "
+            "compiled test identities or platform compatibility.",
             "",
             "## Reproduce", "",
             "From a checkout of KELD:",
@@ -350,8 +366,8 @@ def main():
         raise AssertionError("not all tracked entries were accounted for")
     validation = independently_validate(rows, blobs)
     # Commit-path touches in a pinned history interval; renames are NOT followed.
-    history = git(repo, "log", "--format=", "--name-only", "--since=2026-09-15", pinned)
-    changes = Counter(p for p in history.decode("utf-8", "replace").splitlines() if p.strip())
+    history = git(repo, "log", "-z", "--format=", "--name-only", "--since=2026-09-15", pinned)
+    changes = change_counts(history)
     summary = summarize(rows, pinned, validation, args.date, changes)
     dest = args.output if args.output.is_absolute() else repo / args.output
     dest = dest.resolve()

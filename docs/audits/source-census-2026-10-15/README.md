@@ -89,7 +89,7 @@ Count of commits touching each *current path* since 2026-09-15 on the pinned his
 - Category C test entry modules use existing review triggers (>100 LOC or 4 KiB), other test modules >400 LOC or 16 KiB; review is not rejection.
 - Do not impose file limits until their design implications and exceptions are independently reviewed.
 - Candidate priority for next stage: inspect ownership and test discovery of test-heavy modules, compare agents' before/after read-set, check active PRs, then choose cohesive families.
-- The census does not measure live updater behavior, compiled test identities, platform compatibility or change-frequency; independent evidence remains required.
+- Commit-touch counts are a bounded change-frequency proxy, not evidence of coupling or ownership; the census does not measure live updater behavior, compiled test identities or platform compatibility.
 
 ## Reproduce
 

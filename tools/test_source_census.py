@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Independent boundary and live-Git tests for pinned source census."""
 
+import os
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 import source_census as census
@@ -30,6 +32,16 @@ class CounterContracts(unittest.TestCase):
         self.assertEqual(["100644", "120000", "160000"], [r["mode"] for r in e])
         with self.assertRaises(ValueError):
             census.parse_tree(raw + raw)
+
+    def test_history_count_preserves_newline_unicode_and_duplicates(self):
+        raw = "normal.rs\0line\nbreak.rs\0café.rs\0normal.rs\0".encode()
+        result = census.change_counts(raw)
+        self.assertEqual(2, result["normal.rs"])
+        self.assertEqual(1, result["line\nbreak.rs"])
+        self.assertEqual(1, result["café.rs"])
+        self.assertEqual(3, len(result))
+        self.assertNotIn("line", result)
+        self.assertNotIn("break.rs", result)
 
     def test_exclusions_are_explicit(self):
         cases = [
@@ -139,6 +151,34 @@ class GitObjectProof(unittest.TestCase):
             self.assertEqual(0, census.independently_validate(census.collect(
                 changed, census.read_blobs(repo, changed)),
                 census.read_blobs(repo, changed))["mismatches"])
+
+    def test_git_helper_ignores_inherited_repository_locations(self):
+        with tempfile.TemporaryDirectory(prefix="keld-census-hook-") as temp:
+            base = Path(temp)
+            caller, isolated = base / "caller", base / "isolated"
+            caller.mkdir()
+            isolated.mkdir()
+            census.git(caller, "init", "-q")
+            (caller / "caller.rs").write_text("caller")
+            census.git(caller, "add", "caller.rs")
+            self.commit(caller, "caller baseline")
+            original_head = census.git(caller, "rev-parse", "HEAD")
+            original_index = (caller / ".git" / "index").read_bytes()
+            (isolated / "only_here.rs").write_text("isolated")
+            with mock.patch.dict(os.environ, {
+                "GIT_DIR": str(caller / ".git"),
+                "GIT_WORK_TREE": str(caller),
+                "GIT_INDEX_FILE": str(caller / ".git" / "index"),
+            }):
+                census.git(isolated, "init", "-q")
+                census.git(isolated, "add", "only_here.rs")
+                self.commit(isolated, "isolated baseline")
+                entries = census.parse_tree(
+                    census.git(isolated, "ls-tree", "-r", "-z", "HEAD"))
+            self.assertEqual(["only_here.rs"], [e["path"] for e in entries])
+            self.assertEqual(original_head, census.git(caller, "rev-parse", "HEAD"))
+            self.assertEqual(original_index, (caller / ".git" / "index").read_bytes())
+            self.assertEqual(b"", census.git(caller, "status", "--porcelain"))
 
     def test_independent_manifest_output_from_pinned_commit(self):
         with tempfile.TemporaryDirectory(prefix="keld-census-test-") as tmp:
