@@ -10,3 +10,11 @@ export {
 export type { EchoRequest, EchoResponse } from "./echo.generated.ts";
 export { isCallError, type KeldCallError } from "./link.ts";
 export { fs } from "./fs.ts";
+export {
+  auth,
+  type AuthBeginRequest,
+  type AuthTokenRequest,
+  type AuthBeginResult,
+  type AuthTokenResult,
+  type AuthCallOptions,
+} from "./auth.ts";

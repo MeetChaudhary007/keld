@@ -379,6 +379,12 @@ where
         .unwrap_or_else(|| keld_core::DEFAULT_ENTRY.to_owned());
     let renderer = keld_core::renderer_from_config_ts(&config)
         .unwrap_or_else(|| keld_core::DEFAULT_RENDERER.to_owned());
+    // The reviewed Core extractor reads the same already-open project config.
+    // It returns the shared Native type without filtering profiles or requiring clientId.
+    let auth_configuration =
+        keld_core::auth_configuration_from_config_ts(&config).map_err(|source| {
+            BootCompileError::new("project auth configuration", source.to_string())
+        })?;
     validate_relative("entry", &entry)?;
     validate_relative("renderer", &renderer)?;
 
@@ -488,7 +494,7 @@ where
         "permissions",
     )?;
     let digest = Sha256::digest(permissions_bytes);
-    let descriptor = serde_json::to_vec(&serde_json::json!({
+    let mut descriptor = serde_json::json!({
         "schema": 1,
         "name": name,
         "entry": entry,
@@ -497,8 +503,28 @@ where
             "file": PERMISSIONS_FILE,
             "content_sha256": format!("sha256:{digest:x}"),
         }
-    }))
-    .map_err(|source| BootCompileError::new("boot descriptor", source.to_string()))?;
+    });
+    // Preserve the byte shape of legacy stages when no auth profile is configured.
+    // A configured-but-incomplete profile is nonempty and must be carried unchanged;
+    // Native owns the post-Allow missing-client decision.
+    if !auth_configuration.is_empty() {
+        let auth = serde_json::to_value(&auth_configuration).map_err(|source| {
+            BootCompileError::new("boot auth configuration", source.to_string())
+        })?;
+        match &mut descriptor {
+            serde_json::Value::Object(object) => {
+                object.insert(String::from("auth"), auth);
+            }
+            _ => {
+                return Err(BootCompileError::new(
+                    "boot descriptor",
+                    "generated descriptor root is not an object",
+                ));
+            }
+        }
+    }
+    let descriptor = serde_json::to_vec(&descriptor)
+        .map_err(|source| BootCompileError::new("boot descriptor", source.to_string()))?;
     write_new_file(
         &root.join("keld.boot.json"),
         &descriptor,
@@ -1078,12 +1104,69 @@ mod tests {
         assert_eq!(descriptor["name"], "Stage Fixture");
         assert_eq!(descriptor["entry"], "src/main.ts");
         assert_eq!(descriptor["renderer"], "index.html");
+        assert!(
+            descriptor.get("auth").is_none(),
+            "empty auth preserves legacy shape"
+        );
         assert_eq!(descriptor["permissions"]["file"], "keld.permissions.jsonc");
         let digest = Sha256::digest(b"{}\n");
         assert_eq!(
             descriptor["permissions"]["content_sha256"],
             format!("sha256:{digest:x}")
         );
+    }
+
+    #[test]
+    fn stage_dev_boot_roundtrips_auth_into_schema_one_descriptor() {
+        let (_temp, project, source_host) = fixture();
+        fs::write(
+            project.join("keld.config.ts"),
+            r#"export default {
+  name: "Stage Fixture",
+  entry: "src/main.ts",
+  renderer: "index.html",
+  auth: { "entra-common": { clientId: "public-client", fixedRedirect: "http://localhost:53161/callback" } },
+} as const;
+"#,
+        )
+        .expect("auth config");
+        let staged = stage_dev_boot(&project, &source_host).expect("stage auth config");
+        let descriptor: serde_json::Value = serde_json::from_slice(
+            &fs::read(staged.root().join("keld.boot.json")).expect("boot descriptor"),
+        )
+        .expect("parse descriptor");
+        let expected_auth: serde_json::Value = serde_json::from_str(
+            r#"{"entra-common":{"clientId":"public-client","fixedRedirect":"http://localhost:53161/callback"}}"#,
+        )
+        .expect("independent auth JSON literal");
+        assert_eq!(descriptor["schema"], 1);
+        assert_eq!(descriptor.get("auth"), Some(&expected_auth));
+    }
+
+    #[test]
+    fn stage_dev_boot_carries_missing_client_without_pre_allow_refusal() {
+        let (_temp, project, source_host) = fixture();
+        fs::write(
+            project.join("keld.config.ts"),
+            r#"export default {
+  name: "Stage Fixture",
+  entry: "src/main.ts",
+  renderer: "index.html",
+  auth: { "entra-common": {} },
+} as const;
+"#,
+        )
+        .expect("incomplete auth config");
+        let staged = stage_dev_boot(&project, &source_host)
+            .expect("missing clientId is carried, not rejected by the producer");
+        let descriptor: serde_json::Value = serde_json::from_slice(
+            &fs::read(staged.root().join("keld.boot.json")).expect("boot descriptor"),
+        )
+        .expect("parse descriptor");
+        let expected_auth: serde_json::Value = serde_json::from_str(r#"{"entra-common":{}}"#)
+            .expect("independent missing-client JSON literal");
+        assert_eq!(descriptor["schema"], 1);
+        assert_eq!(descriptor.get("auth"), Some(&expected_auth));
     }
 
     #[test]

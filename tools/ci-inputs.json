@@ -92,10 +92,11 @@
         "crates/keld-ipc/src/lifecycle.rs",
         "crates/keld-ipc/src/channel_table.rs",
         "crates/keld-native/src/fs.rs",
+        "crates/keld-native/src/auth/mod.rs",
         "crates/keld-native/tests/fixtures/fs-payload-v0.tsv",
         "crates/keld-wv/src/wkwebview/macos_bridge.rs"
       ],
-      "contract": "Bun reads IPC constants and CLI templates, generates and drift-checks the channel-table region from crates/keld-ipc/src/channel_table.rs, scans production TypeScript and the macOS bridge's injected scripts for channel-id literals, echo declaration ownership scans every production .ts under crates and packages, and transport tests census every public-tree filename ending receiver-semantics-v0.tsv. The bounded native FS generator/check reads crates/keld-native/src/fs.rs, and its semantic tests read crates/keld-native/tests/fixtures/fs-payload-v0.tsv. Source-reader drift invalidates exclusions.",
+      "contract": "Bun reads IPC constants and CLI templates, generates and drift-checks the channel-table region from crates/keld-ipc/src/channel_table.rs, scans production TypeScript and the macOS bridge's injected scripts for channel-id literals, echo declaration ownership scans every production .ts under crates and packages, and transport tests census every public-tree filename ending receiver-semantics-v0.tsv. The bounded native FS generator/check reads crates/keld-native/src/fs.rs, and its semantic tests read crates/keld-native/tests/fixtures/fs-payload-v0.tsv. The bounded native auth generator/check and its semantic tests read crates/keld-native/src/auth/mod.rs. Source-reader drift invalidates exclusions.",
       "reader_set": "bun-readers"
     },
     {
@@ -358,14 +359,14 @@
         "crates/keld-host/tests/no_flag/macos/public_fs/project.rs",
         "crates/keld-host/tests/no_flag/macos/public_fs.rs"
       ],
-      "sha256": "fce76889df7dbb7f9b4a5f441a4bfa40da237dbc2f9a11d4226001d9ccbcbe19"
+      "sha256": "a8f9fad55d3ce83d3d1c49b5f30f13c16414860b3ef5440ac8c2117fe5df9cce"
     },
     "bun-readers": {
       "patterns": [
         "packages/*",
         "justfile"
       ],
-      "sha256": "1139709380f7d601c219e7c1eeaa1c4e90bb161bdd2de06176015c19196d54b8"
+      "sha256": "b5e80806ad6b646548d635688cc07af45dd4fa5086371258ed8528c7b00e2ba3"
     },
     "policy-readers": {
       "patterns": [
@@ -392,7 +393,7 @@
         "rust-toolchain.toml",
         ".cargo/*"
       ],
-      "sha256": "f65bfe69d9add5c915b814c27a1606a3539ac70ce39e52b803448fff0a2586b4"
+      "sha256": "2621735d79b605f0fca388fa64e33a05c9b3da698ee39c1a23a99f1b73d9c394"
     },
     "dependency-command": {
       "patterns": [
@@ -421,7 +422,7 @@
     "patterns": [
       "crates/*"
     ],
-    "membership_sha256": "67c94c48810db89098d82f5e39202c7099c7c1b9b86b6ef79126b182f7b8a295",
+    "membership_sha256": "61fbb954ad46c74b59507cdae8e4e5cec7d01f16ae9a128d6bc87efeddff24b5",
     "contract": "Broad census binds path membership only: new/removed crate paths fail closed. Existing crate-content edits select Rust through the crates/* input edge. A new cross-tree read in an existing source must register that reader and its input edge in the same change; exact-reader content digests then guard future drift."
   },
   "rust_package_inputs": {

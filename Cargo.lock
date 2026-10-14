@@ -1606,12 +1606,18 @@ dependencies = [
 name = "keld-native"
 version = "0.0.1"
 dependencies = [
+ "base64 0.23.1",
+ "block2",
  "cap-fs-ext",
  "cap-std",
+ "getrandom 0.4.3",
  "keld-guard",
  "keld-ipc",
+ "objc2",
+ "objc2-foundation",
  "rustix",
  "serde",
+ "serde_json",
  "sha2 0.10.9",
  "windows-sys 0.61.2",
 ]

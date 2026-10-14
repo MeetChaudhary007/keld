@@ -372,7 +372,8 @@ schema language, ship `@keld/schema` or live `keld gen`, or replace runtime vali
 static, append-only table owned by `keld-ipc` (name, `u16` id, receive-policy class,
 guard reference); id `0` stays reserved for `HELLO`, and ids are never renumbered or
 reused. TypeScript constants are generated from it by the KEL-98 generator. It is live
-since X05-T4 (#597): `keld_ipc::channel_table` holds echo = 1, fs = 2 and lifecycle = 3,
+since X05-T4 (#597): `keld_ipc::channel_table` holds echo = 1, fs = 2, lifecycle = 3
+and the KEL-89 auth allocation = 4,
 every production id derives from it, the TypeScript ids are a generated, drift-checked
 region of `transport.ts`, and the wire is unchanged. Handshake-time name resolution and
 full `keld gen` emission remain destination work that needs a `HELLO` change, a protocol

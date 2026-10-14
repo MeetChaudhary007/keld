@@ -20,6 +20,7 @@ import { describe, expect, test } from "bun:test";
 
 import {
   ALLOCATED_CHANNELS,
+  AUTH_CHANNEL,
   APP_LINK_IO_DEADLINE_MS,
   DrainSignal,
   ECHO_CHANNEL,
@@ -231,17 +232,17 @@ describe("GH-527 receive policy mirrors", () => {
   });
 
   test("replyWaiter accepts only channel table ids, by type and at runtime (GH-597)", () => {
-    expect(ALLOCATED_CHANNELS).toEqual([ECHO_CHANNEL, FS_CHANNEL, LIFECYCLE_CHANNEL]);
-    for (const channel of [ECHO_CHANNEL, FS_CHANNEL, LIFECYCLE_CHANNEL]) {
+    expect(ALLOCATED_CHANNELS).toEqual([ECHO_CHANNEL, FS_CHANNEL, LIFECYCLE_CHANNEL, AUTH_CHANNEL]);
+    for (const channel of [ECHO_CHANNEL, FS_CHANNEL, LIFECYCLE_CHANNEL, AUTH_CHANNEL]) {
       expect(isAllocatedChannel(channel)).toBe(true);
     }
-    for (const unallocated of [HANDSHAKE_CHANNEL, 4, 9, 0xffff, 2.5, -1]) {
+    for (const unallocated of [HANDSHAKE_CHANNEL, 5, 9, 0xffff, 2.5, -1]) {
       expect(isAllocatedChannel(unallocated)).toBe(false);
     }
     // Type-level negative control: if `replyWaiter` widened its parameter to
     // `number`, this directive would be unused and `bun run typecheck` fails.
-    // @ts-expect-error 4 is not an allocated channel
-    expect(() => replyWaiter(4, 7)).toThrow(
+    // @ts-expect-error 5 is not an allocated channel
+    expect(() => replyWaiter(5, 7)).toThrow(
       "KELD-IPC-005: channel is not allocated by the channel table",
     );
     for (const unallocated of [9, 0xffff]) {

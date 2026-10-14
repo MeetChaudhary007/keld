@@ -1654,7 +1654,8 @@ schema language, ship `@keld/schema` or live `keld gen`, or replace runtime vali
 static, append-only table owned by `keld-ipc` (name, `u16` id, receive-policy class,
 guard reference); id `0` stays reserved for `HELLO`, and ids are never renumbered or
 reused. TypeScript constants are generated from it by the KEL-98 generator. It is live
-since X05-T4 (#597): `keld_ipc::channel_table` holds echo = 1, fs = 2 and lifecycle = 3,
+since X05-T4 (#597): `keld_ipc::channel_table` holds echo = 1, fs = 2, lifecycle = 3
+and the KEL-89 auth allocation = 4,
 every production id derives from it, the TypeScript ids are a generated, drift-checked
 region of `transport.ts`, and the wire is unchanged. Handshake-time name resolution and
 full `keld gen` emission remain destination work that needs a `HELLO` change, a protocol
@@ -1851,7 +1852,7 @@ manifest decoder.
     "shell":   { "open": ["https://docs.myapp.com/**"], "spawn": [{ "cmd": "$RESOURCES/bin/ffmpeg", "args": "reviewed" }] },
     "system":  ["clipboard.read", "clipboard.write", "notifications", "tray", "global-shortcuts"],
     "secrets": ["keychain:myapp/**"],
-    // approved spec, not live: docs/specs/keld-auth.md. Each entry is a declared
+    // T3 macOS implementation: docs/specs/keld-auth.md. Each entry is a declared
     // issuer literal from that spec's closed v0 provider-profile table — the one
     // v0 row is `entra-common`. A literal that names no tabled profile matches
     // nothing the host ever asks for and therefore always denies.
@@ -1940,7 +1941,7 @@ manifest decoder.
   the app ceiling by default. Any additional role-specific authority is a separately
   versioned, reviewable manifest change; it cannot arise from an Electron
   `utilityProcess` option or child request. This schema is not live.
-- **Auth grants (destination; approved spec, not live):** `app.auth.begin` and
+- **Auth grants (T3 macOS implementation; other OS-broker paths remain targets):** `app.auth.begin` and
   `app.auth.token` scopes are both issuer-URL exact string literals, compared by byte
   equality — after `evaluate`'s own `..`-segment rejection, which runs on the resource
   before any scope is matched, so a byte-equal pair containing a `..` segment still
@@ -1960,8 +1961,11 @@ manifest decoder.
   denial's full `Display` (`02-ipc.md` §2), because the requested resource is the thing
   being protected — on denials, and on the host-internal invariant path where the guard
   Allows but no session resolved, so the two cannot be told apart.
-  Owner: `docs/specs/keld-auth.md` (KEL-89). No auth channel, handler, or load-time
-  entry rejection exists in the workspace yet.
+  Owner: `docs/specs/keld-auth.md` (KEL-89). Shared manifest loading rejects the
+  malformed `auth.begin`/`auth.token` issuer entries above. Direct public serde
+  deserialization is not that load path; AC13(d) separately owns its defense.
+  The T3 macOS implementation supplies the auth channel, Core admission and
+  Native runtime handler. Other OS-broker paths remain targets.
 - **CSP injection** by default on every webview (`default` = self + keld:// + declared
   net hosts; `static-only` = no script eval, no net). Opt-out is a named, linted grant.
 
@@ -1970,7 +1974,7 @@ manifest decoder.
 - **Destination:** `keld dev` runs with a **dev-permissive profile + recorder**: every
   would-be denial is allowed but recorded with a stack.
   **v0:** no dev-permissive profile and no denial recorder exist in the workspace;
-  `evaluate` remains default-deny for the live call sites (media + host `fs`), and
+  `evaluate` remains default-deny for the live call sites (media, host `fs` and T3 macOS auth), and
   echo / lifecycle stay ungated as in §1.
 - `keld doctor --permissions` (and `keld build`) is **planned**: diffs recorded
   usage against the manifest and prints exact JSON patches ("your app called
@@ -4290,6 +4294,7 @@ This ledger owns repository **Current/Target/Evidence** facts. Architecture owns
 | `surface.no-flag-macos` | macOS | **Partial** — The no-flag host, native window, app link, recovery, and ordered cleanup are implemented for the current slice. | [code](../../crates/keld-core/src/app_session.rs), [test](../../crates/keld-host/tests/no_flag_macos.rs) | [Specified](../../docs/specs/kel96-no-flag-host-boot.md) | KEL-96 | `43cab25dd13b3d7379e03c4662482d3f40ea1a40` |
 | `surface.no-flag-windows` | Windows | **Partial** — The no-flag host, native window, named-pipe app link, recovery, ordered cleanup, and authenticated Authenticode identity-to-persistent-WebView2 wiring are implemented; the single KEL-135 Windows Authenticode verifier is owned by keld-guard (KEL-270 T4d S8) and keld-core calls it. Windows admits two boot states (KEL-254 A3 AC2): a dev lease reaches only the owner-private dev-stage validator, and a lease-less launch boots only the authenticated installed package (KEL-254 T3 Part B). keld-core verifies the executable once, reads its embedded ExpectedAppIdentity from that pinned handle (KELD-UPDATE-019/017), selects the installation through KEL-53's executable-located entrypoint (KELD-UPDATE-*), requires the protected record's publisher scope and app id to equal the verified identity through keld-update's signer rule, which runs inside that selection before the snapshot lease (KELD-UPDATE-020, moved from keld-core's KELD-WV-009 by KEL-270 T4d S9a) and opens the strict boot files beneath the selected tree, all before any listener, child or window; the persistent profile comes from that boot identity. On 2026-10-06 the KEL-135 signed rows passed on fresh per-run PerUserDirect installations of P1/P2-signed embedded hosts built from this slice (RAMANI, unelevated): startup, which also shows that the running session pins its version directory, profile concurrency, crash release, the five-store App A/B/other-publisher isolation matrix and both purge rows, with signed refusals for a host without a container, one outside an installation, one under another recorded publisher and one signed for another app. These are native rows of the installed route, not KEL-254 installed-boot acceptance: KEL-19 T2's AC2 and AC8 rows have since passed as operator rows (#515; one Windows 11 machine), but KEL-19 T3 (`keld build` integration and its post-sign check) and KEL-254 T4 are open, machine-mode installed boot is reachable but unqualified, and the second ordinary user's row, machine-mode installed cells and updated, rolled-back or candidate boot (KEL-254 T4) remain unrun. Earlier dev-stage evidence covers the second ordinary user's store isolation, restart, cleanup, and first-user retention; filesystem denial; and saved-media grant revocation. Broader Windows profile acceptance and all macOS/Linux browser-profile acceptance remain incomplete. | [code](../../crates/keld-core/src/app_session.rs), [code](../../crates/keld-guard/src/windows_authenticode.rs), [test](../../crates/keld-host/tests/no_flag_windows.rs) | [Specified](../../docs/specs/kel135-persistent-profile-identity.md) | KEL-96, KEL-101, KEL-135 | `2848a65df86e3362ad05fc1cac3ff82aab55cf7c` |
 | `surface.no-flag-linux` | Linux | **Partial** — The no-flag host, WebKitGTK window, authenticated app link, strict Bun generations, recovery, CLI/host-death cleanup, and relaunch are implemented for Ubuntu/Debian x86_64 Wayland; X11, non-Debian, and release packaging remain unverified. | [code](../../crates/keld-core/src/app_session.rs), [code](../../crates/keld-host/src/main.rs), [test](../../crates/keld-host/tests/no_flag_linux.rs) | [Specified](../../docs/specs/kel96-no-flag-host-boot.md) | KEL-28, KEL-96 | `c41ec5e117db284d191ee508f42a4d8812869a00` |
+| `surface.auth-macos` | macOS | **Partial** — The keld-native-owned macOS T3 external-browser loopback/PKCE broker is reachable through guarded AppProcess auth.begin/auth.token and the public API. Host-session credential custody, canonical token single-flight, resource-free denials and ordered physical cleanup have scoped implementation and acceptance evidence; the real Entra flow and private issuer comparison are recorded separately. ASWebAuthenticationSession, Windows WAM, Linux auth and signing/distribution are not claimed; the original header-only SDK network experiment remains failed/unqualified alongside the corrected component proof. | [code](../../crates/keld-native/src/auth/controller.rs), [code](../../crates/keld-core/src/app_session/auth_router.rs), [code](../../packages/@keld/api/src/auth.ts), [test](../../crates/keld-native/src/auth/macos_http_tests.rs), [test](../../crates/keld-core/src/app_session/auth_router_tests.rs), [test](../../crates/keld-host/tests/no_flag/macos/public_fs/actual_auth_app.rs) | [Specified](../../docs/specs/keld-auth.md) | KEL-89 | `498b1b374e6ee27472813cec8d386ee9bf2375c1` |
 
 ---
 
@@ -5307,8 +5312,9 @@ match the crate that already emits the code. Do not invent a third spelling.
 ## KELD-IPC-005
 
 - crate: keld-ipc
-- message: Unexpected kipc frame or session state
-- fix: Check frame kind and channel match the session contract.
+- message: Unexpected kipc frame or session state; a valid guarded call may instead be refused because its host-owned admission capacity is exhausted.
+- fix: For terminal protocol rejection, check frame kind and channel match the session contract. For a correlated capacity refusal, wait for admitted work to finish before issuing new work; that call was not admitted and the link remains usable.
+- status: Capacity refusal uses the IPC-owned `CallError::admission_capacity` constant only after the complete bounded frame is consumed under its original first-byte deadline. It is nonterminal and resource-free. Duplicate/invalid correlations, closed or poisoned admission, malformed headers, truncated bodies and deadline failures retain their terminal behavior.
 
 ## KELD-IPC-006
 
@@ -5709,8 +5715,8 @@ match the crate that already emits the code. Do not invent a third spelling.
 ## KELD-GUARD005
 
 - crate: keld-guard
-- message: Permissions manifest is not UTF-8, is ambiguous, or is not valid JSONC
-- fix: Write UTF-8, remove duplicate object keys, or fix the JSON (comments are allowed; trailing commas are not).
+- message: Permissions manifest is not UTF-8, is ambiguous, is not valid JSONC, or contains a malformed auth issuer grant
+- fix: Write UTF-8, remove duplicate object keys, fix the JSON, or remove `**` and control characters from `app.auth.begin`/`app.auth.token` issuer literals (comments are allowed; trailing commas are not).
 
 ## KELD-GUARD006
 
@@ -6365,6 +6371,108 @@ match the crate that already emits the code. Do not invent a third spelling.
 - crate: keld-updater-helper
 - message: The updater helper's recovery-only role is disabled in this release (RecoveryDisabled); it refused after anchoring itself, before the writer lease and any write
 - fix: No supported resolution exists other than administrator action; any activation journal, the pointers and the versions are preserved, and no ordinary process repairs them.
+
+## KELD-AUTH-002
+
+- crate: keld-native
+- module: auth
+- message: The provider names no key in the closed v0 provider-profile table; AC14(a) is the only pre-Allow auth refusal.
+- fix: Correct the quoted/escaped unknown provider key to one of the closed valid profile keys named by the auth diagnostic.
+- status: Implemented T3 macOS provider-resolution source; route qualification remains bound to its recorded predicates, not established by this registry entry. Other OS-broker paths remain targets.
+
+
+## KELD-AUTH-003
+
+- crate: keld-native
+- module: auth
+- message: Exact-literal redirect mode is selected with a dynamic port before any socket attempt.
+- fix: Configure the one registered fixed redirect port; bind-0 is not a fallback. If a socket was attempted and bind failed, use KELD-AUTH-004 instead.
+- status: Implemented T3 macOS redirect-plan validation source; qualification is limited to recorded predicates, not every profile/mode. Other OS-broker paths remain targets.
+
+
+## KELD-AUTH-010
+
+- crate: keld-native
+- module: auth
+- message: The child-supplied login_hint exceeds its byte bound or contains a control character.
+- fix: Correct only the named length or character-class constraint; never include the offending login_hint value in the diagnostic.
+- status: Implemented T3 macOS post-Allow login-hint validation source; qualification is limited to recorded ordering and privacy predicates. Other OS-broker paths remain targets.
+
+
+## KELD-AUTH-011
+
+- crate: keld-native
+- module: auth
+- message: Loopback/scheme callback parsing or correlation failed, including malformed or ambiguous input and unknown/mismatched state. An IdP rejection of the authorization-code/verifier exchange is KELD-AUTH-013.
+- fix: Discard the callback and restart the flow; never echo the received state.
+- status: T3 macOS implements host-side callback parsing and state correlation. This entry does not establish other scheme/broker behavior or IdP PKCE validation.
+
+
+## KELD-AUTH-012
+
+- crate: keld-native
+- module: auth
+- message: The IdP returned an OAuth callback error such as access_denied, invalid_scope or interaction_required.
+- fix: Treat the sanitized provider error code as the IdP decision, not Keld policy. Bound provider text to 256 bytes with truncation marked, strip controls and quote it in a delimited position after Keld’s code; never parse it to select a Keld code path.
+- status: Implemented T3 macOS correlated provider-callback error and D18(a) sanitation source; qualification is predicate-specific. Other OS-broker paths remain targets.
+
+
+## KELD-AUTH-013
+
+- crate: keld-native
+- module: auth
+- message: Authorization-code-to-token exchange failed, or the IdP refused the scope set requested by auth.token.
+- fix: Name transport failure versus IdP rejection and start only a new user-initiated operation; no automatic retry occurs. Sanitize any provider text under D18(a): bounded 256-byte quoted text, controls stripped and truncation marked, after Keld’s own code.
+- status: Implemented T3 macOS transport and token-reply source; this registry entry proves neither complete exchange behavior nor T3 flow acceptance. Other OS-broker paths remain targets.
+
+
+## KELD-AUTH-016
+
+- crate: keld-native
+- module: auth
+- message: Authentication failed in local entropy, encoding, processing-bound, clock or internal-state processing; no existing AUTH001–015 condition applies.
+- fix: Start a new user-initiated auth.begin; if the failure persists, report the static Keld diagnostic. Keep message/fix resource-free and constant; do not include credentials, account ids, issuer/request values, provider text or raw OS errors.
+- status: Reviewed T3 local source contract, recorded in the same PR under §8 delegated approval. Runtime evidence is predicate-specific; unreachable/target conditions remain unqualified. Never use for unresolved/stale account or AC13(d).
+
+## KELD-AUTH-004
+
+- crate: keld-native
+- module: auth
+- message: Rung-3 loopback listener bind or system-browser launch failed.
+- fix: For a bind failure, free the configured port or correct its registration; for a browser-launch failure, configure a working default browser. Name which operation failed.
+- status: Implemented T3 macOS loopback-bind and system-browser-launch failure source; qualification is limited to recorded predicates. Other OS-broker paths remain targets.
+
+## KELD-AUTH-007
+
+- crate: keld-native
+- module: auth
+- message: The user cancelled the broker or external-user-agent dialog (canceledLogin class); the failure is non-terminal.
+- fix: Retry only when initiated by the user. A defect-neutral default-browser hint is permitted; do not assert an Apple defect or retry automatically.
+- status: Implemented T3 macOS owning-flow cancellation source; qualification is limited to recorded predicates and does not establish external-dialog cancellation. Other OS-broker paths remain targets.
+
+## KELD-AUTH-008
+
+- crate: keld-native
+- module: auth
+- message: The authorization step did not complete within the host bound.
+- fix: Start a new user-initiated auth.begin; never retry automatically.
+- status: Implemented T3 macOS authorization/launch deadline source; qualification is limited to recorded absolute-bound predicates. Other OS-broker paths remain targets.
+
+## KELD-AUTH-009
+
+- crate: keld-native
+- module: auth
+- message: Terminal invalid_grant refresh failure evicts the session and ends its liveness.
+- fix: Sign in again through auth.begin; the host holds no durable credential.
+- status: Implemented T3 macOS exact terminal-refresh classification and current-session eviction source; qualification is predicate-specific, not proof of every IdP outcome. Other OS-broker paths remain targets.
+
+## KELD-AUTH-015
+
+- crate: keld-native
+- module: auth
+- message: The resolved provider profile has no clientId configured for this application; this is refused only after guard Allow.
+- fix: Add clientId under the named profile in the keld.config.ts auth section. Name the profile/configuration location without account or session detail.
+- status: Implemented T3 macOS post-Allow missing-client refusal source; qualification is limited to recorded admission and denial-equality predicates. Other OS-broker paths remain targets.
 
 ---
 

@@ -1,5 +1,10 @@
 //! Validated no-flag application boot and host-owned primary session (KEL-96).
 
+#[cfg(target_os = "macos")]
+mod auth_router;
+#[cfg(target_os = "macos")]
+use auth_router::{AuthSession, AuthWork, AuthWorker};
+
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
 use std::collections::HashMap;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -65,18 +70,22 @@ use keld_ipc::CallError;
 use keld_ipc::codec::{decode, encode};
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
 use keld_ipc::frame::{CorrelationId, FrameKind};
+#[cfg(all(test, target_os = "macos"))]
+use keld_ipc::link::read_primary_app_frame_interruptible_with_privileged_call;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-use keld_ipc::link::read_quit_drain_frame;
+use keld_ipc::link::read_quit_drain_frame_with_privileged_calls;
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
 use keld_ipc::link::{
-    AppLinkDeadlines, read_primary_app_frame_interruptible,
-    read_primary_app_frame_interruptible_with_privileged_call, write_frame,
+    AppLinkDeadlines, GuardedCallAdmission, read_primary_app_frame_interruptible_with_admission,
+    write_frame,
 };
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
 use keld_ipc::{
     APP_LINK_IO_DEADLINE, APP_LINK_READER_POLL, BootstrapStream, ECHO_CHANNEL, IpcError,
     LIFECYCLE_CHANNEL, LifecycleEvent, LifecycleRequest, LifecycleResponse,
 };
+#[cfg(any(target_os = "macos", target_os = "linux", windows, test))]
+use keld_native::auth::AuthConfiguration;
 #[cfg(all(test, target_os = "macos", not(keld_core_native_renderer_main)))]
 use keld_native::fs::FsResponse;
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
@@ -205,6 +214,7 @@ struct AppBootSelection {
     entry_path: PathBuf,
     entry_file: File,
     renderer_html: Vec<u8>,
+    auth_configuration: AuthConfiguration,
     #[cfg(windows)]
     mode: WindowsBootMode,
 }
@@ -1155,6 +1165,13 @@ struct BootDocument {
     entry: String,
     renderer: String,
     permissions: PermissionsDocument,
+    /// Optional schema-v1 operator auth carrier. This is deserialized only;
+    /// Native remains the sole owner of profile filtering and semantic checks.
+    #[serde(
+        default,
+        deserialize_with = "keld_native::auth::deserialize_auth_configuration"
+    )]
+    auth: AuthConfiguration,
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux", windows, test))]
@@ -1171,6 +1188,7 @@ struct ParsedBoot {
     entry: PathBuf,
     renderer: PathBuf,
     permissions_digest: [u8; 32],
+    auth_configuration: AuthConfiguration,
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux", windows, test))]
@@ -1222,6 +1240,7 @@ fn parse_boot_bytes(bytes: &[u8]) -> Result<ParsedBoot, HostAppError> {
         entry,
         renderer,
         permissions_digest,
+        auth_configuration: document.auth,
     })
 }
 
@@ -1341,6 +1360,7 @@ fn validate_from_root(root: &Path) -> Result<ValidatedBootSelection, HostAppErro
             entry_path: parsed.entry,
             entry_file,
             renderer_html,
+            auth_configuration: parsed.auth_configuration,
         },
         permissions_file,
         permissions_digest: parsed.permissions_digest,
@@ -1402,6 +1422,7 @@ fn validate_windows_boot_files(
             entry_path: parsed.entry,
             entry_file,
             renderer_html,
+            auth_configuration: parsed.auth_configuration,
             mode,
         },
         permissions_file,
@@ -2126,6 +2147,7 @@ fn run_app(
         entry_path,
         entry_file,
         renderer_html,
+        auth_configuration,
     } = boot;
     let html = String::from_utf8(renderer_html).map_err(|source| {
         HostAppError::new(
@@ -2185,6 +2207,7 @@ fn run_app(
         guardian_owner.handle(),
         shutdown,
         guard_snapshot,
+        auth_configuration,
     )?;
     guardian_owner.attach_router(router.handle())?;
     let (window_events_tx, window_events_rx) = mpsc::channel();
@@ -2894,6 +2917,7 @@ fn run_app_direct(
         entry_path,
         entry_file,
         renderer_html,
+        auth_configuration: _auth_configuration,
         #[cfg(windows)]
         mode,
     } = boot;
@@ -3909,7 +3933,7 @@ struct GuardianOwner {
 #[cfg(target_os = "macos")]
 enum GuardianOwnerCommand {
     AttachRouter(
-        PrimaryRouterHandle,
+        Box<PrimaryRouterHandle>,
         std::sync::mpsc::SyncSender<Result<(), String>>,
     ),
     ArmRecovery(RecoveryArm, std::sync::mpsc::SyncSender<Result<(), String>>),
@@ -3957,6 +3981,7 @@ impl GuardianOwner {
                 loop {
                     match command_rx.recv_timeout(Duration::from_millis(50)) {
                         Ok(GuardianOwnerCommand::AttachRouter(attached, reply)) => {
+                            let attached = *attached;
                             let observed = if router.is_some() {
                                 Err(String::from("router is already attached"))
                             } else {
@@ -4203,7 +4228,10 @@ impl GuardianOwner {
     fn attach_router(&self, router: PrimaryRouterHandle) -> Result<(), HostAppError> {
         let (reply_tx, reply_rx) = mpsc::sync_channel(1);
         self.command_tx
-            .send(GuardianOwnerCommand::AttachRouter(router, reply_tx))
+            .send(GuardianOwnerCommand::AttachRouter(
+                Box::new(router),
+                reply_tx,
+            ))
             .map_err(|_| app_detail("guardian router attachment", "guardian owner stopped"))?;
         match reply_rx.recv_timeout(GUARDIAN_OWNER_REPLY_DEADLINE) {
             Ok(Ok(())) => Ok(()),
@@ -5014,6 +5042,10 @@ struct PrimaryRouterHandle {
     shutdown: SessionShutdownState,
     fs: Option<Weak<FsDispatchSession>>,
     fs_worker_commands: Option<SyncSender<FsWorkerCommand>>,
+    #[cfg(target_os = "macos")]
+    auth: Option<Arc<AuthSession>>,
+    #[cfg(target_os = "macos")]
+    auth_commands: Option<SyncSender<AuthWork>>,
     guardian: PlatformPrimaryOwnerHandle,
     window_commands: Sender<AppWindowCommand>,
     #[cfg(all(test, target_os = "macos"))]
@@ -5351,6 +5383,22 @@ impl PrimaryRouterHandle {
         }
     }
 
+    fn privileged_calls(&self) -> &'static [&'static keld_ipc::channel_table::ChannelEntry] {
+        #[cfg(target_os = "macos")]
+        if self.auth.is_some() {
+            return if self.fs.is_some() {
+                &[&keld_ipc::channel_table::FS, &keld_ipc::channel_table::AUTH]
+            } else {
+                &[&keld_ipc::channel_table::AUTH]
+            };
+        }
+        if self.fs.is_some() {
+            &[&keld_ipc::channel_table::FS]
+        } else {
+            &[]
+        }
+    }
+
     fn retire_current_generation_locked(
         &self,
         current: &mut Option<ActivePrimaryGeneration>,
@@ -5371,7 +5419,15 @@ impl PrimaryRouterHandle {
             ));
         };
         active.reader_stop.store(true, Ordering::Release);
+        #[cfg(target_os = "macos")]
+        let auth_retirement = self
+            .auth
+            .as_ref()
+            .map_or(Ok(()), |auth| auth.retire(attempt));
+        #[cfg(not(target_os = "macos"))]
+        let auth_retirement = Ok(());
         collapse_app_results([
+            auth_retirement,
             self.fail_pending_echo_for_attempt(attempt, pending_detail),
             self.fs
                 .as_ref()
@@ -5415,7 +5471,30 @@ impl PrimaryRouterHandle {
                 .take()
                 .map(|corr| (LIFECYCLE_CHANNEL, corr)),
         ];
-        write_best_effort_answers(&mut active.writer, pending.into_iter().flatten(), error);
+        #[cfg(target_os = "macos")]
+        let auth_pending = match self
+            .auth
+            .as_ref()
+            .map(|auth| auth.pending_for(attempt))
+            .transpose()
+        {
+            Ok(pending) => pending.unwrap_or_default(),
+            Err(error) => {
+                eprintln!("{error}");
+                if let Some(auth) = &self.auth {
+                    auth.stop_tail();
+                }
+                let _ = self.window_commands.send(AppWindowCommand::Fatal);
+                Vec::new()
+            }
+        };
+        #[cfg(not(target_os = "macos"))]
+        let auth_pending = std::iter::empty();
+        write_best_effort_answers(
+            &mut active.writer,
+            pending.into_iter().flatten().chain(auth_pending),
+            error,
+        );
     }
 
     /// After an accepted `Quit`'s real REPLY and its FS drain, answers each
@@ -5469,11 +5548,11 @@ impl PrimaryRouterHandle {
         hard_deadline: Instant,
     ) -> QuitDrainEnd {
         let error = CallError::quit_drained();
-        let privileged_call = self.fs.is_some().then_some(&keld_ipc::channel_table::FS);
+        let privileged_calls = self.privileged_calls();
         loop {
-            let header = match read_quit_drain_frame(
+            let header = match read_quit_drain_frame_with_privileged_calls(
                 reader,
-                privileged_call,
+                privileged_calls,
                 idle_deadline,
                 hard_deadline,
             ) {
@@ -5484,7 +5563,9 @@ impl PrimaryRouterHandle {
                 Err(_) => return QuitDrainEnd::NotAdmitted,
             };
             let declares_err = header.channel() == LIFECYCLE_CHANNEL
-                || (privileged_call.is_some() && header.channel() == FS_CHANNEL);
+                || privileged_calls
+                    .iter()
+                    .any(|entry| entry.id() == header.channel());
             if header.kind() != FrameKind::Call || !declares_err {
                 continue;
             }
@@ -5759,6 +5840,28 @@ impl PrimaryRouterHandle {
         Ok(())
     }
 
+    #[cfg(target_os = "macos")]
+    fn retire_auth_for_quit(&self, attempt: u32) -> Result<(), HostAppError> {
+        self.auth.as_ref().map_or(Ok(()), |auth| {
+            let retired = (|| {
+                let mut current = self
+                    .current
+                    .lock()
+                    .map_err(|_| app_detail("auth Quit", "generation lock poisoned"))?;
+                self.answer_pending_calls_locked(
+                    &mut current,
+                    attempt,
+                    &CallError::generation_retired(),
+                );
+                auth.retire(attempt)
+            })();
+            // Close physical admission even when the caller bookkeeping failed.
+            // Native stop/poll remains the sole proof of physical drain.
+            auth.stop_tail();
+            retired
+        })
+    }
+
     fn lifecycle_quit(
         &self,
         attempt: u32,
@@ -5837,19 +5940,45 @@ impl PrimaryRouterHandle {
             }
         }
         self.write_quit_reply(correlation, reply)?;
-        self.quiesce_and_drain_fs()?;
+        #[cfg(target_os = "macos")]
+        let auth_retirement = self.retire_auth_for_quit(attempt);
+        #[cfg(not(target_os = "macos"))]
+        let auth_retirement = Ok(());
+        if let Err(fs_error) = self.quiesce_and_drain_fs() {
+            return collapse_app_results([auth_retirement, Err(fs_error)]);
+        }
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         self.answer_calls_after_quit(attempt, reader);
-        let mut current_guard = self
-            .current
-            .lock()
-            .map_err(|_| app_detail("primary session generation", "generation lock poisoned"))?;
-        let active = current_guard.as_mut().ok_or_else(|| {
-            app_detail(
-                "lifecycle Quit link close",
-                "current primary generation disappeared after the reply",
-            )
-        })?;
+        self.finish_quit_link_and_tail(
+            auth_retirement,
+            #[cfg(windows)]
+            reader,
+        )
+    }
+
+    fn finish_quit_link_and_tail(
+        &self,
+        auth_retirement: Result<(), HostAppError>,
+        #[cfg(windows)] reader: &mut BootstrapStream,
+    ) -> Result<(), HostAppError> {
+        let Ok(mut current_guard) = self.current.lock() else {
+            return collapse_app_results([
+                auth_retirement,
+                Err(app_detail(
+                    "primary session generation",
+                    "generation lock poisoned",
+                )),
+            ]);
+        };
+        let Some(active) = current_guard.as_mut() else {
+            return collapse_app_results([
+                auth_retirement,
+                Err(app_detail(
+                    "lifecycle Quit link close",
+                    "current primary generation disappeared after the reply",
+                )),
+            ]);
+        };
         #[cfg(windows)]
         let peer_close = await_windows_quit_peer_close(reader);
         #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -5860,7 +5989,12 @@ impl PrimaryRouterHandle {
         );
         current_guard.take();
         drop(current_guard);
-        collapse_app_results([peer_close, link_close, self.finish_tail("lifecycle Quit")])
+        collapse_app_results([
+            auth_retirement,
+            peer_close,
+            link_close,
+            self.finish_tail("lifecycle Quit"),
+        ])
     }
 
     fn write_quit_reply(
@@ -5938,6 +6072,27 @@ impl PrimaryRouterHandle {
             .lock()
             .map_err(|_| app_detail("primary session generation", "generation lock poisoned"))?;
         let pending = self.fail_any_pending_echo("application call retired by CLI lease loss");
+        #[cfg(target_os = "macos")]
+        let auth_retirement = if let Some(active) = current_guard.as_ref() {
+            let attempt = active.attempt;
+            self.answer_pending_calls_locked(
+                &mut current_guard,
+                attempt,
+                &CallError::generation_retired(),
+            );
+            self.auth.as_ref().map_or(Ok(()), |auth| {
+                let retired = auth.retire(attempt);
+                auth.stop_tail();
+                retired
+            })
+        } else {
+            if let Some(auth) = &self.auth {
+                auth.stop_tail();
+            }
+            Ok(())
+        };
+        #[cfg(not(target_os = "macos"))]
+        let auth_retirement = Ok(());
         let link = current_guard.as_mut().map_or(Ok(()), |active| {
             finish_link_shutdown(
                 active.writer.shutdown_app_link(),
@@ -5946,7 +6101,12 @@ impl PrimaryRouterHandle {
         });
         current_guard.take();
         drop(current_guard);
-        collapse_app_results([pending, link, self.finish_tail("CLI lease loss")])
+        collapse_app_results([
+            pending,
+            auth_retirement,
+            link,
+            self.finish_tail("CLI lease loss"),
+        ])
     }
 
     fn apply_generation_update(
@@ -6208,7 +6368,10 @@ impl PrimaryRouterHandle {
                 {
                     result = Err(append_app_cleanup(primary, [Err(cleanup)]));
                 }
-                if result.is_err() && !handle.is_current(attempt) {
+                // A revoked reader during live recovery is intentionally inert.
+                // Accepted terminal shutdown errors must survive current removal:
+                // removing the link is one cleanup step, not proof all steps passed.
+                if result.is_err() && !handle.is_current(attempt) && handle.shutdown.is_running() {
                     result = Ok(());
                 }
                 if result.is_err() && handle.is_current(attempt) {
@@ -6267,6 +6430,10 @@ impl PrimaryRouterHandle {
 
     fn finish_tail(&self, phase: &'static str) -> Result<(), HostAppError> {
         self.guardian.shutdown_and_wait()?;
+        #[cfg(target_os = "macos")]
+        if let Some(auth) = &self.auth {
+            return auth.quit_after_drain(self);
+        }
         self.window_commands
             .send(AppWindowCommand::Quit)
             .map_err(|_| app_detail(phase, "UI event loop is unavailable"))
@@ -6277,6 +6444,8 @@ impl PrimaryRouterHandle {
 struct PrimaryRouter {
     handle: PrimaryRouterHandle,
     fs_worker: Option<FsWorker>,
+    #[cfg(target_os = "macos")]
+    auth_worker: Option<AuthWorker>,
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
@@ -6386,6 +6555,10 @@ impl PrimaryRouter {
             shutdown,
             fs: fs.map(GuardSnapshot::fs_weak),
             fs_worker_commands: None,
+            #[cfg(target_os = "macos")]
+            auth: None,
+            #[cfg(target_os = "macos")]
+            auth_commands: None,
             guardian,
             window_commands,
             #[cfg(all(test, target_os = "macos"))]
@@ -6397,6 +6570,8 @@ impl PrimaryRouter {
             1,
             #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
             fs_worker_test_gate,
+            #[cfg(target_os = "macos")]
+            None,
         )?;
         router.handle.install_prepared_generation(1, stream)?;
         Ok(router)
@@ -6408,6 +6583,7 @@ impl PrimaryRouter {
         guardian: PlatformPrimaryOwnerHandle,
         shutdown: SessionShutdownState,
         fs: Option<&GuardSnapshot>,
+        #[cfg(target_os = "macos")] auth_configuration: AuthConfiguration,
     ) -> Result<Self, HostAppError> {
         Self::start_bound_with_fs_setup(
             bound,
@@ -6417,6 +6593,8 @@ impl PrimaryRouter {
             fs,
             #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
             None,
+            #[cfg(target_os = "macos")]
+            fs.map(|snapshot| (snapshot.verified.clone(), auth_configuration)),
         )
     }
 
@@ -6431,7 +6609,7 @@ impl PrimaryRouter {
         fs: Option<&GuardSnapshot>,
         gate: Arc<FsWorkerTestGate>,
     ) -> Result<Self, HostAppError> {
-        Self::start_bound_with_fs_setup(bound, window_commands, guardian, shutdown, fs, Some(gate))
+        Self::start_bound_with_fs_setup(bound, window_commands, guardian, shutdown, fs, Some(gate), None)
     }
     }
 
@@ -6443,6 +6621,7 @@ impl PrimaryRouter {
         fs: Option<&GuardSnapshot>,
         #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
         fs_worker_test_gate: Option<Arc<FsWorkerTestGate>>,
+        #[cfg(target_os = "macos")] auth_startup: Option<(VerifiedManifest, AuthConfiguration)>,
     ) -> Result<Self, HostAppError> {
         let identity = PrimaryLinkIdentity::Role(bound.principal());
         let attempt = bound.attempt();
@@ -6465,6 +6644,10 @@ impl PrimaryRouter {
             shutdown,
             fs: fs.map(GuardSnapshot::fs_weak),
             fs_worker_commands: None,
+            #[cfg(target_os = "macos")]
+            auth: None,
+            #[cfg(target_os = "macos")]
+            auth_commands: None,
             guardian,
             window_commands,
             #[cfg(all(test, target_os = "macos"))]
@@ -6476,6 +6659,8 @@ impl PrimaryRouter {
             attempt,
             #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
             fs_worker_test_gate,
+            #[cfg(target_os = "macos")]
+            auth_startup,
         )?;
         router
             .handle
@@ -6490,7 +6675,14 @@ impl PrimaryRouter {
         #[cfg(all(test, any(target_os = "macos", target_os = "linux")))] test_gate: Option<
             Arc<FsWorkerTestGate>,
         >,
+        #[cfg(target_os = "macos")] auth_startup: Option<(VerifiedManifest, AuthConfiguration)>,
     ) -> Result<Self, HostAppError> {
+        #[cfg(target_os = "macos")]
+        let auth_worker = auth_startup
+            .map(|(verified, configuration)| {
+                AuthWorker::start(&mut handle, verified, configuration)
+            })
+            .transpose()?;
         let fs_worker = if let Some(broker) = broker {
             Some(FsWorker::start(
                 &mut handle,
@@ -6502,7 +6694,12 @@ impl PrimaryRouter {
         } else {
             None
         };
-        Ok(Self { handle, fs_worker })
+        Ok(Self {
+            handle,
+            fs_worker,
+            #[cfg(target_os = "macos")]
+            auth_worker,
+        })
     }
 
     fn handle(&self) -> PrimaryRouterHandle {
@@ -6523,6 +6720,10 @@ impl PrimaryRouter {
             let fs_close = fs
                 .as_ref()
                 .map_or(Ok(()), |session| session.close_admission());
+            #[cfg(target_os = "macos")]
+            if let Some(auth) = &self.handle.auth {
+                auth.stop_tail();
+            }
             self.handle.shutdown.stop_reader();
             let mut current = match self.handle.current.lock() {
                 Ok(current) => current,
@@ -6532,6 +6733,10 @@ impl PrimaryRouter {
                 .handle
                 .fail_any_pending_echo("application call retired by router shutdown");
             if let Some(active) = current.take() {
+                #[cfg(target_os = "macos")]
+                if let Some(auth) = &self.handle.auth {
+                    let _ = auth.retire(active.attempt);
+                }
                 let _ = active.writer.shutdown_app_link();
             }
             (fs_close, pending)
@@ -6558,6 +6763,10 @@ impl PrimaryRouter {
             results.push(fs.drain());
         }
         if let Some(worker) = &mut self.fs_worker {
+            results.push(worker.stop_and_join());
+        }
+        #[cfg(target_os = "macos")]
+        if let Some(worker) = &mut self.auth_worker {
             results.push(worker.stop_and_join());
         }
         collapse_app_results(results)
@@ -6795,20 +7004,34 @@ fn read_primary_frames(
         // selects the existing privileged CALL policy for the `fs` channel
         // table entry; an unguarded session keeps the legacy
         // echo/lifecycle/PING policy.
-        let frame = if handle.fs.is_some() {
-            read_primary_app_frame_interruptible_with_privileged_call(
-                reader,
-                reader_stop,
-                || handle.pending_echo_corr_for(attempt),
-                &keld_ipc::channel_table::FS,
-                || handle.has_outstanding_fs_call(attempt),
-            )
-        } else {
-            read_primary_app_frame_interruptible(reader, reader_stop, || {
-                handle.pending_echo_corr_for(attempt)
-            })
-        };
-        let (header, payload) = match frame {
+        let frame = read_primary_app_frame_interruptible_with_admission(
+            reader,
+            reader_stop,
+            || handle.pending_echo_corr_for(attempt),
+            handle.privileged_calls(),
+            |entry, corr| {
+                #[cfg(not(target_os = "macos"))]
+                let _ = corr; // Auth correlation admission is macOS-only.
+                if entry.id() == FS_CHANNEL {
+                    return if handle.has_outstanding_fs_call(attempt) {
+                        GuardedCallAdmission::RejectSession
+                    } else {
+                        GuardedCallAdmission::Admit
+                    };
+                }
+                #[cfg(target_os = "macos")]
+                if entry.id() == keld_ipc::channel_table::AUTH.id() {
+                    return handle
+                        .auth
+                        .as_ref()
+                        .map_or(GuardedCallAdmission::RejectSession, |auth| {
+                            auth.admission(attempt, corr)
+                        });
+                }
+                GuardedCallAdmission::RejectSession
+            },
+        );
+        let frame = match frame {
             Ok(Some(frame)) => frame,
             Ok(None) => {
                 if handle.shutdown.cause() == SESSION_CLI_LEASE_LOST {
@@ -6849,6 +7072,25 @@ fn read_primary_frames(
         if handle.shutdown.cause() == SESSION_CLI_LEASE_LOST {
             handle.cli_lease_lost()?;
             return Ok(());
+        }
+        let keld_ipc::link::PrimaryAppFrame {
+            header,
+            payload,
+            admission,
+        } = frame;
+        if admission == GuardedCallAdmission::AtCapacity {
+            // The shared reader consumed the complete bounded frame under its
+            // original clock. It admitted no call and the body is never decoded.
+            with_primary_caller_writer(&handle.current, &handle.shutdown, caller, |writer| {
+                keld_ipc::write_call_error(
+                    writer,
+                    header.channel(),
+                    header.corr(),
+                    &CallError::admission_capacity(),
+                )
+                .map_err(|source| app_ipc("guarded call capacity refusal", &source))
+            })?;
+            continue;
         }
         match (header.kind(), header.channel()) {
             #[cfg(target_os = "macos")]
@@ -6903,6 +7145,13 @@ fn read_primary_frames(
                         ));
                     }
                 }
+            }
+            #[cfg(target_os = "macos")]
+            (FrameKind::Call, channel)
+                if channel == keld_ipc::channel_table::AUTH.id()
+                    && handle.shutdown.is_running() =>
+            {
+                handle.enqueue_auth(attempt, header.corr(), &payload, reader_stop)?;
             }
             (FrameKind::Call, LIFECYCLE_CHANNEL) => {
                 let request: LifecycleRequest =
@@ -6991,12 +7240,11 @@ fn write_best_effort_answers(
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
-fn dispatch_primary_echo(
+fn with_primary_caller_writer(
     current: &Mutex<Option<ActivePrimaryGeneration>>,
     shutdown: &SessionShutdownState,
     caller: &PrimaryCallerContext,
-    correlation: CorrelationId,
-    payload: &[u8],
+    write: impl FnOnce(&mut BootstrapStream) -> Result<(), HostAppError>,
 ) -> Result<(), HostAppError> {
     let _transition = shutdown.transition_guard();
     let mut current = current
@@ -7018,17 +7266,30 @@ fn dispatch_primary_echo(
     {
         return Ok(());
     }
-    let reply =
-        keld_ipc::echo::handle_echo(payload).map_err(|source| app_ipc("echo dispatch", &source))?;
-    write_frame(
-        &mut active.writer,
-        FrameKind::Reply,
-        0,
-        ECHO_CHANNEL,
-        correlation,
-        &reply,
-    )
-    .map_err(|source| app_ipc("primary session reply", &source))
+    write(&mut active.writer)
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+fn dispatch_primary_echo(
+    current: &Mutex<Option<ActivePrimaryGeneration>>,
+    shutdown: &SessionShutdownState,
+    caller: &PrimaryCallerContext,
+    correlation: CorrelationId,
+    payload: &[u8],
+) -> Result<(), HostAppError> {
+    with_primary_caller_writer(current, shutdown, caller, |writer| {
+        let reply = keld_ipc::echo::handle_echo(payload)
+            .map_err(|source| app_ipc("echo dispatch", &source))?;
+        write_frame(
+            writer,
+            FrameKind::Reply,
+            0,
+            ECHO_CHANNEL,
+            correlation,
+            &reply,
+        )
+        .map_err(|source| app_ipc("primary session reply", &source))
+    })
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
@@ -8038,6 +8299,125 @@ mod tests {
     }
 
     #[test]
+    fn strict_schema_v1_boot_carries_auth_without_filtering_profiles() {
+        let bytes = br#"{"schema":1,"name":"Fixture","entry":"src/main.ts","renderer":"index.html","permissions":{"file":"keld.permissions.jsonc","content_sha256":"sha256:ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356"},"auth":{"entra-common":{"fixedRedirect":"http://localhost:53161/callback"},"future-provider":{}}}"#;
+        let parsed = parse_boot_bytes(bytes).expect("schema-v1 auth carrier");
+        assert_eq!(
+            parsed.auth_configuration.len(),
+            2,
+            "Core must not filter provider keys"
+        );
+        let entra = parsed
+            .auth_configuration
+            .get("entra-common")
+            .expect("known profile");
+        assert_eq!(
+            entra.client_id, None,
+            "missing clientId remains data until Native post-Allow"
+        );
+        assert_eq!(
+            entra.fixed_redirect.as_deref(),
+            Some("http://localhost:53161/callback")
+        );
+        assert!(parsed.auth_configuration.contains_key("future-provider"));
+    }
+
+    #[test]
+    fn strict_schema_v1_boot_rejects_unknown_auth_profile_fields() {
+        let cases = [
+            br#"{"schema":1,"name":"Fixture","entry":"src/main.ts","renderer":"index.html","permissions":{"file":"keld.permissions.jsonc","content_sha256":"sha256:ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356"},"auth":{"entra-common":{"clientID":"operator-client"}}}"#.as_slice(),
+            br#"{"schema":1,"name":"Fixture","entry":"src/main.ts","renderer":"index.html","permissions":{"file":"keld.permissions.jsonc","content_sha256":"sha256:ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356"},"auth":{"entra-common":{"clientId":"operator-client","fixedRedirct":"http://localhost:53161/callback"}}}"#.as_slice(),
+            br#"{"schema":1,"name":"Fixture","entry":"src/main.ts","renderer":"index.html","permissions":{"file":"keld.permissions.jsonc","content_sha256":"sha256:ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356"},"auth":{"future-provider":{"clientID":"unused"}}}"#.as_slice(),
+        ];
+        for bytes in cases {
+            let error = must_err(
+                parse_boot_bytes(bytes),
+                "unknown inner auth field must refuse",
+            );
+            assert_eq!(error.code(), "KELD-CORE-035");
+        }
+    }
+
+    #[test]
+    fn strict_schema_v1_auth_null_fields_preserve_absence() {
+        let bytes = br#"{"schema":1,"name":"Fixture","entry":"src/main.ts","renderer":"index.html","permissions":{"file":"keld.permissions.jsonc","content_sha256":"sha256:ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356"},"auth":{"entra-common":{"clientId":null,"fixedRedirect":null}}}"#;
+        let parsed = parse_boot_bytes(bytes).expect("existing Option null compatibility");
+        let profile = parsed
+            .auth_configuration
+            .get("entra-common")
+            .expect("known profile");
+        assert!(profile.client_id.is_none());
+        assert!(profile.fixed_redirect.is_none());
+    }
+
+    #[test]
+    fn strict_schema_v1_boot_without_auth_defaults_to_empty() {
+        let bytes = br#"{"schema":1,"name":"Fixture","entry":"src/main.ts","renderer":"index.html","permissions":{"file":"keld.permissions.jsonc","content_sha256":"sha256:ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356"}}"#;
+        let parsed = parse_boot_bytes(bytes).expect("legacy schema-v1 boot descriptor");
+        assert!(parsed.auth_configuration.is_empty());
+    }
+
+    #[test]
+    fn strict_schema_v1_boot_rejects_duplicate_auth_shape() {
+        let cases = [
+            br#"{"schema":1,"name":"Fixture","entry":"src/main.ts","renderer":"index.html","permissions":{"file":"keld.permissions.jsonc","content_sha256":"sha256:ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356"},"auth":{},"auth":{"entra-common":{}}}"#.as_slice(),
+            br#"{"schema":1,"name":"Fixture","entry":"src/main.ts","renderer":"index.html","permissions":{"file":"keld.permissions.jsonc","content_sha256":"sha256:ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356"},"auth":{"entra-common":{"clientId":"first","clientId":"second"}}}"#.as_slice(),
+            // The map owner must reject repeated decoded profile keys as well
+            // as duplicate struct fields. These are independent raw JSON literals.
+            br#"{"schema":1,"name":"Fixture","entry":"src/main.ts","renderer":"index.html","permissions":{"file":"keld.permissions.jsonc","content_sha256":"sha256:ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356"},"auth":{"entra-common":{"clientId":"first"},"entra-common":{"clientId":"second"}}}"#.as_slice(),
+            br#"{"schema":1,"name":"Fixture","entry":"src/main.ts","renderer":"index.html","permissions":{"file":"keld.permissions.jsonc","content_sha256":"sha256:ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356"},"auth":{"entra-common":{},"entra\u002dcommon":{}}}"#.as_slice(),
+            br#"{"schema":1,"name":"Fixture","entry":"src/main.ts","renderer":"index.html","permissions":{"file":"keld.permissions.jsonc","content_sha256":"sha256:ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356"},"auth":{"unknown-profile":{},"unknown-profile":{}}}"#.as_slice(),
+        ];
+        for bytes in cases {
+            let error = must_err(parse_boot_bytes(bytes), "duplicate auth shape must fail");
+            assert_eq!(error.code(), "KELD-CORE-035");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn schema_v1_auth_carrier_survives_actual_root_validation() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = tempfile::tempdir().expect("temporary parent");
+        let root = temp.path().join("stage");
+        fs::create_dir(&root).expect("stage root");
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).expect("private mode");
+        fs::create_dir(root.join("src")).expect("source directory");
+        fs::write(root.join("src/main.ts"), b"export {};\n").expect("entry");
+        fs::write(root.join("index.html"), b"<p>fixture</p>\n").expect("renderer");
+        fs::write(root.join(PERMISSIONS_FILE), b"{}\n").expect("permissions");
+        // Independent literal: this is the exact serialized schema-v1 boot carrier.
+        fs::write(
+            root.join(BOOT_FILE),
+            br#"{"schema":1,"name":"Fixture","entry":"src/main.ts","renderer":"index.html","permissions":{"file":"keld.permissions.jsonc","content_sha256":"sha256:ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356"},"auth":{"entra-common":{"fixedRedirect":"http://localhost:53161/callback"},"future-provider":{}}}"#,
+        )
+        .expect("boot descriptor");
+
+        let selection = validate_from_root(&root).expect("validate real staged boot files");
+        assert_eq!(selection.app.auth_configuration.len(), 2);
+        let entra = selection
+            .app
+            .auth_configuration
+            .get("entra-common")
+            .expect("configured profile");
+        assert_eq!(
+            entra.client_id, None,
+            "clientId remains for Native post-Allow handling"
+        );
+        assert_eq!(
+            entra.fixed_redirect.as_deref(),
+            Some("http://localhost:53161/callback")
+        );
+        assert!(
+            selection
+                .app
+                .auth_configuration
+                .contains_key("future-provider")
+        );
+    }
+
+    #[test]
     fn bounded_boot_rejects_zero_limit_plus_one_and_non_utf8() {
         assert!(parse_boot_bytes(&[]).is_err());
         let exact = vec![b' '; MAX_BOOT_BYTES];
@@ -8435,6 +8815,10 @@ mod tests {
             shutdown,
             fs: Some(snapshot.fs_weak()),
             fs_worker_commands: None,
+            #[cfg(target_os = "macos")]
+            auth: None,
+            #[cfg(target_os = "macos")]
+            auth_commands: None,
             guardian: GuardianOwnerHandle {
                 command_tx: guardian_tx,
             },
@@ -8569,6 +8953,10 @@ mod tests {
             shutdown: SessionShutdownState::new(),
             fs: Some(snapshot.fs_weak()),
             fs_worker_commands: Some(commands.clone()),
+            #[cfg(target_os = "macos")]
+            auth: None,
+            #[cfg(target_os = "macos")]
+            auth_commands: None,
             guardian: GuardianOwnerHandle {
                 command_tx: guardian_tx,
             },
@@ -8579,6 +8967,8 @@ mod tests {
         let router = PrimaryRouter {
             handle: handle.clone(),
             fs_worker: None,
+            #[cfg(target_os = "macos")]
+            auth_worker: None,
         };
 
         let admitted = snapshot
@@ -9752,6 +10142,10 @@ mod tests {
             shutdown: SessionShutdownState::new(),
             fs: Some(snapshot.fs_weak()),
             fs_worker_commands: None,
+            #[cfg(target_os = "macos")]
+            auth: None,
+            #[cfg(target_os = "macos")]
+            auth_commands: None,
             guardian: GuardianOwnerHandle {
                 command_tx: guardian_tx,
             },
@@ -9767,6 +10161,8 @@ mod tests {
                     .expect("transfer successor drain broker"),
             ),
             1,
+            None,
+            #[cfg(target_os = "macos")]
             None,
         )
         .expect("successor drain router worker");
@@ -11474,6 +11870,10 @@ mod tests {
             shutdown: SessionShutdownState::new(),
             fs: None,
             fs_worker_commands: None,
+            #[cfg(target_os = "macos")]
+            auth: None,
+            #[cfg(target_os = "macos")]
+            auth_commands: None,
             guardian: PlatformPrimaryOwnerHandle { command_tx },
             window_commands: window_tx,
             #[cfg(target_os = "macos")]
@@ -11526,6 +11926,8 @@ mod tests {
         let mut router = PrimaryRouter {
             handle: handle.clone(),
             fs_worker: None,
+            #[cfg(target_os = "macos")]
+            auth_worker: None,
         };
         router
             .stop_and_join()
@@ -11556,6 +11958,8 @@ mod tests {
         let mut router = PrimaryRouter {
             handle: handle.clone(),
             fs_worker: None,
+            #[cfg(target_os = "macos")]
+            auth_worker: None,
         };
         router.stop_and_join().expect("router teardown");
         assert!(
@@ -11619,6 +12023,8 @@ mod tests {
         let mut router = PrimaryRouter {
             handle: handle.clone(),
             fs_worker: None,
+            #[cfg(target_os = "macos")]
+            auth_worker: None,
         };
         let teardown = thread::spawn(move || {
             teardown_start.wait();
@@ -11881,6 +12287,10 @@ mod tests {
             shutdown: SessionShutdownState::new(),
             fs: None,
             fs_worker_commands: None,
+            #[cfg(target_os = "macos")]
+            auth: None,
+            #[cfg(target_os = "macos")]
+            auth_commands: None,
             guardian: PlatformPrimaryOwnerHandle {
                 command_tx: guardian_tx,
             },

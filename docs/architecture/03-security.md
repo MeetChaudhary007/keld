@@ -86,7 +86,7 @@ manifest decoder.
     "shell":   { "open": ["https://docs.myapp.com/**"], "spawn": [{ "cmd": "$RESOURCES/bin/ffmpeg", "args": "reviewed" }] },
     "system":  ["clipboard.read", "clipboard.write", "notifications", "tray", "global-shortcuts"],
     "secrets": ["keychain:myapp/**"],
-    // approved spec, not live: docs/specs/keld-auth.md. Each entry is a declared
+    // T3 macOS implementation: docs/specs/keld-auth.md. Each entry is a declared
     // issuer literal from that spec's closed v0 provider-profile table — the one
     // v0 row is `entra-common`. A literal that names no tabled profile matches
     // nothing the host ever asks for and therefore always denies.
@@ -175,7 +175,7 @@ manifest decoder.
   the app ceiling by default. Any additional role-specific authority is a separately
   versioned, reviewable manifest change; it cannot arise from an Electron
   `utilityProcess` option or child request. This schema is not live.
-- **Auth grants (destination; approved spec, not live):** `app.auth.begin` and
+- **Auth grants (T3 macOS implementation; other OS-broker paths remain targets):** `app.auth.begin` and
   `app.auth.token` scopes are both issuer-URL exact string literals, compared by byte
   equality — after `evaluate`'s own `..`-segment rejection, which runs on the resource
   before any scope is matched, so a byte-equal pair containing a `..` segment still
@@ -195,8 +195,11 @@ manifest decoder.
   denial's full `Display` (`02-ipc.md` §2), because the requested resource is the thing
   being protected — on denials, and on the host-internal invariant path where the guard
   Allows but no session resolved, so the two cannot be told apart.
-  Owner: `docs/specs/keld-auth.md` (KEL-89). No auth channel, handler, or load-time
-  entry rejection exists in the workspace yet.
+  Owner: `docs/specs/keld-auth.md` (KEL-89). Shared manifest loading rejects the
+  malformed `auth.begin`/`auth.token` issuer entries above. Direct public serde
+  deserialization is not that load path; AC13(d) separately owns its defense.
+  The T3 macOS implementation supplies the auth channel, Core admission and
+  Native runtime handler. Other OS-broker paths remain targets.
 - **CSP injection** by default on every webview (`default` = self + keld:// + declared
   net hosts; `static-only` = no script eval, no net). Opt-out is a named, linted grant.
 
@@ -205,7 +208,7 @@ manifest decoder.
 - **Destination:** `keld dev` runs with a **dev-permissive profile + recorder**: every
   would-be denial is allowed but recorded with a stack.
   **v0:** no dev-permissive profile and no denial recorder exist in the workspace;
-  `evaluate` remains default-deny for the live call sites (media + host `fs`), and
+  `evaluate` remains default-deny for the live call sites (media, host `fs` and T3 macOS auth), and
   echo / lifecycle stay ungated as in §1.
 - `keld doctor --permissions` (and `keld build`) is **planned**: diffs recorded
   usage against the manifest and prints exact JSON patches ("your app called
