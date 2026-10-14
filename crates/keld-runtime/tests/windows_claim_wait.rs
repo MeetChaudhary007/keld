@@ -43,9 +43,13 @@ const FLOOR: Duration = Duration::from_secs(5);
 /// the wait it serves by at most one slice.
 const SLICE: Duration = Duration::from_millis(50);
 /// "At once": the bound on the handle mechanism's latency, from the call that ends the
-/// candidate to the owner's return. PROVISIONAL until the S6c2b measurement sets it:
-/// a quarter of [`FLOOR`].
-const AT_ONCE: Duration = Duration::from_millis(1250);
+/// candidate to the owner's return. S6c2b measured it over twenty runs of this file
+/// while the full `keld-runtime` suite ran concurrently as load (its evidence record,
+/// `flake-load1.log`, on this machine: maximum 5 ms, median 1 ms); four times that
+/// maximum is 20 ms, and the bound takes the rule's floor instead, sixteen default
+/// timer ticks (16 x 15.625 ms), for a loaded two-core runner. It stays twenty times
+/// below [`FLOOR`], so the negative control still separates the two mechanisms.
+const AT_ONCE: Duration = Duration::from_millis(250);
 /// `TerminateJobObject`'s exit code in `WindowsProcessJob::terminate_and_wait`.
 const JOB_TERMINATION_EXIT: u32 = 1;
 
