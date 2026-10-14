@@ -1437,8 +1437,9 @@ on the instance:
   I/O.
 - The app-link bootstrap listener follows the same rule. A `shutdown` in flight at
   admission's one-shot yields `Cancelled`, never an authenticated stream that has been
-  aborted. After `KELD-AR1` the owner reads `KELD-AB1` and `KELD-AY1` by
-position, decides the health window (30 seconds plus a margin G, which the caller
+  aborted.
+
+After `KELD-AR1` the owner reads `KELD-AB1` and `KELD-AY1` by position, decides the health window (30 seconds plus a margin G, which the caller
 passes until KEL-53 §6 S6c fixes it from its measurement) as a state machine over an
 injected clock, and then either writes `KELD-AK1` accepted and waits for the
 candidate's end of file before it closes, or writes `KELD-AK1` rolled back once without
