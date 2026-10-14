@@ -7,6 +7,11 @@
 //! debug-only `KELD_TEST_WINDOWS_SECOND_SESSION=1` seam asks the loop for exactly one
 //! more session; production never requests one, so the loop runs one session until the
 //! S6c coordinator (or the rollback restore) starts the next.
+//!
+//! The persistent profile record is read only at write-free points: after a session's
+//! `Ready` (its `running` was written before navigation and nothing writes it again
+//! before the quit) and after the host exited. The host replaces the record by a rename
+//! under its lease, which an open reader's handle makes fail, so the cell never polls it.
 
 use crate::PRODUCT_DEADLINE;
 use crate::support::control::{accept_ready_generation, read_control_line};
@@ -25,15 +30,11 @@ use std::net::{TcpListener, TcpStream};
 use std::os::windows::io::{AsRawHandle as _, OwnedHandle};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
 
 /// The debug-only S6c evidence trigger (the shape of `KELD_TEST_WINDOWS_LEASE_CENSUS`).
 const SECOND_SESSION_SEAM: &str = "KELD_TEST_WINDOWS_SECOND_SESSION";
-const RECORD_POLL: Duration = Duration::from_millis(5);
 
 /// One observation of the persistent profile's lifecycle record, as the KEL-135
 /// `profile.lifecycle.v1` document encodes it (`phase` and the owning `pid`).
@@ -72,16 +73,16 @@ struct ObservedSession {
 }
 
 impl ObservedSession {
-    /// Accepts the next Bun generation on `control` and waits for the session's `Ready`,
-    /// its titled window and the record `running` under `host_pid`.
+    /// Accepts the next Bun generation on `control` and waits for the session's `Ready`
+    /// and its titled window; the record then reads `running` under `host_pid`.
     fn observe(control: &TcpListener, host: &mut Child, host_pid: u32, root: &Path) -> Self {
         let (reader, writer, bun_pid, link) = accept_ready_generation(control, host);
         let bun = open_process_for_wait(bun_pid, true);
         let window = wait_for_host_window(host_pid, Instant::now() + PRODUCT_DEADLINE);
-        wait_for_record(
-            root,
-            &LifecycleObservation::running_under(host_pid),
-            Instant::now() + PRODUCT_DEADLINE,
+        assert_eq!(
+            read_lifecycle_record(root),
+            LifecycleObservation::running_under(host_pid),
+            "the session's engine holds the profile"
         );
         Self {
             reader,
@@ -191,12 +192,6 @@ fn kel270_s6c_two_consecutive_sessions_in_one_host_process() {
     let mut seamed = SeamedHost::launch(&installed, root.path(), &control);
     let (host_pid, host_birth) = (seamed.pid, seamed.birth);
 
-    // Independent record watcher: samples every distinct (phase, owner) transition of
-    // the persistent profile record for the run's evidence. The assertions use bounded
-    // waits on the record, never this sampled sequence.
-    let stop_watcher = Arc::new(AtomicBool::new(false));
-    let watcher = spawn_record_watcher(root.path().to_path_buf(), Arc::clone(&stop_watcher));
-
     let first = ObservedSession::observe(&control, &mut seamed.host, host_pid, root.path());
     let (bun_1, link_1, window_1, threads_1) = (
         first.bun_pid,
@@ -208,6 +203,8 @@ fn kel270_s6c_two_consecutive_sessions_in_one_host_process() {
 
     // Session 2 in the same process: a fresh Bun generation binds on the same control
     // listener. A host that exits after one session fails here with its exit status.
+    // Reaching `Ready` here also proves the engine found `idle`: a non-idle record under
+    // this live owner is refused as `ProfileInUse` (KEL-135 `next_windows_lifecycle_action`).
     let second = ObservedSession::observe(&control, &mut seamed.host, host_pid, root.path());
     seamed.assert_same_live_process();
     assert_ne!(
@@ -230,8 +227,6 @@ fn kel270_s6c_two_consecutive_sessions_in_one_host_process() {
     let bun_2_handle = second.quit("second session");
 
     let (status, stdout, stderr) = seamed.finish();
-    stop_watcher.store(true, Ordering::Release);
-    let record_sequence = watcher.join().expect("record watcher thread");
     assert!(
         status.success(),
         "host exited with {status}\nstdout:\n{stdout}\nstderr:\n{stderr}"
@@ -245,21 +240,16 @@ fn kel270_s6c_two_consecutive_sessions_in_one_host_process() {
         WAIT_OBJECT_0,
         "the second Bun primary is reaped by the host exit"
     );
-    wait_for_record(
-        root.path(),
-        &LifecycleObservation::idle(),
-        Instant::now() + PRODUCT_DEADLINE,
+    assert_eq!(
+        read_lifecycle_record(root.path()),
+        LifecycleObservation::idle(),
+        "the profile is released after the second session"
     );
     let engine_constructions = count_engine_constructions(&stdout);
     assert_eq!(
         engine_constructions,
         (2, 2),
         "two engine constructions in one process\nstdout:\n{stdout}"
-    );
-    assert!(
-        record_sequence.contains(&LifecycleObservation::running_under(host_pid))
-            && record_sequence.last() == Some(&LifecycleObservation::idle()),
-        "the sampled record sequence must include the asserted phases: {record_sequence:?}"
     );
     println!(
         "KELD_KEL270_H5 {}",
@@ -271,9 +261,6 @@ fn kel270_s6c_two_consecutive_sessions_in_one_host_process() {
             "bun_2_creation": bun_2_times.creation,
             "window_handles": [window_1["handle"], window_2["handle"]],
             "host_threads_at_ready": [threads_1, threads_2],
-            "record_sequence": record_sequence.iter().map(|observation| {
-                serde_json::json!({"phase": observation.phase, "owner_pid": observation.owner_pid})
-            }).collect::<Vec<_>>(),
             "engine_constructions": engine_constructions.0,
         })
     );
@@ -306,12 +293,12 @@ fn count_engine_constructions(stdout: &str) -> (usize, usize) {
 }
 
 /// The one persistent profile's `profile.lifecycle.v1` beneath the isolated test root.
-fn lifecycle_record_path(root: &Path) -> Option<PathBuf> {
+fn lifecycle_record_path(root: &Path) -> PathBuf {
     let namespaces = root.join("Keld").join("profiles").join("v1");
     let mut found = None;
-    for entry in fs::read_dir(&namespaces).ok()? {
-        let entry = entry.ok()?;
-        if entry.file_type().ok()?.is_dir() {
+    for entry in fs::read_dir(&namespaces).expect("read the profile namespaces") {
+        let entry = entry.expect("profile namespace entry");
+        if entry.file_type().expect("namespace entry type").is_dir() {
             assert!(
                 found.is_none(),
                 "exactly one persistent profile namespace under {}",
@@ -320,54 +307,23 @@ fn lifecycle_record_path(root: &Path) -> Option<PathBuf> {
             found = Some(entry.path().join("profile.lifecycle.v1"));
         }
     }
-    found
+    found.expect("one persistent profile namespace")
 }
 
-/// Reads the record if it exists and is readable right now; a replace in flight
-/// (rename or an exclusive writer) reads as `None` and is sampled again.
-fn read_lifecycle_record(root: &Path) -> Option<LifecycleObservation> {
-    let bytes = fs::read(lifecycle_record_path(root)?).ok()?;
-    let document: Value = serde_json::from_slice(&bytes).ok()?;
-    let phase = document["phase"].as_str()?.to_owned();
+/// Reads the record at a point where the host does not write it (module note).
+fn read_lifecycle_record(root: &Path) -> LifecycleObservation {
+    let path = lifecycle_record_path(root);
+    let bytes = fs::read(&path).unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+    let document: Value = serde_json::from_slice(&bytes).expect("lifecycle record JSON");
+    let phase = document["phase"]
+        .as_str()
+        .expect("lifecycle record phase")
+        .to_owned();
     let owner_pid = match &document["owner"] {
         Value::Null => None,
-        owner => Some(owner["pid"].as_u64()?),
+        owner => Some(owner["pid"].as_u64().expect("lifecycle owner pid")),
     };
-    Some(LifecycleObservation { phase, owner_pid })
-}
-
-fn wait_for_record(root: &Path, expected: &LifecycleObservation, deadline: Instant) {
-    loop {
-        let observed = read_lifecycle_record(root);
-        if observed.as_ref() == Some(expected) {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "profile record did not reach {expected:?}; last observation {observed:?}"
-        );
-        thread::park_timeout(RECORD_POLL);
-    }
-}
-
-fn spawn_record_watcher(
-    root: PathBuf,
-    stop: Arc<AtomicBool>,
-) -> thread::JoinHandle<Vec<LifecycleObservation>> {
-    thread::spawn(move || {
-        let mut sequence: Vec<LifecycleObservation> = Vec::new();
-        loop {
-            if let Some(observed) = read_lifecycle_record(&root)
-                && sequence.last() != Some(&observed)
-            {
-                sequence.push(observed);
-            }
-            if stop.load(Ordering::Acquire) {
-                return sequence;
-            }
-            thread::park_timeout(RECORD_POLL);
-        }
-    })
+    LifecycleObservation { phase, owner_pid }
 }
 
 /// Thread census of the host (evidence only: tao parks one wait thread per event loop).
