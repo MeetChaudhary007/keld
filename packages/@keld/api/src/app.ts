@@ -164,3 +164,10 @@ export async function invokeFs(payload: Uint8Array): Promise<Uint8Array> {
   const link = await ensureLink();
   return link.callFs(payload);
 }
+
+/** Package-private auth invocation on the existing role singleton link. */
+export async function invokeAuth(payload: Uint8Array, deadlineMs: number): Promise<Uint8Array> {
+  await app.whenReady();
+  const link = await ensureLink();
+  return link.callAuth(payload, deadlineMs);
+}

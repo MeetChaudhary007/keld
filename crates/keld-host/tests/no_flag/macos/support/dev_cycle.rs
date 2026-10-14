@@ -227,6 +227,13 @@ impl ShippingDevCycle {
         )
     }
 
+    fn trace_phase(&self, action: &str, signal: Option<&str>) {
+        eprintln!(
+            "KELD_DEV_CYCLE_ACTION action={action} signal={signal:?} roles={}",
+            self.evidence()
+        );
+    }
+
     pub(crate) fn crash_and_recover(&mut self) {
         let old_guardian = self.guardian_pid;
         let old_bun = self.bun_pid;
@@ -281,6 +288,7 @@ impl ShippingDevCycle {
     }
 
     pub(crate) fn kill_cli_and_expect_lease_shutdown(&mut self) {
+        self.trace_phase("kill-cli", Some("KILL"));
         let cli = self.cli.as_mut().expect("live shipping CLI");
         cli.kill().expect("SIGKILL only the shipping CLI");
         let status = cli.wait().expect("wait killed shipping CLI");
@@ -322,6 +330,7 @@ impl ShippingDevCycle {
         signal_name: &str,
         number: i32,
     ) {
+        self.trace_phase("signal-cli-group", Some(signal_name));
         signal_process_group(&format!("-{signal_name}"), self.cli_pid)
             .unwrap_or_else(|error| panic!("group {signal_name} failed: {error}"));
         let status = self
@@ -344,6 +353,7 @@ impl ShippingDevCycle {
     }
 
     pub(crate) fn self_terminate_and_expect_verbatim_error(&mut self) {
+        self.trace_phase("app-self-terminate", None);
         self.control_writer
             .write_all(b"EXIT0\n")
             .expect("request unrequested status-zero exit");
@@ -359,6 +369,7 @@ impl ShippingDevCycle {
     }
 
     pub(crate) fn quit_and_expect_success(&mut self) {
+        self.trace_phase("orderly-quit", None);
         self.control_writer
             .write_all(b"QUIT\n")
             .expect("request T2 relaunch Quit");
@@ -379,9 +390,29 @@ impl ShippingDevCycle {
     }
 
     pub(crate) fn assert_group_gone(&mut self) {
+        eprintln!(
+            "KELD_DEV_AWAIT_GONE role=host pid={} roles={}",
+            self.host_pid,
+            self.evidence()
+        );
         await_process_gone(self.host_pid);
+        eprintln!(
+            "KELD_DEV_AWAIT_GONE role=guardian pid={} roles={}",
+            self.guardian_pid,
+            self.evidence()
+        );
         await_process_gone(self.guardian_pid);
+        eprintln!(
+            "KELD_DEV_AWAIT_GONE role=bun pid={} roles={}",
+            self.bun_pid,
+            self.evidence()
+        );
         await_process_gone(self.bun_pid);
+        eprintln!(
+            "KELD_DEV_AWAIT_GONE role=descendant pid={} roles={}",
+            self.descendant_pid,
+            self.evidence()
+        );
         await_process_gone(self.descendant_pid);
         assert_eq!(native_windows(self.host_pid, TITLE), [] as [u32; 0]);
         self.group_gone = true;

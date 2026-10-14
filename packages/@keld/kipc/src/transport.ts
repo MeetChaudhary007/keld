@@ -1,4 +1,4 @@
-// @keld/kipc-transport sha256:994beb63f821bda9c4394e2faae39cfcb5ea4ddd7da4d464c7a53b90a3173964
+// @keld/kipc-transport sha256:f054baf639fd1b245248cc6f024cc53daa1d45e064687542d3932ed1ecf4cf95
 /**
  * Canonical TypeScript kipc v2 app-link transport (KEL-136).
  *
@@ -44,10 +44,12 @@ export const ECHO_CHANNEL = 1;
 export const FS_CHANNEL = 2;
 /** Channel `lifecycle` (`keld_ipc::channel_table::LIFECYCLE`). */
 export const LIFECYCLE_CHANNEL = 3;
+/** Channel `auth` (`keld_ipc::channel_table::AUTH`). */
+export const AUTH_CHANNEL = 4;
 /** An allocated channel id (`keld_ipc::channel_table::CHANNEL_TABLE`). */
-export type AllocatedChannel = typeof ECHO_CHANNEL | typeof FS_CHANNEL | typeof LIFECYCLE_CHANNEL;
+export type AllocatedChannel = typeof ECHO_CHANNEL | typeof FS_CHANNEL | typeof LIFECYCLE_CHANNEL | typeof AUTH_CHANNEL;
 /** Every allocated channel id, in table order. */
-export const ALLOCATED_CHANNELS: readonly AllocatedChannel[] = Object.freeze([ECHO_CHANNEL, FS_CHANNEL, LIFECYCLE_CHANNEL]);
+export const ALLOCATED_CHANNELS: readonly AllocatedChannel[] = Object.freeze([ECHO_CHANNEL, FS_CHANNEL, LIFECYCLE_CHANNEL, AUTH_CHANNEL]);
 /** Channels whose receive class carries host `EVENT`s (`ReceiveClass::carries_host_events`). */
 export const HOST_EVENT_CHANNELS: readonly AllocatedChannel[] = Object.freeze([LIFECYCLE_CHANNEL]);
 // @generated-end channel-table
@@ -989,38 +991,49 @@ export function encodeVarint(n: number): Uint8Array {
   return new Uint8Array(bytes);
 }
 
+function decodeVarintAt(bytes: Uint8Array, offset: number, truncatedDetail: string): [number, number];
+function decodeVarintAt(bytes: Uint8Array, offset: number, truncatedDetail: string, width: 64): [bigint, number];
 function decodeVarintAt(
   bytes: Uint8Array,
   offset: number,
   truncatedDetail: string,
-): [number, number] {
+  width: 32 | 64 = 32,
+): [number | bigint, number] {
   if (!Number.isInteger(offset) || offset < 0 || offset > bytes.length) {
     throw kipcError(
       "KELD-IPC-003",
-      `varint offset must be an integer in [0, ${bytes.length}], got ${offset}`,
+      "varint offset must be an integer in [0, " + bytes.length + "], got " + offset,
     );
   }
   let result = 0;
+  let wideResult: bigint | undefined;
   let placeValue = 1;
   let pos = offset;
-  for (let byteIndex = 0; byteIndex < 5; byteIndex += 1) {
-    if (pos >= bytes.length) {
-      throw kipcError("KELD-IPC-003", truncatedDetail);
-    }
+  const maximumBytes = width === 32 ? 5 : 10;
+  const finalMaximum = width === 32 ? 0x0f : 0x01;
+  for (let byteIndex = 0; byteIndex < maximumBytes; byteIndex += 1) {
+    if (pos >= bytes.length) throw kipcError("KELD-IPC-003", truncatedDetail);
     const byte = bytes[pos];
     pos += 1;
-    if (byteIndex === 4 && byte > 0x0f) {
-      throw kipcError(
-        "KELD-IPC-003",
-        "u32 varint exceeds five bytes or overflows its fifth byte",
-      );
+    if (byteIndex === maximumBytes - 1 && byte > finalMaximum) {
+      throw kipcError("KELD-IPC-003", width === 32
+        ? "u32 varint exceeds five bytes or overflows its fifth byte"
+        : "u64 varint exceeds ten bytes or overflows its tenth byte");
     }
-    result += (byte & 0x7f) * placeValue;
-    if ((byte & 0x80) === 0) return [result, pos];
+    if (width === 32) result += (byte & 0x7f) * placeValue;
+    else wideResult = (wideResult ?? 0n) | (BigInt(byte & 0x7f) << BigInt(byteIndex * 7));
+    if ((byte & 0x80) === 0) return [width === 32 ? result : wideResult ?? 0n, pos];
     placeValue *= 128;
   }
-  throw kipcError("KELD-IPC-003", "u32 varint exceeds five bytes");
+  throw kipcError("KELD-IPC-003", width === 32
+    ? "u32 varint exceeds five bytes" : "u64 varint exceeds ten bytes");
 }
+
+/** Decode an exact Rust u64 as bigint; no Number conversion loses its precision. */
+export function decodeU64Varint(bytes: Uint8Array, offset: number): [bigint, number] {
+  return decodeVarintAt(bytes, offset, "truncated u64 varint", 64);
+}
+
 
 /** Decodes an unsigned LEB128 varint starting at `offset`. Returns `[value, nextOffset]`. */
 export function decodeVarint(bytes: Uint8Array, offset: number): [number, number] {
@@ -1371,7 +1384,8 @@ export function selectInboundPolicy(
   }
 }
 
-function linkError(code: string, detail: string): KeldCallError {
+/** @internal Construct a typed local transport/admission failure without copying its code mapping. */
+export function linkError(code: string, detail: string): KeldCallError {
   return codedError(code, `${code}: ${detail}`);
 }
 
@@ -1514,7 +1528,8 @@ function inboundTable(
   return { eventChannels: new Set(eventChannels), callPolicies };
 }
 
-function requireDeadline(deadlineMs: number): void {
+/** @internal Shared finite caller-deadline policy; public adapters validate before bootstrap. */
+export function requireDeadline(deadlineMs: number): void {
   if (
     typeof deadlineMs !== "number" ||
     !Number.isFinite(deadlineMs) ||

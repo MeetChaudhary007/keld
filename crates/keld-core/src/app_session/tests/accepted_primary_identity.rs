@@ -121,6 +121,7 @@ fn accepted_app_bound_identity_is_refused_by_primary_admission() {
         GuardianOwnerHandle { command_tx: owner },
         SessionShutdownState::new(),
         None,
+        AuthConfiguration::new(),
     );
     let Err(error) = result else {
         panic!("accepted app-bound role entered primary router");
