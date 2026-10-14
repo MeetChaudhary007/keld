@@ -1,0 +1,531 @@
+//! The profile handover's cooperative quit, its forced end at the quit deadline D, and
+//! a handover whose UI tail fails (KEL-53 §7 row "8, 20 (profile handover)", cells h11,
+//! h12 and the tail half of h9; KEL-270 T4d S6c2a).
+//!
+//! The debug-only `KELD_TEST_WINDOWS_HANDOVER=1` seam requests a handover right after
+//! the first session's `Ready` and asks the loop for one more session, the shape the
+//! S6c2e coordinator and the S6c2f restore use. The host ends its UI through the
+//! existing `Quit` command, writes `LastWindowClosed` itself once the loop has
+//! returned, waits up to D for the application's `Quit` and otherwise ends the session
+//! under the handover cause. Each cell observes the application's control stream, the
+//! host's own evidence line (its monotonic clock), the profile record at write-free
+//! points, the native window census and the next session or launch.
+
+use super::sessions::{
+    LifecycleObservation, ObservedSession, SeamedHost, assert_first_exited_before_second,
+    engine_constructions, read_lifecycle_record,
+};
+use crate::support::control::{accept_ready_generation, try_read_control_line};
+use crate::support::installed::{INSTALLER_ENV, InstalledApp, SIGNED_HOST_A_P1, fixture_env};
+use crate::support::process::{open_process_for_wait, process_times, wait_for_process_signal};
+use crate::support::product::ProductFixture;
+use crate::support::profile_run::{ProfileTestRoot, assert_profile_test_root_feature};
+use serde_json::Value;
+use std::io::BufReader;
+use std::net::{TcpListener, TcpStream};
+use std::os::windows::io::AsRawHandle as _;
+use std::process::Command;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
+use std::time::{Duration, Instant};
+use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+
+/// The debug-only handover trigger (the shape of `KELD_TEST_WINDOWS_SECOND_SESSION`).
+const HANDOVER_SEAM: &str = "KELD_TEST_WINDOWS_HANDOVER";
+/// The keld-wv fault fixture that loses the host's `BrowserProcessExited` under a short
+/// post-exit grace (h9's seam-injected barrier grace expiry).
+const BARRIER_GRACE_EXPIRY_SEAM: &str = "KELD_TEST_WINDOWS_BARRIER_GRACE_EXPIRY";
+/// The reference application's h12 mode: it reports `LastWindowClosed` and ignores it.
+const IGNORE_LAST_WINDOW_CLOSED: &str = "KELD_T1B_IGNORE_LAST_WINDOW_CLOSED";
+/// The host's evidence line for one seam-driven handover (its monotonic clock).
+const HOST_EVIDENCE_PREFIX: &str = "KELD_TEST_WINDOWS_HANDOVER ";
+/// The quit deadline D as KEL-53 §4 *Margin and deadlines* records it (S6c2a's
+/// measurement is below its 10 s floor, so D is the floor).
+const QUIT_DEADLINE: Duration = Duration::from_secs(10);
+/// Kill switch over the handover's UI end (the liveness-gated barrier: at most the
+/// shutdown hang guard plus the post-exit grace) and D; never a synchronization wait.
+const HANDOVER_KILL_SWITCH: Duration = Duration::from_secs(150);
+
+/// The run-owned installation, profile root and control listener one cell uses.
+struct HandoverCell {
+    fixture: ProductFixture,
+    root: ProfileTestRoot,
+    installed: InstalledApp,
+    control: TcpListener,
+}
+
+impl HandoverCell {
+    fn prepare() -> Self {
+        let fixture = ProductFixture::new();
+        let root = ProfileTestRoot::new();
+        let installed = InstalledApp::install(
+            &fixture.project,
+            &fixture_env(SIGNED_HOST_A_P1),
+            &fixture_env(INSTALLER_ENV),
+        );
+        assert_profile_test_root_feature(installed.host(), root.path());
+        let control = TcpListener::bind(("127.0.0.1", 0)).expect("bind handover control");
+        Self {
+            fixture,
+            root,
+            installed,
+            control,
+        }
+    }
+
+    fn finish(self) {
+        drop(self.installed);
+        self.root.remove();
+        drop(self.fixture);
+    }
+}
+
+/// Independent native observation of the host's main window every ~100 ms, recorded as
+/// `(ms since start, main window handle)` transitions (h8: record only).
+struct WindowWatch {
+    stop: Arc<AtomicBool>,
+    join: Option<thread::JoinHandle<Vec<(u64, u64)>>>,
+}
+
+impl WindowWatch {
+    fn start(pid: u32) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&stop);
+        let started = Instant::now();
+        let join = thread::spawn(move || {
+            let mut transitions = Vec::new();
+            let mut last = None;
+            while !flag.load(Ordering::Acquire) {
+                let handle = host_main_window(pid);
+                if last != Some(handle) {
+                    transitions.push((elapsed_ms(started), handle));
+                    last = Some(handle);
+                }
+                thread::park_timeout(Duration::from_millis(100));
+            }
+            transitions
+        });
+        Self {
+            stop,
+            join: Some(join),
+        }
+    }
+
+    fn finish(mut self) -> Vec<(u64, u64)> {
+        self.stop.store(true, Ordering::Release);
+        self.join
+            .take()
+            .expect("window watcher thread")
+            .join()
+            .expect("window watcher did not panic")
+    }
+}
+
+impl Drop for WindowWatch {
+    /// Stops the observer when a failed assertion unwinds past `finish`.
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+/// The first window's disappearance to the second window's appearance, in ms, when
+/// both transitions were observed.
+fn window_gap_ms(transitions: &[(u64, u64)]) -> Option<u64> {
+    let mut seen = false;
+    let mut gone_at = None;
+    for (at, handle) in transitions {
+        match (seen, gone_at, *handle) {
+            (false, _, handle) if handle != 0 => seen = true,
+            (true, None, 0) => gone_at = Some(*at),
+            (true, Some(gone), handle) if handle != 0 => return Some(at.saturating_sub(gone)),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn elapsed_ms(since: Instant) -> u64 {
+    u64::try_from(since.elapsed().as_millis()).expect("elapsed ms fits u64")
+}
+
+/// The host's main window handle as the OS reports it now, `0` when it has none.
+fn host_main_window(pid: u32) -> u64 {
+    host_main_window_with_title(pid).0
+}
+
+/// The host's main window handle and title as the OS reports them now.
+fn host_main_window_with_title(pid: u32) -> (u64, String) {
+    let output = Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            &format!(
+                "$p=Get-Process -Id {pid} -ErrorAction SilentlyContinue; if ($p) {{ [string]([uint64]$p.MainWindowHandle.ToInt64()) + '|' + $p.MainWindowTitle }} else {{ '0|' }}"
+            ),
+        ])
+        .output()
+        .expect("query host main window");
+    let text = String::from_utf8_lossy(&output.stdout);
+    let text = text.trim();
+    let (handle, title) = text.split_once('|').unwrap_or(("0", ""));
+    (handle.parse().unwrap_or(0), title.to_owned())
+}
+
+/// Reads one control line under the handover kill switch.
+fn read_handover_line(reader: &mut BufReader<TcpStream>, label: &str) -> String {
+    try_read_control_line(reader, Instant::now() + HANDOVER_KILL_SWITCH)
+        .unwrap_or_else(|error| panic!("{label}: {error}"))
+}
+
+/// The one `KELD_TEST_WINDOWS_HANDOVER` line the seam-driven host prints.
+fn host_handover_evidence(stdout: &str) -> Value {
+    let lines: Vec<&str> = stdout
+        .lines()
+        .filter_map(|line| line.strip_prefix(HOST_EVIDENCE_PREFIX))
+        .collect();
+    assert_eq!(
+        lines.len(),
+        1,
+        "exactly one host handover evidence line\nstdout:\n{stdout}"
+    );
+    serde_json::from_str(lines[0].trim_end()).expect("host handover evidence JSON")
+}
+
+struct HandoverRun {
+    host_pid: u32,
+    bun_pids: [u32; 2],
+    window_census_at_last_window_closed: u64,
+    control_ms_from_last_window_closed_to_link_eof: u64,
+    quit_reply: bool,
+    transitions: Vec<(u64, u64)>,
+    evidence: Value,
+    stdout: String,
+}
+
+/// One seam-driven handover followed by a second session the controller quits: the
+/// shared body of h11 and h12, which differ only in the application's mode.
+fn run_handover_then_second_session(
+    cell: &HandoverCell,
+    ignore_last_window_closed: bool,
+) -> HandoverRun {
+    let mut seams = vec![(HANDOVER_SEAM, "1")];
+    if ignore_last_window_closed {
+        seams.push((IGNORE_LAST_WINDOW_CLOSED, "1"));
+    }
+    let mut seamed = SeamedHost::launch(&cell.installed, cell.root.path(), &cell.control, &seams);
+    let host_pid = seamed.pid;
+    let watch = WindowWatch::start(host_pid);
+
+    // Session 1 to Ready. The seam requests the handover right after Ready, so the
+    // window is closing from here on and the record is not read until the host waits.
+    let (mut reader, _writer, bun_1, link_1) =
+        accept_ready_generation(&cell.control, &mut seamed.host);
+    let bun_1_handle = open_process_for_wait(bun_1, true);
+
+    // 3a: the UI loop returned and the host told the application; the window is gone.
+    assert_eq!(
+        read_handover_line(&mut reader, "await LastWindowClosed"),
+        "LAST_WINDOW_CLOSED"
+    );
+    let last_window_closed_at = Instant::now();
+    let (window_census_at_last_window_closed, window_title) = host_main_window_with_title(host_pid);
+    if ignore_last_window_closed {
+        // The host waits D from here (10 s, write-free), so this census and record
+        // read cannot race the next session: no window of the host exists once the
+        // application is told, and the loop released the profile before the write.
+        assert_eq!(
+            window_census_at_last_window_closed, 0,
+            "the application is told LastWindowClosed only after the window closed (host main window title: {window_title:?})"
+        );
+        assert_eq!(
+            read_lifecycle_record(cell.root.path()),
+            LifecycleObservation::idle(),
+            "the profile is idle before the application is told"
+        );
+    }
+    // With the reference application the next session follows its Quit within
+    // hundreds of milliseconds, so a census here may already see that session's
+    // window; the ordering is asserted by h12 and recorded here (h8).
+
+    // 3b / 3c as the application's mode decides.
+    let next = read_handover_line(&mut reader, "await the session end");
+    let quit_reply = if ignore_last_window_closed {
+        assert_eq!(
+            next, "LINK_EOF",
+            "an application that ignores LastWindowClosed is ended without a Quit reply"
+        );
+        false
+    } else {
+        assert_eq!(
+            next, "QUIT_REPLY",
+            "the host answers the application's Quit"
+        );
+        assert_eq!(
+            read_handover_line(&mut reader, "await the link close"),
+            "LINK_EOF"
+        );
+        true
+    };
+    let control_ms_from_last_window_closed_to_link_eof = elapsed_ms(last_window_closed_at);
+    if ignore_last_window_closed {
+        assert!(
+            Duration::from_millis(control_ms_from_last_window_closed_to_link_eof)
+                >= QUIT_DEADLINE.saturating_sub(Duration::from_secs(1)),
+            "the forced end waited for D: {control_ms_from_last_window_closed_to_link_eof} ms"
+        );
+    }
+
+    // The loop proceeds: a second full session in the same process, ended by the
+    // controller as h5 ends its sessions.
+    let second =
+        ObservedSession::observe(&cell.control, &mut seamed.host, host_pid, cell.root.path());
+    seamed.assert_same_live_process();
+    assert_ne!(
+        bun_1, second.bun_pid,
+        "the second session starts a new Bun primary"
+    );
+    assert_ne!(
+        link_1, second.link,
+        "the second session mints fresh app-link authority"
+    );
+    assert_eq!(
+        wait_for_process_signal(&bun_1_handle, 0),
+        WAIT_OBJECT_0,
+        "the first Bun primary is reaped before the second session's generation binds"
+    );
+    assert_first_exited_before_second(
+        process_times(bun_1_handle.as_raw_handle().cast()),
+        process_times(second.bun.as_raw_handle().cast()),
+    );
+    let bun_2 = second.bun_pid;
+    let bun_2_handle = second.quit("second session");
+    let (status, stdout, stderr) = seamed.finish_by(Instant::now() + HANDOVER_KILL_SWITCH);
+    let transitions = watch.finish();
+    assert!(
+        status.success(),
+        "host exited with {status}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert_eq!(
+        wait_for_process_signal(&bun_2_handle, 0),
+        WAIT_OBJECT_0,
+        "the second Bun primary is reaped by the host exit"
+    );
+    assert_eq!(
+        read_lifecycle_record(cell.root.path()),
+        LifecycleObservation::idle(),
+        "the profile is released after the second session"
+    );
+    let (prepared_folders, environments) = engine_constructions(&stdout);
+    assert_eq!(
+        (prepared_folders.len(), environments),
+        (2, 2),
+        "two engine constructions in one process\nstdout:\n{stdout}"
+    );
+    assert_eq!(
+        prepared_folders[0], prepared_folders[1],
+        "both engines prepared the same persistent profile folder"
+    );
+    let evidence = host_handover_evidence(&stdout);
+    assert_eq!(
+        evidence["deadline_us"].as_u64(),
+        Some(u64::try_from(QUIT_DEADLINE.as_micros()).expect("D fits u64")),
+        "the host's quit deadline is D as the spec records it: {evidence}"
+    );
+    HandoverRun {
+        host_pid,
+        bun_pids: [bun_1, bun_2],
+        window_census_at_last_window_closed,
+        control_ms_from_last_window_closed_to_link_eof,
+        quit_reply,
+        transitions,
+        evidence,
+        stdout,
+    }
+}
+
+/// h11, cooperative quit: the reference application receives `LastWindowClosed` after
+/// the window closed, requests `Quit` within D, the host answers it and the session ends
+/// under the lifecycle-Quit cause, never the forced one; the loop then runs the next
+/// session. The host's own clock yields one D sample (write to Quit frame).
+#[test]
+#[ignore = "requires KELD_KEL254_SIGNED_HOST_A_P1 (a debug host built with kel135-profile-test-root) and KELD_KEL254_INSTALLER_FIXTURE (KEL-254 installed-host operator fixtures)"]
+fn kel270_s6c2a_h11_reference_app_quits_within_d_after_handover() {
+    let cell = HandoverCell::prepare();
+    let run = run_handover_then_second_session(&cell, false);
+    assert!(run.quit_reply);
+    assert_eq!(
+        run.evidence["cause"], "lifecycle-quit",
+        "the application's Quit claimed the session: {}",
+        run.evidence
+    );
+    let quit_wait_us = run.evidence["quit_wait_us"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("the host measured the Quit frame: {}", run.evidence));
+    assert!(
+        quit_wait_us < run.evidence["deadline_us"].as_u64().expect("deadline"),
+        "the Quit arrived inside D: {}",
+        run.evidence
+    );
+    assert!(
+        run.evidence["forced_after_us"].is_null(),
+        "the forced tail never ran: {}",
+        run.evidence
+    );
+    println!(
+        "KELD_KEL270_H11 {}",
+        serde_json::json!({
+            "host_pid": run.host_pid,
+            "bun_pids": run.bun_pids,
+            "host": run.evidence,
+            "window_census_at_last_window_closed": run.window_census_at_last_window_closed,
+            "control_ms_last_window_closed_to_link_eof": run.control_ms_from_last_window_closed_to_link_eof,
+            "window_transitions_ms": run.transitions,
+            "window_gap_ms": window_gap_ms(&run.transitions),
+        })
+    );
+    drop(run.stdout);
+    cell.finish();
+}
+
+/// h12, forced end: an application that ignores `LastWindowClosed` is ended at D under
+/// the handover cause (no Quit reply, the link closed, the Bun primary reaped) and the
+/// loop then proceeds to the next session. Without the deadline the session never
+/// ends within the kill switch, which is this cell's negative control.
+#[test]
+#[ignore = "requires KELD_KEL254_SIGNED_HOST_A_P1 (a debug host built with kel135-profile-test-root) and KELD_KEL254_INSTALLER_FIXTURE (KEL-254 installed-host operator fixtures)"]
+fn kel270_s6c2a_h12_app_ignoring_last_window_closed_is_ended_at_d() {
+    let cell = HandoverCell::prepare();
+    let run = run_handover_then_second_session(&cell, true);
+    assert!(!run.quit_reply);
+    assert_eq!(
+        run.evidence["cause"], "forced",
+        "the handover cause ended the session: {}",
+        run.evidence
+    );
+    let forced_after_us = run.evidence["forced_after_us"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("the host recorded the forced end: {}", run.evidence));
+    assert!(
+        forced_after_us >= run.evidence["deadline_us"].as_u64().expect("deadline"),
+        "the forced end came no earlier than D on the host's clock: {}",
+        run.evidence
+    );
+    assert!(
+        run.evidence["quit_wait_us"].is_null(),
+        "no Quit frame was admitted: {}",
+        run.evidence
+    );
+    println!(
+        "KELD_KEL270_H12 {}",
+        serde_json::json!({
+            "host_pid": run.host_pid,
+            "bun_pids": run.bun_pids,
+            "host": run.evidence,
+            "window_census_at_last_window_closed": run.window_census_at_last_window_closed,
+            "control_ms_last_window_closed_to_link_eof": run.control_ms_from_last_window_closed_to_link_eof,
+            "window_transitions_ms": run.transitions,
+            "window_gap_ms": window_gap_ms(&run.transitions),
+        })
+    );
+    drop(run.stdout);
+    cell.finish();
+}
+
+/// h9, tail half: a handover whose UI end fails (seam-injected barrier grace expiry)
+/// ends the host with the tail's error, with no second session and no `LastWindowClosed`
+/// to the application; the profile record stays `stopping` under the dead host, and the
+/// next launch boots (the current version) and recovers the profile to `Ready`.
+#[test]
+#[ignore = "requires KELD_KEL254_SIGNED_HOST_A_P1 (a debug host built with kel135-profile-test-root) and KELD_KEL254_INSTALLER_FIXTURE (KEL-254 installed-host operator fixtures)"]
+fn kel270_s6c2a_h9_failed_handover_tail_exits_with_its_error() {
+    let cell = HandoverCell::prepare();
+    let mut seamed = SeamedHost::launch(
+        &cell.installed,
+        cell.root.path(),
+        &cell.control,
+        &[(HANDOVER_SEAM, "1"), (BARRIER_GRACE_EXPIRY_SEAM, "1")],
+    );
+    let host_pid = seamed.pid;
+    let (mut reader, _writer, bun_1, _link) =
+        accept_ready_generation(&cell.control, &mut seamed.host);
+    let bun_1_handle = open_process_for_wait(bun_1, true);
+
+    // The handover's UI end faults at the barrier: the host exits with that error.
+    let (failed_status, stdout, stderr) = seamed.finish_by(Instant::now() + HANDOVER_KILL_SWITCH);
+    assert!(
+        !failed_status.success(),
+        "a failed handover tail must end the host with an error\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("KELD-WV-009") && stderr.contains("within the post-exit grace"),
+        "the host reports the barrier's fault\nstderr:\n{stderr}"
+    );
+    let (prepared_folders, environments) = engine_constructions(&stdout);
+    assert_eq!(
+        (prepared_folders.len(), environments),
+        (1, 1),
+        "no second session follows a failed tail\nstdout:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains(HOST_EVIDENCE_PREFIX),
+        "no handover completed\nstdout:\n{stdout}"
+    );
+    // The application was never told and never answered: its only possible control
+    // record after Ready is the link's end of file (or none, when it was reaped first).
+    let after_ready = try_read_control_line(&mut reader, Instant::now() + Duration::from_secs(2));
+    assert!(
+        matches!(after_ready.as_deref(), Ok("LINK_EOF") | Err(_)),
+        "the application saw neither LastWindowClosed nor a Quit reply: {after_ready:?}"
+    );
+    assert_eq!(
+        wait_for_process_signal(&bun_1_handle, 0),
+        WAIT_OBJECT_0,
+        "the Bun primary is reaped with the failed host"
+    );
+    assert_eq!(
+        read_lifecycle_record(cell.root.path()),
+        LifecycleObservation {
+            phase: "stopping".to_owned(),
+            owner_pid: Some(u64::from(host_pid)),
+        },
+        "idle was never reached: the record stays stopping under the dead host"
+    );
+
+    // The next launch, with no seam, boots and recovers the profile to Ready.
+    let mut relaunched = SeamedHost::launch(&cell.installed, cell.root.path(), &cell.control, &[]);
+    let relaunched_pid = relaunched.pid;
+    let session = ObservedSession::observe(
+        &cell.control,
+        &mut relaunched.host,
+        relaunched_pid,
+        cell.root.path(),
+    );
+    let bun_2_handle = session.quit("relaunched session");
+    let (status, relaunch_stdout, relaunch_stderr) = relaunched.finish();
+    assert!(
+        status.success(),
+        "relaunched host exited with {status}\nstdout:\n{relaunch_stdout}\nstderr:\n{relaunch_stderr}"
+    );
+    assert_eq!(wait_for_process_signal(&bun_2_handle, 0), WAIT_OBJECT_0);
+    assert_eq!(
+        read_lifecycle_record(cell.root.path()),
+        LifecycleObservation::idle(),
+        "the relaunched session released the recovered profile"
+    );
+    println!(
+        "KELD_KEL270_H9 {}",
+        serde_json::json!({
+            "failed_host_pid": host_pid,
+            "failed_host_status": failed_status.code(),
+            "after_ready_control": format!("{after_ready:?}"),
+            "relaunched_host_pid": relaunched_pid,
+            "failed_host_stderr": stderr.lines().take(4).collect::<Vec<_>>(),
+        })
+    );
+    cell.finish();
+}

@@ -323,6 +323,11 @@ let requested = await Promise.race([
   receiveCommand(),
   lastWindowClosed.then(async () => {
     await sendControl("LAST_WINDOW_CLOSED");
+    if (process.env.KELD_T1B_IGNORE_LAST_WINDOW_CLOSED === "1") {
+      // KEL-53 §7 h12: an application that ignores its last window closing and never
+      // requests Quit on its own; only a controller command ends this race.
+      return new Promise<string>(() => {});
+    }
     return "QUIT";
   }),
 ]);

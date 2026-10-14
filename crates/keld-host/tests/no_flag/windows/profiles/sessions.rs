@@ -39,20 +39,20 @@ const SECOND_SESSION_SEAM: &str = "KELD_TEST_WINDOWS_SECOND_SESSION";
 /// One observation of the persistent profile's lifecycle record, as the KEL-135
 /// `profile.lifecycle.v1` document encodes it (`phase` and the owning `pid`).
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct LifecycleObservation {
-    phase: String,
-    owner_pid: Option<u64>,
+pub(super) struct LifecycleObservation {
+    pub(super) phase: String,
+    pub(super) owner_pid: Option<u64>,
 }
 
 impl LifecycleObservation {
-    fn running_under(pid: u32) -> Self {
+    pub(super) fn running_under(pid: u32) -> Self {
         Self {
             phase: "running".to_owned(),
             owner_pid: Some(u64::from(pid)),
         }
     }
 
-    fn idle() -> Self {
+    pub(super) fn idle() -> Self {
         Self {
             phase: "idle".to_owned(),
             owner_pid: None,
@@ -62,20 +62,25 @@ impl LifecycleObservation {
 
 /// One application session observed to `Ready`: its Bun generation, app link, window,
 /// the profile record `running` under the host, and the host's thread census.
-struct ObservedSession {
-    reader: BufReader<TcpStream>,
-    writer: TcpStream,
-    bun_pid: u32,
-    bun: OwnedHandle,
-    link: String,
-    window: Value,
-    threads: u64,
+pub(super) struct ObservedSession {
+    pub(super) reader: BufReader<TcpStream>,
+    pub(super) writer: TcpStream,
+    pub(super) bun_pid: u32,
+    pub(super) bun: OwnedHandle,
+    pub(super) link: String,
+    pub(super) window: Value,
+    pub(super) threads: u64,
 }
 
 impl ObservedSession {
     /// Accepts the next Bun generation on `control` and waits for the session's `Ready`
     /// and its titled window; the record then reads `running` under `host_pid`.
-    fn observe(control: &TcpListener, host: &mut Child, host_pid: u32, root: &Path) -> Self {
+    pub(super) fn observe(
+        control: &TcpListener,
+        host: &mut Child,
+        host_pid: u32,
+        root: &Path,
+    ) -> Self {
         let (reader, writer, bun_pid, link) = accept_ready_generation(control, host);
         let bun = open_process_for_wait(bun_pid, true);
         let window = wait_for_host_window(host_pid, Instant::now() + PRODUCT_DEADLINE);
@@ -97,7 +102,7 @@ impl ObservedSession {
 
     /// Requests the application's `Quit` and observes the lifecycle-Quit cause: the host
     /// answers the correlated Quit, then closes the link (the forced tail never replies).
-    fn quit(mut self, label: &str) -> OwnedHandle {
+    pub(super) fn quit(mut self, label: &str) -> OwnedHandle {
         self.writer
             .write_all(b"QUIT\n")
             .unwrap_or_else(|error| panic!("{label}: request lifecycle Quit: {error}"));
@@ -110,15 +115,20 @@ impl ObservedSession {
     }
 }
 
-/// The signed installed host launched lease-less with the second-session seam set.
-struct SeamedHost {
-    host: Child,
-    pid: u32,
-    birth: u64,
+/// The signed installed host launched lease-less with debug-only evidence seams set.
+pub(super) struct SeamedHost {
+    pub(super) host: Child,
+    pub(super) pid: u32,
+    pub(super) birth: u64,
 }
 
 impl SeamedHost {
-    fn launch(installed: &InstalledApp, root: &Path, control: &TcpListener) -> Self {
+    pub(super) fn launch(
+        installed: &InstalledApp,
+        root: &Path,
+        control: &TcpListener,
+        seams: &[(&str, &str)],
+    ) -> Self {
         let control_port = control
             .local_addr()
             .expect("session control address")
@@ -130,7 +140,7 @@ impl SeamedHost {
             .env("KELD_PROFILE_TEST_ROOT", root)
             .env("TEMP", temp)
             .env("TMP", temp)
-            .env(SECOND_SESSION_SEAM, "1")
+            .envs(seams.iter().copied())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -143,7 +153,7 @@ impl SeamedHost {
 
     /// The host is still the process that ran the first session: same creation time,
     /// not exited.
-    fn assert_same_live_process(&mut self) {
+    pub(super) fn assert_same_live_process(&mut self) {
         assert!(
             self.host.try_wait().expect("observe the host").is_none(),
             "the host must still be running its second session"
@@ -157,8 +167,16 @@ impl SeamedHost {
     }
 
     /// Waits for the orderly exit and returns its status with the drained output.
-    fn finish(mut self) -> (std::process::ExitStatus, String, String) {
-        let status = wait_child(&mut self.host, Instant::now() + PRODUCT_DEADLINE);
+    pub(super) fn finish(self) -> (std::process::ExitStatus, String, String) {
+        self.finish_by(Instant::now() + PRODUCT_DEADLINE)
+    }
+
+    /// [`Self::finish`] under a caller-chosen kill switch.
+    pub(super) fn finish_by(
+        mut self,
+        deadline: Instant,
+    ) -> (std::process::ExitStatus, String, String) {
+        let status = wait_child(&mut self.host, deadline);
         let mut stdout = String::new();
         let mut stderr = String::new();
         self.host
@@ -177,6 +195,44 @@ impl SeamedHost {
     }
 }
 
+impl Drop for SeamedHost {
+    /// Harness cleanup after a failed assertion only: every passing path has already
+    /// observed the orderly exit through `finish`. A host left alive would hold the
+    /// runner's inherited output pipe open past the test, so it is terminated and
+    /// reported, never counted as product cleanup.
+    fn drop(&mut self) {
+        if matches!(self.host.try_wait(), Ok(None)) {
+            let _ = self.host.kill();
+            let _ = self.host.wait();
+            // Diagnostics for the failed assertion: the host's own output, bounded.
+            let mut stdout = String::new();
+            let mut stderr = String::new();
+            if let Some(mut pipe) = self.host.stdout.take() {
+                let _ = pipe.read_to_string(&mut stdout);
+            }
+            if let Some(mut pipe) = self.host.stderr.take() {
+                let _ = pipe.read_to_string(&mut stderr);
+            }
+            let tail = |text: &str| {
+                text.lines()
+                    .rev()
+                    .take(40)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            eprintln!(
+                "KELD_KEL270_HOST_KILLED_ON_DROP pid={}\nhost stdout (tail):\n{}\nhost stderr (tail):\n{}",
+                self.pid,
+                tail(&stdout),
+                tail(&stderr)
+            );
+        }
+    }
+}
+
 #[test]
 #[ignore = "requires KELD_KEL254_SIGNED_HOST_A_P1 (a debug host built with kel135-profile-test-root) and KELD_KEL254_INSTALLER_FIXTURE (KEL-254 installed-host operator fixtures)"]
 fn kel270_s6c_two_consecutive_sessions_in_one_host_process() {
@@ -189,7 +245,12 @@ fn kel270_s6c_two_consecutive_sessions_in_one_host_process() {
     );
     assert_profile_test_root_feature(installed.host(), root.path());
     let control = TcpListener::bind(("127.0.0.1", 0)).expect("bind session control");
-    let mut seamed = SeamedHost::launch(&installed, root.path(), &control);
+    let mut seamed = SeamedHost::launch(
+        &installed,
+        root.path(),
+        &control,
+        &[(SECOND_SESSION_SEAM, "1")],
+    );
     let (host_pid, host_birth) = (seamed.pid, seamed.birth);
 
     let first = ObservedSession::observe(&control, &mut seamed.host, host_pid, root.path());
@@ -273,7 +334,7 @@ fn kel270_s6c_two_consecutive_sessions_in_one_host_process() {
     root.remove();
 }
 
-fn assert_first_exited_before_second(first: ProcessTimes, second: ProcessTimes) {
+pub(super) fn assert_first_exited_before_second(first: ProcessTimes, second: ProcessTimes) {
     assert_ne!(first.exit, 0, "the first Bun primary has exited");
     assert!(
         first.exit < second.creation,
@@ -286,7 +347,7 @@ fn assert_first_exited_before_second(first: ProcessTimes, second: ProcessTimes) 
 /// The debug profile fixture prints one `KELD_PROFILE_TEST_PREPARED <user-data folder>`
 /// and one `KELD_PROFILE_TEST_ENVIRONMENT_READY` line per `WebView2Engine::new`;
 /// returns each construction's prepared folder and the count of ready environments.
-fn engine_constructions(stdout: &str) -> (Vec<&str>, usize) {
+pub(super) fn engine_constructions(stdout: &str) -> (Vec<&str>, usize) {
     let prepared = stdout
         .lines()
         .filter_map(|line| line.strip_prefix("KELD_PROFILE_TEST_PREPARED "))
@@ -318,7 +379,7 @@ fn lifecycle_record_path(root: &Path) -> PathBuf {
 }
 
 /// Reads the record at a point where the host does not write it (module note).
-fn read_lifecycle_record(root: &Path) -> LifecycleObservation {
+pub(super) fn read_lifecycle_record(root: &Path) -> LifecycleObservation {
     let path = lifecycle_record_path(root);
     let bytes = fs::read(&path).unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
     let document: Value = serde_json::from_slice(&bytes).expect("lifecycle record JSON");
