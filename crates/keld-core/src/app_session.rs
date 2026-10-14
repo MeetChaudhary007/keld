@@ -372,6 +372,7 @@ impl FsDispatchSession {
     /// Returns the dispatch state to its initial shape for the next application
     /// session of this process. Refuses while a call is admitted, outstanding or
     /// pending: the previous session's router must have quiesced and drained.
+    #[cfg(any(target_os = "linux", windows))]
     fn reset_for_next_session(&self) -> Result<(), HostAppError> {
         let mut state = self
             .state
