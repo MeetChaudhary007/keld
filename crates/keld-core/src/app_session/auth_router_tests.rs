@@ -151,7 +151,7 @@ impl Fixture {
                 .transpose()?,
             1,
             None,
-            Some((verified.clone(), configuration)),
+            Some((verified.clone(), configuration, None)),
         )?;
         router
             .handle
@@ -168,17 +168,24 @@ impl Fixture {
             window,
         })
     }
-    fn call(&mut self, request: &AuthRequest, corr: u32) -> FixtureResult<CallError> {
-        let channel = keld_ipc::channel_table::AUTH.id();
+    fn call_frame(
+        &mut self,
+        request: &AuthRequest,
+        corr: u32,
+    ) -> FixtureResult<(keld_ipc::frame::FrameHeader, Vec<u8>)> {
         write_frame(
             &mut self.client,
             FrameKind::Call,
             0,
-            channel,
+            keld_ipc::channel_table::AUTH.id(),
             CorrelationId(corr),
             &encode(request)?,
         )?;
-        let (header, payload) = read_frame(&mut self.client)?;
+        Ok(read_frame(&mut self.client)?)
+    }
+    fn call(&mut self, request: &AuthRequest, corr: u32) -> FixtureResult<CallError> {
+        let channel = keld_ipc::channel_table::AUTH.id();
+        let (header, payload) = self.call_frame(request, corr)?;
         assert_eq!(
             (header.kind, header.channel, header.corr),
             (FrameKind::Err, channel, CorrelationId(corr))
@@ -283,6 +290,7 @@ fn actual_primary_auth_begin_allow_with_client_validates_private_hint_before_eff
         AuthProfileConfiguration {
             client_id: Some("literal-test-client".to_owned()),
             fixed_redirect: None,
+            as_redirect: None,
         },
     );
     let mut fixture = Fixture::new(
@@ -1133,12 +1141,26 @@ fn intentional_live_retirement_keeps_reader_inert_and_auth_owner_for_successor()
         .handle
         .retire_generation(1)
         .expect("existing intentional recovery retirement");
+    let gap_presentation_stop = fixture.router.handle.prepare_auth_presentation_drive(false);
     let reader = fixture.take_reader(1)?;
     reader
         .join()
         .expect("old reader joined")
         .expect("intentionally retired reader stays inert");
     assert!(fixture.router.handle.shutdown.is_running());
+    assert_eq!(
+        gap_presentation_stop,
+        keld_native::auth::AsMainStop::Running,
+        "a retired role reader is not host shutdown"
+    );
+    assert!(
+        !fixture
+            .router
+            .handle
+            .shutdown
+            .reader_stop
+            .load(Ordering::Acquire)
+    );
     assert!(
         !auth_owner.tail.load(Ordering::Acquire),
         "role retirement stopped host auth"
@@ -1170,5 +1192,115 @@ fn intentional_live_retirement_keeps_reader_inert_and_auth_owner_for_successor()
         "successor routes through actual retained auth worker"
     );
     fixture.finish()?;
+    Ok(())
+}
+
+#[test]
+fn anchor_close_keeps_host_auth_and_real_token_denials_live() -> FixtureResult<()> {
+    use super::super::LifecycleEvent;
+    for (manifest, expected) in [
+        ("{}", "KELD-GUARD001"),
+        (
+            r#"{"app":{"auth":{"token":["https://login.microsoftonline.com/common"]}}}"#,
+            "KELD-GUARD002",
+        ),
+    ] {
+        let mut fixture = Fixture::new(manifest, AuthConfiguration::new())?;
+        let owner = Arc::clone(
+            fixture
+                .router
+                .handle
+                .auth
+                .as_ref()
+                .ok_or("auth owner absent")?,
+        );
+        // This is the same operation the production main callback invokes.
+        let presentation_stop = fixture.router.handle.prepare_auth_presentation_drive(true);
+        let close = fixture.router.handle.signal_last_window_closed();
+        let event = read_frame(&mut fixture.client);
+        let token = fixture.call_frame(
+            &AuthRequest::Token {
+                account_id: "opaque-missing-after-close".to_owned(),
+                scopes: None,
+            },
+            181,
+        );
+        let accepting = owner.accepting.load(Ordering::Acquire);
+        let tail = owner.tail.load(Ordering::Acquire);
+        let session_running = fixture.router.handle.shutdown.is_running();
+        let global_reader_stop = fixture
+            .router
+            .handle
+            .shutdown
+            .reader_stop
+            .load(Ordering::Acquire);
+        let fatal = fixture
+            .window
+            .try_iter()
+            .any(|command| command == super::super::AppWindowCommand::Fatal);
+        // Join the actual reader/Native worker before any predicate can panic.
+        let cleanup = fixture.finish();
+        assert_eq!(
+            (accepting, tail),
+            (true, false),
+            "anchor close ended host Auth; cleanup: {cleanup:?}"
+        );
+        cleanup?;
+        close?;
+        let (event_header, event_payload) = event?;
+        assert_eq!(
+            (event_header.kind, event_header.channel),
+            (FrameKind::Event, keld_ipc::LIFECYCLE_CHANNEL)
+        );
+        assert_eq!(
+            decode::<LifecycleEvent>(&event_payload)?,
+            LifecycleEvent::LastWindowClosed
+        );
+        assert_eq!(
+            presentation_stop,
+            keld_native::auth::AsMainStop::AnchorClosing,
+            "main presentation must stop before its anchor retires"
+        );
+        assert!(session_running);
+        assert!(!global_reader_stop);
+        assert!(!fatal, "anchor-free Token became a session fatal");
+        let (header, payload) = token?;
+        assert_eq!(
+            (header.kind, header.channel, header.corr),
+            (
+                FrameKind::Err,
+                keld_ipc::channel_table::AUTH.id(),
+                CorrelationId(181)
+            )
+        );
+        let error = decode::<CallError>(&payload)?;
+        assert_eq!(error.code, expected);
+        assert!(!error.message.contains("opaque-missing-after-close"));
+    }
+    Ok(())
+}
+
+#[test]
+fn global_host_cut_still_stops_auth_before_presentation_drive() -> FixtureResult<()> {
+    let mut fixture = Fixture::new("{}", AuthConfiguration::new())?;
+    let owner = Arc::clone(
+        fixture
+            .router
+            .handle
+            .auth
+            .as_ref()
+            .ok_or("auth owner absent")?,
+    );
+    // Same global owner marker used by accepted host cleanup, not a role flag.
+    fixture.router.handle.shutdown.stop_reader();
+    let presentation_stop = fixture.router.handle.prepare_auth_presentation_drive(false);
+    let observed = (
+        owner.accepting.load(Ordering::Acquire),
+        owner.tail.load(Ordering::Acquire),
+    );
+    let cleanup = fixture.finish();
+    cleanup?;
+    assert_eq!(presentation_stop, keld_native::auth::AsMainStop::HostTail);
+    assert_eq!(observed, (false, true));
     Ok(())
 }

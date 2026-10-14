@@ -31,6 +31,7 @@ serde_json = { workspace = true }
 nix = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { workspace = true }
 core-foundation = { workspace = true }
 getrandom = { workspace = true }
 sha2 = { workspace = true }

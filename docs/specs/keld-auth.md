@@ -539,7 +539,7 @@ macOS:
 | Rung | When | Ownership | Unavailable/inapplicable |
 | --- | --- | --- | --- |
 | 0. Enterprise SSO broker | **Never claimed in v0** (D6). Device-compliance CA → AC7b typed deny | n/a | Destination tier: broker-aware routing on MDM-managed devices, own spec + managed-hardware proof |
-| 1. ASWebAuthenticationSession | Default interactive path | Host retains session + provider; `NSWindow` anchor on main thread; in-process custom-scheme initializer callback needs no Info.plist (168:74) and does not transit OS scheme dispatch (226 K11/F12, per 176:75; the narrow defensible form of the old "hijack-proof" claim) | API/start failure → rung 3. `prefersEphemeralWebBrowserSession` is an ignorable preference — never an isolation claim. Third-party default browsers without `CallbackURLMatchingIsSupported` route to Safari |
+| 1. ASWebAuthenticationSession | Preferred interactive path with an explicit valid operator AS return binding; omitted/null binding retains the pre-T4 direct rung 3 route | Host retains session + provider; `NSWindow` anchor on main thread; in-process custom-scheme initializer callback needs no Info.plist (168:74) and does not transit OS scheme dispatch (226 K11/F12, per 176:75; the narrow defensible form of the old "hijack-proof" claim) | API/start failure → rung 3. `prefersEphemeralWebBrowserSession` is an ignorable preference — never an isolation claim. Third-party default browsers without `CallbackURLMatchingIsSupported` route to Safari |
 | 2. Custom scheme (app-launch form) | Registered via `CFBundleURLTypes` when relaunch-by-URL is required | Host receives URL via bundle registration | v0: no `.app` bundle/plist emitter exists → not reachable; Google: skipped by policy (AC8 quote); use rung 1's in-process form or rung 3 |
 | 3. Loopback + PKCE | Fallback | As Windows rung 3 | As Windows rung 3 |
 
@@ -885,7 +885,8 @@ redirect. (Errata pass 7: earlier revisions wrote `fixedRedirect?:` inside the
 value literal, which is TypeScript *type* syntax and does not parse if copied.)
 
 **T3 config-shape tightening (PR716 follow-up).** Each profile value is a
-closed object with only `clientId` and `fixedRedirect`. The static TypeScript
+closed object with `clientId`, `fixedRedirect`, and the T4 optional
+`asRedirect` binding described below. The static TypeScript
 config reader accepts string literals for these fields when present. The raw
 schema-1 boot DTO retains its existing `Option<String>` decoding: omission or
 JSON `null` means absence. This tightening does not add TypeScript `null`
@@ -907,6 +908,58 @@ public-client id is **not a secret** (that is what PKCE is for), so plaintext
 config is correct; and `keld.config.ts` is already one of the four sanctioned
 config names (root `AGENTS.md`). It is **not** the permissions manifest, so D8's
 "no manifest-schema change" clause is untouched.
+
+**T4 AS return binding and compatibility.** The operator may add
+`asRedirect` beside `clientId` and `fixedRedirect`. For the closed
+`entra-common` profile its supported raw value concatenates `msal`, that
+application's configured public client id, and `://auth` without extra
+separators or normalization, as documented by
+[Microsoft's desktop configuration guide](https://learn.microsoft.com/en-us/entra/identity-platform/scenario-desktop-app-configuration).
+It is an in-process AS custom-scheme return binding, not an OS URI-handler
+registration or a new provider/issuer/grant. The operator registers it under
+Mobile and desktop applications while retaining the existing localhost return.
+The host retains exactly the same raw redirect for authorization and code
+exchange; callback correlation and provider-added slash normalization are
+separate from that immutable OAuth value. For this empty-path `entra-common`
+AS registration, callback destination validation accepts only the exact raw
+registered base or that same base followed by one `/`. This bounded return
+representation follows [Microsoft's documented no-path response rule](https://learn.microsoft.com/en-us/entra/identity-platform/reply-url)
+for query-mode callbacks; the authorization and code-exchange redirect values
+remain the original registration literal. No other scheme, authority, userinfo,
+port, case, path, extra slash or fragment is normalized or admitted, and the
+existing exact state, duplicate-parameter, response-shape and single-use rules
+still apply. This return-compatibility rule does not select another transport,
+retry a failed flow or establish actual provider completion by source review.
+
+Omitted `asRedirect`, or JSON null on the existing boot carrier, preserves the
+pre-T4 direct loopback route. This is a configured-route compatibility rule,
+not an AS API/start failure. An explicit valid binding prefers AS; a malformed
+present binding refuses only after Guard Allow and never silently falls back.
+Only AS pre-start presentation unavailability or an actual API/start failure
+may start a fresh loopback flow with its own redirect, state and PKCE custody.
+An absent or retiring initial anchor is a pre-start unavailable presentation
+context; it does not turn a completed or canceled login into a fresh attempt.
+AS completion errors for a missing or invalid presentation context (SDK codes
+2/3) are terminal after the callback and return `KELD-AUTH-017`; they MUST NOT
+replay through loopback. User cancellation,
+provider rejection, and callback-correlation failure do not trigger fallback.
+`fixedRedirect`
+retains its existing fixed-port HTTP loopback meaning. Static TypeScript
+configuration accepts a string literal; boot omission/null remain absence,
+and the shared Native DTO still rejects unknown inner fields and non-string
+present values. Structural loading does not validate registration semantics.
+
+This is the bounded T4 configuration/profile amendment under §8's delegated
+public-API and permission-model review. The Native carrier implementation and
+SDK/default-route product acceptance are separate: accepting this field is
+not a registration, AS completion, cancellation or T4 qualification claim.
+
+The public Rust carrier adds `as_redirect: Option<String>`. Fully specified
+`AuthProfileConfiguration` struct literals must add `as_redirect: None`, or
+use `..Default::default()` for optional fields. This is a Rust source-API
+addition, not a claim that old exhaustive literals compile unchanged. Existing
+omitted/null JSON and pre-T4 TypeScript operational configuration remain
+compatible under the rule above.
 
 **How it reaches the host — corrected after independent review.** An earlier
 draft of this paragraph said `keld.config.ts` is "parsed by `keld-core` and
@@ -1252,8 +1305,9 @@ compact `KELD-AUTH001`; that spelling is withdrawn.
 | `KELD-AUTH-012` | The IdP returned an OAuth error at the callback (`access_denied`, `invalid_scope`, `interaction_required`, …) | Rung 3 callback | The IdP's error code and that it is the IdP's decision, not Keld's — **sanitised per D18(a)**: provider text is bounded to 256 bytes with truncation marked, control characters stripped, quoted in a delimited position **after** Keld's own code so it can never be read as a code line, and never parsed to select a Keld code path |
 | `KELD-AUTH-013` | The authorization-code → token exchange failed | Rung 3, `auth.begin` completion; also `auth.token` when the IdP refuses a requested scope set (D17) | Whether the failure was transport or IdP-rejection, and that no automatic retry occurs. Any provider text carried here is **sanitised per D18(a)** |
 | `KELD-AUTH-014` | Silent acquisition needs interaction (`UserInteractionRequired` / `0xCAA10001` / `interaction_required`) | Windows rung 1, `auth.token`; 241 §4.3/§4.4 `[fact]` | That the caller must run a fresh interactive `auth.begin`; MUST NOT auto-escalate to a UI |
-| `KELD-AUTH-015` | The resolved provider profile has no `clientId` configured for this application in `keld.config.ts` (D14). **Post-Allow**, so it is not a pre-Allow discriminator | §4 profile table, AC14(c) | The profile key and the `keld.config.ts` `auth` section to add; **no** account or session detail |
+| `KELD-AUTH-015` | The resolved provider profile has no `clientId` configured (D14), or its present `asRedirect` is invalid for the selected client/profile. **Post-Allow**, so neither is a pre-Allow discriminator | §4 profile table, T4 return binding, AC14(c) | Name the profile's `keld.config.ts` `auth` section: add a missing `clientId`, or correct the invalid `asRedirect` registration and rebuild. **No** account or session detail |
 | `KELD-AUTH-016` | Local authentication processing failed in entropy, encoding, a checked processing bound/conversion, clock, or internal flow state, without an existing `KELD-AUTH-001`–`015` condition | T3 implementation extension; the finite Native producer union has independent source review under §8 recorded delegated approval and is recorded with the Native source and canonical registry in the same PR. Runtime qualification is predicate-specific | A static resource-free local-processing condition and its corrective action, with no automatic retry; no raw OS/provider text, credential, account id, issuer or request value; never an unresolved-account discriminator |
+| `KELD-AUTH-017` | macOS reports a missing or invalid presentation context through the AS completion callback after an authentication attempt has started | T4 `ASWebAuthenticationSession` callback; terminal result, never a fresh loopback attempt | Ensure the Keld window remains available and start a new user-initiated sign-in; no raw OS error text and no automatic retry |
 
 **T3 implementation decision — local-processing error (reviewed source; runtime qualification scoped).**
 The AUTH016 row is a bounded implementation extension to AUTH001–015. The same
@@ -1567,6 +1621,9 @@ No permanent refresh lifetimes. No durable refresh custody in v0. This spec
   AC10, AC11, AC13, AC14. **Depends on KEL-102/T3 (core admission +
   `keld-core → keld-native` edge) — the declared predecessor.**
 - [ ] T4 macOS `ASWebAuthenticationSession` rung: AC7, AC7b, AC12.
+  AC7b is a private supplied-class conditional predicate. Public v0 requests
+  remain unclassified; the unit refusal makes no runtime classifier, managed
+  device or broker-compliance outcome claim.
 - [ ] T5 Windows WAM rung (**T2 gate cleared — GO**): AC6. Still gated on
   KEL-102/T3 (T3's declared predecessor) and on the `windows` WAM-feature
   dependency review (§8).
@@ -1624,9 +1681,41 @@ No permanent refresh lifetimes. No durable refresh custody in v0. This spec
 | 11b (D17 canonical key) | unit | the single-flight key is table-driven over pairs that MUST coalesce and pairs that MUST NOT. Coalesce: `["b","a"]` vs `["a","b"]` (order), `["a","a","b"]` vs `["a","b"]` (duplicates), absent vs `[]` (absent ≡ empty). Do **not** coalesce: `["a"]` vs `["A"]` (case-sensitive per RFC 6749 §3.3), `["a"]` vs `["a","b"]` (superset), same scopes under a different `account_id`. Negative control: an implementation keyed on the raw sequence fails the order and duplicate rows, and one that lowercases fails the case row — so the test distinguishes the rule from both neighbouring rules |
 | 11c (D17 pass-through) | integration | a `Token` request whose `scopes` exceed the establishing `begin`'s `granted_scopes` is **not** refused by the host: assert the outbound token-endpoint request carries the requested set byte-for-byte, that no host-side comparison against `granted_scopes` occurs, and that an IdP refusal surfaces as `KELD-AUTH-013` carrying the provider's error. Assert `AuthResponse::Token` has no scope field, pinning the §4 non-claim rather than leaving it prose |
 | 12 | unit | cancel-class result → non-terminal typed error; no automatic re-invocation |
+| T4 AS callback context errors | Native/controller integration | After the AS completion callback reports presentation-context-not-provided or invalid (SDK codes 2/3), return `KELD-AUTH-017` and never enter the fresh T3 loopback rung. Negative control: classifying either callback result as pre-start `StartUnavailable` must fail by reaching the loopback fallback trap. Keep pre-start missing-anchor and actual `start()==false` cases on their existing fallback path. |
 
 Bind port 0; await conditions; no fixed ports; no wall-clock sleeps
 (`.agents/testing.md`).
+
+### macOS T4 owned fatal-run outcome
+
+Ordinary anchor retirement stops that anchor's presentation authority while
+preserving the host account registry and authentication admission. Only the
+existing global host cutoff permanently closes authentication and Native
+presentation admission. Per-generation reader retirement is separate from
+both stop domains. The unpublished Rust main-owner seam names these states
+`Running`, `AnchorClosing` and `HostTail`; it does not add a JS selector or wire
+field. Unclaimed starts at a retiring anchor resolve through the existing
+pre-start unavailable-context path; already-owned presentations retain their
+original cancellation and drain bounds.
+
+The top-level Core host-run result can retain unresolved main-thread presentation
+custody separately from the existing Send-compatible `HostAppError` used by
+workers. After an unexpected UI-loop return, the same main thread services
+CoreFoundation's default mode only within the Native owner's original absolute
+bound. Source handling and cancellation return are not drain receipts.
+Only actual Native operation completion permits normal window/profile release
+and blocking worker/coordinator joins.
+
+If custody remains unproved, Core returns a main-thread-only owned failure with
+the original diagnostic and the actual window/profile, AS service, physical
+worker/router, coordinator, renderer, guardian and verified policy snapshot.
+The shipping Host reports that failure by borrow and retains its payload through
+the existing failed-process exit before ordinary dev-stage deletion. This is a
+fatal failure, never a normal Quit, physical-drain pass or global SDK-quiescence
+claim. It does not require passive SDK session/block deallocation.
+The top-level `run_guarded` and diagnostic `run_unprivileged` Rust error wrapper
+is an explicit public-API addition; worker error types, wire DTOs, principals,
+grant policy and Windows lifecycle cause/tail ownership are unchanged.
 
 ## 8. Review gates triggered
 

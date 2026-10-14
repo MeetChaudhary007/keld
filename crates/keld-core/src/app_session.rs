@@ -1233,6 +1233,78 @@ fn validate_current_exe_stage() -> Result<ValidatedBootSelection, HostAppError> 
     validate_from_root(root)
 }
 
+/// Top-level host-run failure. Worker failures remain the Send-compatible
+/// `HostAppError`; this wrapper can retain main-thread-only macOS custody.
+///
+/// An owned unproved failure is fatal: the shipping Host reports it by borrow
+/// and retains the payload through its existing failed-process exit. It is not
+/// a completed app session and must not be flattened, sent to another thread,
+/// discarded, or used to start another application session.
+#[must_use = "retain unproved main-thread custody through the fatal Host outcome"]
+pub struct HostRunFailure {
+    error: HostAppError,
+    #[cfg(target_os = "macos")]
+    retained: Option<Box<RetainedMacSession>>,
+}
+impl HostRunFailure {
+    /// Whether this failed run still owns unresolved main-thread resources.
+    #[must_use]
+    pub fn retains_main_custody(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            self.retained.is_some()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            false
+        }
+    }
+}
+impl From<HostAppError> for HostRunFailure {
+    fn from(error: HostAppError) -> Self {
+        Self {
+            error,
+            #[cfg(target_os = "macos")]
+            retained: None,
+        }
+    }
+}
+impl std::ops::Deref for HostRunFailure {
+    type Target = HostAppError;
+    fn deref(&self) -> &Self::Target {
+        &self.error
+    }
+}
+impl fmt::Display for HostRunFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.error, f)
+    }
+}
+impl fmt::Debug for HostRunFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HostRunFailure")
+            .field("error", &self.error)
+            .field("retained_main_custody", &self.retains_main_custody())
+            .finish_non_exhaustive()
+    }
+}
+impl std::error::Error for HostRunFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        std::error::Error::source(&self.error)
+    }
+}
+#[cfg(target_os = "macos")]
+struct RetainedMacSession {
+    _presentation: keld_native::auth::AsMainOwner,
+    _engine: WkWebViewEngine,
+    _router: PrimaryRouter,
+    _guardian: GuardianOwner,
+    _coordinator: JoinHandle<Result<(), HostAppError>>,
+    _renderer: RendererDispatch,
+    _commands: Sender<AppWindowCommand>,
+    guard: Option<GuardSnapshot>,
+}
+
 /// Typed no-flag host boot/session failure.
 pub struct HostAppError {
     code: &'static str,
@@ -2056,9 +2128,9 @@ fn read_target(mut file: File, kind: &'static str) -> Result<Vec<u8>, HostAppErr
 ///
 /// # Errors
 ///
-/// Returns [`HostAppError`] for startup, authenticated session, window,
+/// Returns [`HostRunFailure`] preserving the original startup, authenticated session, window,
 /// guardian, Bun self-termination, or ordered-shutdown failure.
-pub fn run_unprivileged(boot: ValidatedBootSelection) -> Result<(), HostAppError> {
+pub fn run_unprivileged(boot: ValidatedBootSelection) -> Result<(), HostRunFailure> {
     #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
     {
         drop(boot);
@@ -2067,7 +2139,8 @@ pub fn run_unprivileged(boot: ValidatedBootSelection) -> Result<(), HostAppError
             "platform availability",
             "no-flag host support is unavailable on this platform",
             NO_FLAG_UNAVAILABLE_FIX,
-        ))
+        )
+        .into())
     }
     #[cfg(target_os = "macos")]
     {
@@ -2089,7 +2162,7 @@ pub fn run_unprivileged(boot: ValidatedBootSelection) -> Result<(), HostAppError
             permissions_digest,
         } = boot;
         drop((permissions_file, permissions_digest));
-        run_app_direct(app, None)
+        run_app_direct(app, None).map_err(HostRunFailure::from)
     }
     #[cfg(target_os = "linux")]
     {
@@ -2099,7 +2172,7 @@ pub fn run_unprivileged(boot: ValidatedBootSelection) -> Result<(), HostAppError
             permissions_digest,
         } = boot;
         drop((permissions_file, permissions_digest));
-        run_app_direct(app, None)
+        run_app_direct(app, None).map_err(HostRunFailure::from)
     }
 }
 
@@ -2111,9 +2184,9 @@ pub fn run_unprivileged(boot: ValidatedBootSelection) -> Result<(), HostAppError
 ///
 /// # Errors
 ///
-/// Returns [`HostAppError`] for a typed manifest preflight failure or any
+/// Returns [`HostRunFailure`] preserving a typed manifest preflight failure or any
 /// existing no-flag startup, session, window, guardian, Bun, or shutdown error.
-pub fn run_guarded(boot: ValidatedBootSelection) -> Result<(), HostAppError> {
+pub fn run_guarded(boot: ValidatedBootSelection) -> Result<(), HostRunFailure> {
     #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
     {
         drop(boot);
@@ -2122,7 +2195,8 @@ pub fn run_guarded(boot: ValidatedBootSelection) -> Result<(), HostAppError> {
             "platform availability",
             "no-flag host support is unavailable on this platform",
             NO_FLAG_UNAVAILABLE_FIX,
-        ))
+        )
+        .into())
     }
     #[cfg(windows)]
     {
@@ -2136,7 +2210,7 @@ pub fn run_guarded(boot: ValidatedBootSelection) -> Result<(), HostAppError> {
             .map_err(HostAppError::manifest)?;
         let guard_snapshot =
             GuardSnapshot::prepare(verified).map_err(|source| HostAppError::fs_prepare(&source))?;
-        run_app_direct(app, Some(&guard_snapshot))
+        run_app_direct(app, Some(&guard_snapshot)).map_err(HostRunFailure::from)
     }
     #[cfg(target_os = "macos")]
     {
@@ -2153,7 +2227,13 @@ pub fn run_guarded(boot: ValidatedBootSelection) -> Result<(), HostAppError> {
         // The owner stays in this frame while run_app performs every startup,
         // event-loop, and ordered-cleanup step. run_app receives only a borrow,
         // so it cannot destroy the verified session policy early.
-        run_app(app, Some(&guard_snapshot))
+        let mut result = run_app(app, Some(&guard_snapshot));
+        if let Err(failure) = &mut result
+            && let Some(retained) = &mut failure.retained
+        {
+            let _ = retained.guard.get_or_insert(guard_snapshot);
+        }
+        result
     }
     #[cfg(target_os = "linux")]
     {
@@ -2167,7 +2247,7 @@ pub fn run_guarded(boot: ValidatedBootSelection) -> Result<(), HostAppError> {
             .map_err(HostAppError::manifest)?;
         let guard_snapshot =
             GuardSnapshot::prepare(verified).map_err(|source| HostAppError::fs_prepare(&source))?;
-        run_app_direct(app, Some(&guard_snapshot))
+        run_app_direct(app, Some(&guard_snapshot)).map_err(HostRunFailure::from)
     }
 }
 
@@ -2503,7 +2583,7 @@ impl SessionShutdownState {
 fn run_app(
     boot: AppBootSelection,
     guard_snapshot: Option<&GuardSnapshot>,
-) -> Result<(), HostAppError> {
+) -> Result<(), HostRunFailure> {
     let mut dev_lease = DevHostLease::from_environment()?;
     let shutdown = SessionShutdownState::new();
     let AppBootSelection {
@@ -2560,6 +2640,19 @@ fn run_app(
     };
 
     let (window_commands_tx, window_commands_rx) = mpsc::channel();
+    let main_thread = objc2::MainThreadMarker::new().ok_or_else(|| {
+        app_detail(
+            "auth presentation",
+            "application owner is not on the main thread",
+        )
+    })?;
+    let presentation_commands = window_commands_tx.clone();
+    let (presentation_port, mut presentation_owner) = keld_native::auth::prepare_as_presentation(
+        main_thread,
+        Arc::new(move || {
+            let _ = presentation_commands.send(AppWindowCommand::MacAuthWake);
+        }),
+    );
     let guardian_owner = GuardianOwner::start(
         guardian,
         window_commands_tx.clone(),
@@ -2573,6 +2666,7 @@ fn run_app(
         shutdown,
         guard_snapshot,
         auth_configuration,
+        Some(presentation_port),
     )?;
     guardian_owner.attach_router(router.handle())?;
     let (window_events_tx, window_events_rx) = mpsc::channel();
@@ -2607,9 +2701,10 @@ fn run_app(
                 window_events_tx,
                 event_coordinator,
                 None,
-                router,
+                (router, presentation_owner, main_thread),
                 guardian_owner,
-            );
+            )
+            .map_err(HostRunFailure::from);
         }
     };
 
@@ -2625,9 +2720,10 @@ fn run_app(
                 window_events_tx,
                 event_coordinator,
                 Some(renderer_dispatch),
-                router,
+                (router, presentation_owner, main_thread),
                 guardian_owner,
-            );
+            )
+            .map_err(HostRunFailure::from);
         }
     };
     let spec = WebviewSpec {
@@ -2643,21 +2739,78 @@ fn run_app(
         renderer_outcomes_rx,
         keld_ipc::channel_table::ECHO.wire_id(),
     );
-    if let Err(source) =
-        engine.create_app_with_renderer_bridge(&spec, window_events_tx.clone(), renderer_endpoint)
-    {
-        let primary = app_webview_error("initial renderer bridge window", &source);
-        return cleanup_window_start_failure(
-            &primary,
-            guard_snapshot,
-            window_events_tx,
-            event_coordinator,
-            Some(renderer_dispatch),
-            router,
-            guardian_owner,
+    let primary_view = match engine.create_app_with_renderer_bridge(
+        &spec,
+        window_events_tx.clone(),
+        renderer_endpoint,
+    ) {
+        Ok(view) => view,
+        Err(source) => {
+            let primary = app_webview_error("initial renderer bridge window", &source);
+            return cleanup_window_start_failure(
+                &primary,
+                guard_snapshot,
+                window_events_tx,
+                event_coordinator,
+                Some(renderer_dispatch),
+                (router, presentation_owner, main_thread),
+                guardian_owner,
+            )
+            .map_err(HostRunFailure::from);
+        }
+    };
+    let presentation_router = router.handle();
+    let mut presentation_unproved = None;
+    let mut retains_main_custody = false;
+    let window_result = engine.run_app_until_quit_with_main_owner(
+        window_commands_rx,
+        window_events_tx,
+        Some(primary_view),
+        &mut |main_thread, anchor, stopping| {
+            let stop_scope = presentation_router.prepare_auth_presentation_drive(stopping);
+            match presentation_owner.drive(main_thread, &mut |_| anchor(), stop_scope) {
+                keld_native::auth::AsMainProgress::Pending { next_deadline } => {
+                    Ok((false, next_deadline))
+                }
+                keld_native::auth::AsMainProgress::Drained => Ok((true, None)),
+                keld_native::auth::AsMainProgress::Unproved { fault, .. } => {
+                    presentation_unproved.get_or_insert_with(|| {
+                        app_detail("auth presentation custody", format!("{fault:?}"))
+                    });
+                    Err(WvError::EventLoop(format!(
+                        "native presentation custody unproved: {fault:?}"
+                    )))
+                }
+            }
+        },
+        &mut retains_main_custody,
+    );
+    if retains_main_custody {
+        // This is the owned fatal branch, not ordinary view-close intent.
+        presentation_router.shutdown.stop_reader();
+        // No blocking joins, profile/stage deletion, or owner Drop on this cut.
+        let loop_error = window_result.err().map_or_else(
+            || app_detail("main presentation tail", "main custody was not released"),
+            |error| app_webview_error("main presentation tail", &error),
         );
+        let error = match presentation_unproved {
+            Some(native) => collapse_app_failures(&loop_error, [Err(native)]),
+            None => loop_error,
+        };
+        return Err(HostRunFailure {
+            error,
+            retained: Some(Box::new(RetainedMacSession {
+                _engine: engine,
+                _presentation: presentation_owner,
+                _router: router,
+                _guardian: guardian_owner,
+                _coordinator: event_coordinator,
+                _renderer: renderer_dispatch,
+                _commands: window_commands_tx,
+                guard: None,
+            })),
+        });
     }
-    let window_result = engine.run_app_until_quit(window_commands_rx, window_events_tx);
     finish_guarded_session(guard_snapshot, |_| {
         drop(window_commands_tx);
         let event_result = event_coordinator
@@ -2690,6 +2843,7 @@ fn run_app(
             ]),
         }
     })
+    .map_err(HostRunFailure::from)
 }
 
 #[cfg(target_os = "macos")]
@@ -4549,9 +4703,36 @@ fn cleanup_window_start_failure(
     window_events: Sender<AppWindowEvent>,
     event_coordinator: JoinHandle<Result<(), HostAppError>>,
     renderer_dispatch: Option<RendererDispatch>,
-    router: PrimaryRouter,
+    presentation: (
+        PrimaryRouter,
+        keld_native::auth::AsMainOwner,
+        objc2::MainThreadMarker,
+    ),
     guardian_owner: GuardianOwner,
 ) -> Result<(), HostAppError> {
+    let (router, mut owner, main_thread) = presentation;
+    if let Some(auth) = &router.handle.auth {
+        auth.stop_tail();
+    }
+    router.handle.shutdown.stop_reader();
+    // No main SDK owner has been created before this loop starts. Native closes
+    // its port synchronously so queued starts and the worker cannot await a UI
+    // loop that failed to start. This does not substitute for the worker tail.
+    let presentation_result = match owner.drive(
+        main_thread,
+        &mut |_| None,
+        keld_native::auth::AsMainStop::HostTail,
+    ) {
+        keld_native::auth::AsMainProgress::Drained => Ok(()),
+        keld_native::auth::AsMainProgress::Unproved { fault, .. } => Err(app_detail(
+            "auth presentation startup cleanup",
+            format!("{fault:?}"),
+        )),
+        keld_native::auth::AsMainProgress::Pending { .. } => Err(app_detail(
+            "auth presentation startup cleanup",
+            "pre-loop owner remains pending",
+        )),
+    };
     finish_guarded_session(guard_snapshot, |_| {
         drop(window_events);
         let event_result = event_coordinator
@@ -4564,6 +4745,7 @@ fn cleanup_window_start_failure(
         Err(collapse_app_failures(
             primary,
             [
+                presentation_result,
                 event_result,
                 router_result,
                 renderer_result,
@@ -4635,7 +4817,7 @@ fn coordinate_window_events(
     commands: &Sender<AppWindowCommand>,
     mut on_ready: impl FnMut(&PrimaryRouterHandle) -> Result<(), HostAppError>,
 ) -> Result<(), HostAppError> {
-    while let Ok(event) = events.recv() {
+    let mut process_event = |event| {
         let result = match event {
             AppWindowEvent::NavigationReady => {
                 router.signal_ready().and_then(|()| on_ready(router))
@@ -4644,8 +4826,31 @@ fn coordinate_window_events(
         };
         if let Err(error) = result {
             let _ = commands.send(AppWindowCommand::Fatal);
-            return Err(error);
+            Err(error)
+        } else {
+            Ok(())
         }
+    };
+    #[cfg(target_os = "macos")]
+    loop {
+        if router.shutdown.reader_stop.load(Ordering::Acquire) {
+            break;
+        }
+        let event = match events.recv_timeout(APP_LINK_READER_POLL) {
+            Ok(event) => {
+                if router.shutdown.reader_stop.load(Ordering::Acquire) {
+                    break;
+                }
+                event
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        };
+        process_event(event)?;
+    }
+    #[cfg(not(target_os = "macos"))]
+    while let Ok(event) = events.recv() {
+        process_event(event)?;
     }
     Ok(())
 }
@@ -5895,6 +6100,24 @@ impl PrimaryRouterHandle {
         }
         self.recovery_armed.store(true, Ordering::Release);
         Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    fn prepare_auth_presentation_drive(&self, ui_stopping: bool) -> keld_native::auth::AsMainStop {
+        // Only the existing global host owner ends Auth admission. An anchor
+        // close retires presentation authority, not the host's account session.
+        let session_cut =
+            self.shutdown.reader_stop.load(Ordering::Acquire) || !self.shutdown.is_running();
+        if session_cut {
+            if let Some(auth) = &self.auth {
+                auth.stop_tail();
+            }
+            keld_native::auth::AsMainStop::HostTail
+        } else if ui_stopping {
+            keld_native::auth::AsMainStop::AnchorClosing
+        } else {
+            keld_native::auth::AsMainStop::Running
+        }
     }
 
     /// Writes `LastWindowClosed` to the application and returns the instant the write
@@ -7396,6 +7619,7 @@ impl PrimaryRouter {
         shutdown: SessionShutdownState,
         fs: Option<&GuardSnapshot>,
         #[cfg(target_os = "macos")] auth_configuration: AuthConfiguration,
+        #[cfg(target_os = "macos")] presentation: Option<keld_native::auth::AsWorkerPort>,
     ) -> Result<Self, HostAppError> {
         Self::start_bound_with_fs_setup(
             bound,
@@ -7406,7 +7630,7 @@ impl PrimaryRouter {
             #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
             None,
             #[cfg(target_os = "macos")]
-            fs.map(|snapshot| (snapshot.verified.clone(), auth_configuration)),
+            fs.map(|snapshot| (snapshot.verified.clone(), auth_configuration, presentation)),
         )
     }
 
@@ -7433,7 +7657,11 @@ impl PrimaryRouter {
         fs: Option<&GuardSnapshot>,
         #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
         fs_worker_test_gate: Option<Arc<FsWorkerTestGate>>,
-        #[cfg(target_os = "macos")] auth_startup: Option<(VerifiedManifest, AuthConfiguration)>,
+        #[cfg(target_os = "macos")] auth_startup: Option<(
+            VerifiedManifest,
+            AuthConfiguration,
+            Option<keld_native::auth::AsWorkerPort>,
+        )>,
     ) -> Result<Self, HostAppError> {
         let identity = PrimaryLinkIdentity::Role(bound.principal());
         let attempt = bound.attempt();
@@ -7487,12 +7715,16 @@ impl PrimaryRouter {
         #[cfg(all(test, any(target_os = "macos", target_os = "linux")))] test_gate: Option<
             Arc<FsWorkerTestGate>,
         >,
-        #[cfg(target_os = "macos")] auth_startup: Option<(VerifiedManifest, AuthConfiguration)>,
+        #[cfg(target_os = "macos")] auth_startup: Option<(
+            VerifiedManifest,
+            AuthConfiguration,
+            Option<keld_native::auth::AsWorkerPort>,
+        )>,
     ) -> Result<Self, HostAppError> {
         #[cfg(target_os = "macos")]
         let auth_worker = auth_startup
-            .map(|(verified, configuration)| {
-                AuthWorker::start(&mut handle, verified, configuration)
+            .map(|(verified, configuration, presentation)| {
+                AuthWorker::start(&mut handle, verified, configuration, presentation)
             })
             .transpose()?;
         let fs_worker = if let Some(broker) = broker {
@@ -9636,6 +9868,32 @@ mod tests {
             .expect("known profile");
         assert!(profile.client_id.is_none());
         assert!(profile.fixed_redirect.is_none());
+    }
+
+    #[test]
+    fn strict_schema_v1_carries_optional_as_return_data() {
+        let mut value = serde_json::json!({
+            "schema": 1, "name": "Fixture", "entry": "src/main.ts",
+            "renderer": "index.html", "permissions": {
+                "file": "keld.permissions.jsonc",
+                "content_sha256": "sha256:ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356"
+            }, "auth": { "entra-common": { "asRedirect": "not-a-valid-registration" } }
+        });
+        for binding in [
+            serde_json::json!("not-a-valid-registration"),
+            serde_json::Value::Null,
+        ] {
+            value["auth"]["entra-common"]["asRedirect"] = binding.clone();
+            let bytes = serde_json::to_vec(&value).expect("boot fixture bytes");
+            let parsed = parse_boot_bytes(&bytes).expect("AS binding is boot data");
+            let profile = parsed
+                .auth_configuration
+                .get("entra-common")
+                .expect("profile");
+            assert_eq!(profile.as_redirect.as_deref(), binding.as_str());
+            assert!(profile.client_id.is_none());
+            assert!(profile.fixed_redirect.is_none());
+        }
     }
 
     #[test]

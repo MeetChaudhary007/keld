@@ -4,8 +4,8 @@ use std::collections::hash_map::Entry;
 use std::sync::atomic::AtomicUsize;
 
 use keld_native::auth::{
-    AuthBroker, AuthRequest, HandleState, HostFault, OperationId, Progress, ReadyResponse,
-    ResponseEvent,
+    AsWorkerPort, AuthBroker, AuthRequest, HandleState, HostFault, OperationId, Progress,
+    ReadyResponse, ResponseEvent,
 };
 
 use super::{
@@ -219,6 +219,7 @@ impl AuthWorker {
         handle: &mut PrimaryRouterHandle,
         verified: VerifiedManifest,
         mut configuration: AuthConfiguration,
+        presentation: Option<AsWorkerPort>,
     ) -> Result<Self, HostAppError> {
         // Sole closed-table filter owned by Native. No validation of known
         // clientId/fixedRedirect here: that remains after the actual Allow.
@@ -233,7 +234,16 @@ impl AuthWorker {
         let worker_session = Arc::clone(&session);
         let join = thread::Builder::new()
             .name(String::from("keld-core-auth-worker"))
-            .spawn(move || run_worker(&receiver, &owner, &worker_session, &verified, configuration))
+            .spawn(move || {
+                run_worker(
+                    &receiver,
+                    &owner,
+                    &worker_session,
+                    &verified,
+                    configuration,
+                    presentation,
+                )
+            })
             .map_err(|source| app_io("auth worker startup", &source))?;
         Ok(Self {
             join: Some(join),
@@ -427,10 +437,14 @@ fn run_worker(
     session: &AuthSession,
     verified: &VerifiedManifest,
     configuration: AuthConfiguration,
+    presentation: Option<AsWorkerPort>,
 ) -> Result<(), HostAppError> {
     // Construct/use/drop on one owner thread. This broker is never replaced by
     // a Bun generation or an FS retirement command.
-    let mut broker = AuthBroker::prepare(verified, configuration);
+    let mut broker = match presentation {
+        Some(port) => AuthBroker::prepare_with_as(verified, configuration, port),
+        None => AuthBroker::prepare(verified, configuration),
+    };
     let mut operations: HashMap<OperationId, Operation> =
         HashMap::with_capacity(AUTH_CALL_CAPACITY);
     let mut events = Vec::with_capacity(AUTH_CALL_CAPACITY);

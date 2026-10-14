@@ -204,6 +204,7 @@ objc2-foundation = { version = "=0.3.2", default-features = false }
 # objc2-app-kit 0.3.2: Zlib OR Apache-2.0 OR MIT, MSRV 1.71.
 # block2 0.6.2: MIT, MSRV 1.71. Both are below the workspace MSRV.
 objc2-app-kit = { version = "=0.3.2", default-features = false }
+objc2-authentication-services = { version = "=0.3.2", default-features = false }
 block2 = { version = "=0.6.2", default-features = false }
 objc2-web-kit = { version = "=0.3.2", default-features = false }
 # --- Dependency review (KEL-96/T4 / AGENTS.md gate) ---

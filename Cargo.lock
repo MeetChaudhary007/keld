@@ -1556,6 +1556,7 @@ dependencies = [
  "keld-update",
  "keld-wv",
  "nix",
+ "objc2",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -1615,6 +1616,8 @@ dependencies = [
  "keld-guard",
  "keld-ipc",
  "objc2",
+ "objc2-app-kit",
+ "objc2-authentication-services",
  "objc2-foundation",
  "rustix",
  "serde",
@@ -1899,6 +1902,18 @@ dependencies = [
  "bitflags 2.13.0",
  "objc2",
  "objc2-core-foundation",
+ "objc2-foundation",
+]
+
+[[package]]
+name = "objc2-authentication-services"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ee6d6f7dab884a28adaec1012eb3889257a49cc145724e35f93ece2d209f8b25"
+dependencies = [
+ "block2",
+ "objc2",
+ "objc2-app-kit",
  "objc2-foundation",
 ]
 

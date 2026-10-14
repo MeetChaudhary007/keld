@@ -12,11 +12,13 @@ fn broker() -> AuthBroker {
         AuthProfileConfiguration {
             client_id: Some("literal-client".to_owned()),
             fixed_redirect: None,
+            as_redirect: None,
         },
     );
     AuthBroker {
         prepared_digest: [0; 32],
         configuration,
+        as_port: None,
         registry: SessionRegistry::new(),
         owner: Arc::new(()),
         next_operation: 0,
@@ -919,4 +921,599 @@ fn native_singleflight_real_sdk_one_exchange_and_healthy_cache() {
         "auth::controller::tests::native_singleflight_real_sdk_one_exchange_and_healthy_cache",
         singleflight_sdk_case,
     );
+}
+
+#[test]
+fn as_registration_is_validated_only_after_actual_begin_allow() {
+    let mut broker = broker();
+    broker
+        .configuration
+        .get_mut("entra-common")
+        .expect("profile config")
+        .as_redirect = Some("malformed-secret-free-fixture".to_owned());
+    let request = || AuthRequest::Begin {
+        provider: "entra-common".to_owned(),
+        scopes: None,
+        login_hint: None,
+    };
+    let denied = parse_manifest(r#"{"app":{}}"#).expect("default deny");
+    let result = broker.handle_manifest_request(
+        &denied,
+        Principal::AppProcess,
+        request(),
+        || -> Option<()> {
+            panic!("denial cannot admit");
+        },
+    );
+    let HandleState::Ready(response) = result else {
+        panic!("guard denial must be ready");
+    };
+    assert_eq!(
+        response.into_response().expect_err("actual denial").code,
+        "KELD-GUARD001"
+    );
+    let allowed = parse_manifest(
+        r#"{"app":{"auth":{"begin":["https://login.microsoftonline.com/common"]}}}"#,
+    )
+    .expect("literal begin grant");
+    let result = broker.handle_manifest_request(
+        &allowed,
+        Principal::AppProcess,
+        request(),
+        || -> Option<()> {
+            panic!("malformed binding cannot admit");
+        },
+    );
+    let HandleState::Ready(response) = result else {
+        panic!("post-Allow configuration error must be ready");
+    };
+    assert_eq!(
+        response.into_response().expect_err("invalid binding").code,
+        "KELD-AUTH-015"
+    );
+    assert!(broker.jobs.is_empty());
+}
+
+#[test]
+fn known_compliance_class_uses_actual_guard_before_typed_no_effect_deny() {
+    use std::cell::Cell;
+    let mut owner = broker();
+    // Deliberately missing/invalid setup proves the known-class cut precedes
+    // client/redirect processing, rather than selecting AS or browser fallback.
+    let configuration = owner
+        .configuration
+        .get_mut("entra-common")
+        .expect("profile config");
+    configuration.client_id = None;
+    configuration.as_redirect = Some("invalid-fixture-binding".to_owned());
+    configuration.fixed_redirect = Some("invalid-fixture-loopback".to_owned());
+    let request = || AuthRequest::Begin {
+        provider: "entra-common".to_owned(),
+        scopes: None,
+        login_hint: None,
+    };
+    let admissions = Cell::new(0_u32);
+    let admit = || {
+        admissions.set(admissions.get() + 1);
+        Some(())
+    };
+    let denied = parse_manifest(r#"{"app":{}}"#).expect("actual default deny");
+    let denied = owner.handle_classified_manifest_request(
+        &denied,
+        Principal::AppProcess,
+        request(),
+        TrustedFlowClass::KnownRequiresDeviceCompliance,
+        admit,
+    );
+    let HandleState::Ready(response) = denied else {
+        panic!("Guard denial must remain ready");
+    };
+    assert_eq!(
+        response
+            .into_response()
+            .expect_err("actual Guard denial")
+            .code,
+        "KELD-GUARD001"
+    );
+    let allowed = parse_manifest(
+        r#"{"app":{"auth":{"begin":["https://login.microsoftonline.com/common"]}}}"#,
+    )
+    .expect("actual literal grant");
+    let denied = owner.handle_classified_manifest_request(
+        &allowed,
+        Principal::AppProcess,
+        request(),
+        TrustedFlowClass::KnownRequiresDeviceCompliance,
+        admit,
+    );
+    let HandleState::Ready(response) = denied else {
+        panic!("known class must be denied before effects");
+    };
+    let error = response
+        .into_response()
+        .expect_err("conditional unit predicate");
+    assert_eq!(error.code, "KELD-AUTH-006");
+    assert!(error.message.contains("Intune Company Portal"));
+    assert!(error.message.contains("Enterprise SSO"));
+    assert!(error.message.contains("no device-compliance claim"));
+    assert!(
+        error
+            .message
+            .contains("broker-capable managed-device application")
+    );
+    assert_eq!(admissions.get(), 0);
+    assert_eq!(owner.next_operation, 0);
+    assert!(owner.jobs.is_empty());
+    // Public v0 input cannot mint the trusted class: same actual granted request
+    // remains Unclassified and hits its original configuration producer.
+    let ordinary = owner.handle_manifest_request(&allowed, Principal::AppProcess, request(), admit);
+    let HandleState::Ready(response) = ordinary else {
+        panic!("missing client is resource-free");
+    };
+    assert_eq!(
+        response
+            .into_response()
+            .expect_err("unclassified public route")
+            .code,
+        "KELD-AUTH-015"
+    );
+    assert_eq!(admissions.get(), 0);
+}
+
+#[test]
+fn as_pending_stop_fences_do_not_generate_their_own_wake_loop() {
+    let operation = broker().next_id().expect("existing opaque identity owner");
+    super::super::macos_session::assert_stop_wake_contract(operation);
+}
+
+#[test]
+fn canceled_login_completes_once_without_restart_and_allows_explicit_begin() {
+    use std::cell::Cell;
+    // A forbidden automatic T3 fallback returns its existing config error before
+    // any socket/browser effect, so the negative control remains resource-free.
+    let (mut owner, port, manifest, account) = as_begin_fixture("invalid-fallback-trap");
+    let request = || AuthRequest::Begin {
+        provider: "entra-common".to_owned(),
+        scopes: None,
+        login_hint: None,
+    };
+    let admissions = Cell::new(0_u32);
+    let admit = || {
+        admissions.set(admissions.get() + 1);
+        Some(())
+    };
+    let begin = |owner: &mut AuthBroker| {
+        owner.handle_manifest_request(&manifest, Principal::AppProcess, request(), admit)
+    };
+    let operation = match begin(&mut owner) {
+        HandleState::Pending {
+            operation,
+            admission: Some(()),
+        } => operation,
+        other => panic!("actual explicit Begin must be admitted: {other:?}"),
+    };
+    let mut events = Vec::new();
+    assert_eq!(
+        owner.poll(&operation, |event| events.push(event)),
+        Progress::Pending
+    );
+    assert!(
+        events.is_empty(),
+        "submitted operation has no premature result"
+    );
+    super::super::macos_session::test_deliver_canceled_login(&port, &operation);
+    assert_eq!(
+        owner.poll(&operation, |event| events.push(event)),
+        Progress::Drained
+    );
+    assert_eq!(events.len(), 1, "one actual canceled-login completion");
+    assert_eq!(events[0].operation, operation);
+    let error = events
+        .pop()
+        .expect("actual canceled-login event")
+        .response
+        .into_response()
+        .expect_err("canceled-login is a typed non-success reply");
+    assert_eq!(error.code, "KELD-AUTH-007");
+    assert!(error.message.starts_with("KELD-AUTH-007:"));
+    assert!(error.message.contains("fresh user-initiated auth.begin"));
+    for _ in 0..8 {
+        assert_eq!(
+            owner.poll(&operation, |event| events.push(event)),
+            Progress::Drained
+        );
+    }
+    assert!(
+        events.is_empty(),
+        "retired operation cannot emit again or restart"
+    );
+    assert!(owner.jobs.is_empty(), "no spontaneous native job");
+    assert_eq!(owner.next_operation, 1, "no spontaneous operation identity");
+    assert_eq!(admissions.get(), 1, "no automatic readmission");
+    assert!(
+        owner.registry.admission_open(),
+        "007 leaves the broker viable"
+    );
+    assert_eq!(
+        owner.registry.issuer_for(&account),
+        Some("https://login.microsoftonline.com/common")
+    );
+    let retry = match begin(&mut owner) {
+        HandleState::Pending {
+            operation,
+            admission: Some(()),
+        } => operation,
+        other => panic!("a new explicit Begin must remain viable: {other:?}"),
+    };
+    assert_ne!(retry, operation);
+    assert_eq!(admissions.get(), 2);
+    assert_eq!(owner.next_operation, 2);
+    assert_eq!(owner.jobs.len(), 1);
+    assert!(owner.cancel(&retry, CallError::generation_retired()));
+    assert_eq!(
+        owner.poll(&retry, |event| events.push(event)),
+        Progress::Drained
+    );
+    assert_eq!(
+        events.len(),
+        1,
+        "explicit retry has its own single cleanup result"
+    );
+    assert!(owner.jobs.is_empty());
+}
+
+fn as_begin_fixture(
+    fixed_redirect: &str,
+) -> (AuthBroker, AsWorkerPort, PermissionsManifest, String) {
+    let mut owner = broker();
+    let account = seed_account(&mut owner);
+    let port = super::super::macos_session::test_as_cancellation_port();
+    owner.as_port = Some(port.clone());
+    let configuration = owner
+        .configuration
+        .get_mut("entra-common")
+        .expect("profile config");
+    configuration.as_redirect = Some("msalliteral-client://auth".to_owned());
+    configuration.fixed_redirect = Some(fixed_redirect.to_owned());
+    let manifest = parse_manifest(
+        r#"{"app":{"auth":{"begin":["https://login.microsoftonline.com/common"]}}}"#,
+    )
+    .expect("actual parsed begin grant");
+    (owner, port, manifest, account)
+}
+
+fn anchor_domain_fixture() -> (AuthBroker, AsWorkerPort, PermissionsManifest, String) {
+    let fixture = as_begin_fixture("http://localhost/callback");
+    // This existing syntactically valid missing-port fixture is exactly003.
+    let profile = provider_profile("entra-common").expect("closed profile");
+    let error = RedirectPlan::new(profile, Some("http://localhost/callback"))
+        .err()
+        .expect("fixed mode requires a nonzero explicit port");
+    assert!(matches!(error, PrimitiveError::RedirectMode));
+    assert_eq!(error.code(), "KELD-AUTH-003");
+    fixture
+}
+
+#[test]
+fn local_anchor_close_before_submit_preserves_auth_and_resolves_prestart_fallback() {
+    use super::super::macos_session::{AsMainStop, test_apply_main_stop};
+    use std::cell::Cell;
+    let (mut owner, port, manifest, account) = anchor_domain_fixture();
+    let admissions = Cell::new(0_u64);
+    let mut events = Vec::new();
+    for expected in 1..=2 {
+        let request = AuthRequest::Begin {
+            provider: "entra-common".to_owned(),
+            scopes: None,
+            login_hint: None,
+        };
+        let operation =
+            match owner.handle_manifest_request(&manifest, Principal::AppProcess, request, || {
+                admissions.set(admissions.get() + 1);
+                Some(())
+            }) {
+                HandleState::Pending {
+                    operation,
+                    admission: Some(()),
+                } => operation,
+                other => panic!("actual granted Begin must remain viable: {other:?}"),
+            };
+        assert!(test_apply_main_stop(&port, AsMainStop::AnchorClosing));
+        assert_eq!(
+            owner.poll(&operation, |event| events.push(event)),
+            Progress::Pending
+        );
+        assert!(events.is_empty());
+        assert!(test_apply_main_stop(&port, AsMainStop::AnchorClosing));
+        assert_eq!(
+            owner.poll(&operation, |event| events.push(event)),
+            Progress::Drained
+        );
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].operation, operation);
+        let error = events
+            .pop()
+            .expect("actual prestart result")
+            .response
+            .into_response()
+            .expect_err("existing invalid T3 redirect proves fallback without I/O");
+        assert_eq!(error.code, "KELD-AUTH-003");
+        assert!(owner.registry.admission_open());
+        assert_eq!(
+            owner.registry.issuer_for(&account),
+            Some("https://login.microsoftonline.com/common")
+        );
+        assert!(owner.jobs.is_empty());
+        assert_eq!(owner.next_operation, expected);
+        assert_eq!(admissions.get(), expected);
+    }
+}
+
+#[test]
+fn local_anchor_close_stops_active_owner_without_fallback_or_revoking_accounts() {
+    let (mut owner, port, manifest, account) = anchor_domain_fixture();
+    let operation = match owner.handle_manifest_request(
+        &manifest,
+        Principal::AppProcess,
+        AuthRequest::Begin {
+            provider: "entra-common".to_owned(),
+            scopes: None,
+            login_hint: None,
+        },
+        || Some(()),
+    ) {
+        HandleState::Pending {
+            operation,
+            admission: Some(()),
+        } => operation,
+        other => panic!("actual granted Begin: {other:?}"),
+    };
+    let mut events = Vec::new();
+    assert_eq!(
+        owner.poll(&operation, |event| events.push(event)),
+        Progress::Pending
+    );
+    super::super::macos_session::test_active_anchor_retirement(&port, &operation);
+    assert_eq!(
+        owner.poll(&operation, |event| events.push(event)),
+        Progress::Drained
+    );
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].operation, operation);
+    let error = events
+        .pop()
+        .expect("actual stopped owner result")
+        .response
+        .into_response()
+        .expect_err("local presentation stop is not successful login");
+    assert_eq!(
+        error.code, "KELD-AUTH-016",
+        "accepted work must not fallback to trap003"
+    );
+    assert!(owner.registry.admission_open());
+    assert_eq!(
+        owner.registry.issuer_for(&account),
+        Some("https://login.microsoftonline.com/common")
+    );
+    assert!(owner.jobs.is_empty());
+    assert_eq!(owner.next_operation, 1);
+}
+
+#[test]
+fn accepted_as_context_callback_error_does_not_replay_loopback() {
+    let (mut owner, port, manifest, account) = anchor_domain_fixture();
+    let operation = match owner.handle_manifest_request(
+        &manifest,
+        Principal::AppProcess,
+        AuthRequest::Begin {
+            provider: "entra-common".to_owned(),
+            scopes: None,
+            login_hint: None,
+        },
+        || Some(()),
+    ) {
+        HandleState::Pending {
+            operation,
+            admission: Some(()),
+        } => operation,
+        other => panic!("actual granted Begin: {other:?}"),
+    };
+    assert_eq!(owner.poll(&operation, |_| {}), Progress::Pending);
+    let mut events = Vec::new();
+    super::super::macos_session::test_deliver_callback_error(&port, &operation, 2);
+    assert_eq!(
+        owner.poll(&operation, |event| events.push(event)),
+        Progress::Drained
+    );
+    assert_eq!(events.len(), 1);
+    let error = events
+        .pop()
+        .expect("one terminal callback error")
+        .response
+        .into_response()
+        .expect_err("presentation completion error cannot be a successful login");
+    assert_eq!(
+        error.code, "KELD-AUTH-017",
+        "a callback after session start must not enter the trapped loopback fallback"
+    );
+    assert!(owner.registry.admission_open());
+    assert_eq!(
+        owner.registry.issuer_for(&account),
+        Some("https://login.microsoftonline.com/common")
+    );
+    assert!(owner.jobs.is_empty());
+    assert_eq!(owner.next_operation, 1);
+}
+
+#[test]
+fn host_tail_closes_auth_and_native_admission_permanently() {
+    use super::super::macos_session::{AsMainStop, test_apply_main_stop};
+    let (mut owner, port, manifest, _) = anchor_domain_fixture();
+    let request = || AuthRequest::Begin {
+        provider: "entra-common".to_owned(),
+        scopes: None,
+        login_hint: None,
+    };
+    let operation = match owner.handle_manifest_request(
+        &manifest,
+        Principal::AppProcess,
+        request(),
+        || Some(()),
+    ) {
+        HandleState::Pending {
+            operation,
+            admission: Some(()),
+        } => operation,
+        other => panic!("actual granted Begin: {other:?}"),
+    };
+    let mut events = Vec::new();
+    owner.stop_for_host_tail(|event| events.push(event));
+    assert!(!test_apply_main_stop(&port, AsMainStop::HostTail));
+    assert!(!test_apply_main_stop(&port, AsMainStop::AnchorClosing));
+    assert!(!test_apply_main_stop(&port, AsMainStop::Running));
+    assert_eq!(
+        owner.poll(&operation, |event| events.push(event)),
+        Progress::Drained
+    );
+    assert_eq!(events.len(), 1, "same global terminal emitted once");
+    assert!(!owner.registry.admission_open());
+    let stopped = permission_ready_error(owner.handle_manifest_request(
+        &manifest,
+        Principal::AppProcess,
+        request(),
+        || -> Option<()> {
+            panic!("global tail must not readmit");
+        },
+    ));
+    assert_eq!(stopped.code, "KELD-AUTH-016");
+    assert!(owner.jobs.is_empty());
+    assert_eq!(owner.next_operation, 1);
+}
+
+#[test]
+fn host_tail_native_stop_before_submit_finishes_begin_stopping_result() {
+    use super::super::macos_session::{AsMainStop, test_apply_main_stop};
+    let (mut owner, port, manifest, _) = anchor_domain_fixture();
+    let operation = match owner.handle_manifest_request(
+        &manifest,
+        Principal::AppProcess,
+        AuthRequest::Begin {
+            provider: "entra-common".to_owned(),
+            scopes: None,
+            login_hint: None,
+        },
+        || Some(()),
+    ) {
+        HandleState::Pending {
+            operation,
+            admission: Some(()),
+        } => operation,
+        other => panic!("actual granted Begin: {other:?}"),
+    };
+    assert!(!test_apply_main_stop(&port, AsMainStop::HostTail));
+    let mut events = Vec::new();
+    assert_eq!(
+        owner.poll(&operation, |event| events.push(event)),
+        Progress::Drained,
+        "a submit rejected by the already-closed host port is a normal stop result"
+    );
+    assert_eq!(events.len(), 1);
+    let error = events
+        .pop()
+        .expect("one terminal Begin result")
+        .response
+        .into_response()
+        .expect_err("host tail cannot complete sign-in");
+    assert_eq!(error.code, "KELD-AUTH-016");
+    assert!(owner.jobs.is_empty());
+}
+
+#[test]
+fn contended_anchor_stop_registers_before_claim_and_survives_running_drive() {
+    let (mut owner, port, manifest, account) = anchor_domain_fixture();
+    let operation = match owner.handle_manifest_request(
+        &manifest,
+        Principal::AppProcess,
+        AuthRequest::Begin {
+            provider: "entra-common".to_owned(),
+            scopes: None,
+            login_hint: None,
+        },
+        || Some(()),
+    ) {
+        HandleState::Pending {
+            operation,
+            admission: Some(()),
+        } => operation,
+        other => panic!("actual granted Begin: {other:?}"),
+    };
+    let mut events = Vec::new();
+    assert_eq!(
+        owner.poll(&operation, |event| events.push(event)),
+        Progress::Pending
+    );
+    super::super::macos_session::test_contended_anchor_stop(&port, &operation);
+    assert_eq!(
+        owner.poll(&operation, |event| events.push(event)),
+        Progress::Drained
+    );
+    assert_eq!(events.len(), 1);
+    let error = events
+        .pop()
+        .expect("actual prestart reply")
+        .response
+        .into_response()
+        .expect_err("fixed port absence stops fallback before I/O");
+    assert_eq!(error.code, "KELD-AUTH-003");
+    assert!(owner.registry.admission_open());
+    assert_eq!(
+        owner.registry.issuer_for(&account),
+        Some("https://login.microsoftonline.com/common")
+    );
+    assert!(owner.jobs.is_empty());
+}
+
+#[test]
+fn global_tail_overrides_unclaimed_local_unavailable() {
+    use super::super::macos_session::{AsMainStop, test_apply_main_stop};
+    let (mut owner, port, manifest, _) = anchor_domain_fixture();
+    let operation = match owner.handle_manifest_request(
+        &manifest,
+        Principal::AppProcess,
+        AuthRequest::Begin {
+            provider: "entra-common".to_owned(),
+            scopes: None,
+            login_hint: None,
+        },
+        || Some(()),
+    ) {
+        HandleState::Pending {
+            operation,
+            admission: Some(()),
+        } => operation,
+        other => panic!("actual granted Begin: {other:?}"),
+    };
+    let mut events = Vec::new();
+    assert_eq!(
+        owner.poll(&operation, |event| events.push(event)),
+        Progress::Pending
+    );
+    assert!(test_apply_main_stop(&port, AsMainStop::AnchorClosing));
+    owner.stop_for_host_tail(|event| events.push(event));
+    assert!(!test_apply_main_stop(&port, AsMainStop::HostTail));
+    super::super::macos_session::test_assert_unclaimed_host_priority(&port, &operation);
+    assert_eq!(
+        owner.poll(&operation, |event| events.push(event)),
+        Progress::Drained
+    );
+    assert_eq!(events.len(), 1);
+    let error = events
+        .pop()
+        .expect("actual global tail reply")
+        .response
+        .into_response()
+        .expect_err("canonical host tail wins");
+    assert_eq!(error.code, "KELD-AUTH-016");
+    assert!(!owner.registry.admission_open());
+    assert!(owner.jobs.is_empty());
 }

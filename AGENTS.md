@@ -150,7 +150,7 @@ Crate invariants in `AGENTS.md`: `wv`, `ipc`, `guard`, `compat`, `runtime`,
 - Rust lints are workspace-owned. A new `allow` needs inline justification.
 - Production `unsafe`: exact paths/operations sanctioned by the nearest crate
   `AGENTS.md` only; sole allowlist, no crate-wide grant. KEL-89:
-  [Native owner](crates/keld-native/AGENTS.md).
+  [Native T3/T4](crates/keld-native/AGENTS.md).
   Each denies `unsafe_op_in_unsafe_fn` and carries local `// SAFETY:` proofs.
   New production paths require issue-scoped root/nested owner updates plus
   independent `unsafe` gate evidence on the exact final diff; tests follow their
