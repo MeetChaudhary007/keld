@@ -376,7 +376,7 @@
         ".githooks/*",
         "rust-toolchain.toml"
       ],
-      "sha256": "b1c4416cf7e9efde0e5630da14d21702a329524f298e6764ef6c637f77f7f7ed"
+      "sha256": "66cb92264dba3d127c7832f2e8b37bdcc336d4cd999261480119d9388b20d5ea"
     },
     "audit-readers": {
       "patterns": [
