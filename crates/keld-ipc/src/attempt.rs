@@ -361,7 +361,9 @@ impl WindowsAttemptEndpoint {
 /// later [`WindowsAttemptEndpoint::accept_claim`] on that endpoint return
 /// [`WindowsAttemptExchangeError::ClaimCancelled`] promptly; it is idempotent,
 /// a no-op once a claimant was accepted or the endpoint ended or dropped, and
-/// it reaches no other endpoint.
+/// it reaches no other endpoint. A cancel and the acceptance are serialised:
+/// a cancel either wins, and no `KELD-AR1` is sent, or finds the claimant
+/// accepted and does nothing, so it never aborts the accepted channel's I/O.
 ///
 /// It is a weak view of the endpoint's instance: it keeps nothing alive, and
 /// it exposes no accept, read, write or handle, so it cannot be used to admit
@@ -391,7 +393,8 @@ pub struct WindowsAttemptClaimCanceller {
 impl WindowsAttemptClaimCanceller {
     /// Ends the endpoint's claim wait: a pending wait returns
     /// [`WindowsAttemptExchangeError::ClaimCancelled`] promptly, and a wait
-    /// started later returns it at once. Idempotent; a no-op after a claimant
+    /// started later returns it at once, and an acceptance not yet taken is
+    /// refused, so no `KELD-AR1` is sent. Idempotent; a no-op after a claimant
     /// was accepted, after the wait ended, and after the endpoint dropped.
     ///
     /// # Errors

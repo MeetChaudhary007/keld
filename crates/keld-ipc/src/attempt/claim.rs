@@ -82,6 +82,9 @@ enum Connection<P> {
     Refused(ClaimRefusal),
     /// The claim deadline passed during this connection.
     Expired,
+    /// The canceller acted before the one-shot, which was refused: no
+    /// `KELD-AR1` was sent.
+    Cancelled,
 }
 
 impl WindowsAttemptEndpoint {
@@ -110,9 +113,13 @@ impl WindowsAttemptEndpoint {
     /// is observed without a lost wake-up: before this call, at the next wait;
     /// during the connect wait, at once; during a connection's record I/O, at
     /// that operation, which is aborted or refused, after which the instance
-    /// re-arms once and reads the cancel before it waits again. A cancel that
+    /// re-arms once and reads the cancel before it waits again. The cancel and
+    /// the one-shot are serialised on the instance: a cancel that acts before
+    /// the one-shot is taken, including one already in flight when the owner
+    /// reaches it, refuses it, so no `KELD-AR1` is sent, the claimant reads
+    /// end of file and the wait ends with `ClaimCancelled`; a cancel that
     /// lands after the one-shot was consumed is a no-op: the accepted channel
-    /// is returned untouched.
+    /// is returned untouched and none of its I/O is aborted.
     ///
     /// # Errors
     ///
@@ -187,6 +194,9 @@ impl WindowsAttemptEndpoint {
                 }
                 Connection::Expired => {
                     return Err(self.end(WindowsAttemptExchangeError::ClaimDeadline));
+                }
+                Connection::Cancelled => {
+                    return Err(self.end(WindowsAttemptExchangeError::ClaimCancelled));
                 }
             }
         }
@@ -274,7 +284,12 @@ impl WindowsAttemptEndpoint {
         if Instant::now() >= deadline {
             return Ok(Connection::Expired);
         }
-        self.server.consume();
+        // The one-shot is serialised with the canceller: a cancel that acted
+        // first refuses it, and one that comes later finds the instance
+        // consumed and leaves the accepted channel untouched.
+        if !self.server.consume() {
+            return Ok(Connection::Cancelled);
+        }
         AttemptRecord::Receipt(transcript).write_to(&mut stream)?;
         stream.set_absolute_deadline(None);
         Ok(Connection::Accepted(Box::new(

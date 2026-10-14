@@ -18,7 +18,7 @@ use std::ptr;
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, PoisonError, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::{Duration, Instant};
 #[cfg(test)]
 use std::{cell::RefCell, sync::mpsc};
@@ -92,13 +92,22 @@ pub(crate) enum WaitOutcome {
 #[derive(Debug)]
 struct ServerInner {
     pipe: Mutex<Option<OwnedHandle>>,
+    /// Serialises the instance's terminal transitions: the one-shot
+    /// ([`WindowsNamedPipeServer::consume`]), the cancel, the re-arm and the
+    /// close. Each holds it only across its flag checks and non-blocking
+    /// Win32 calls, never across a wait. Lock order: `lifecycle` before
+    /// `pipe`; `pipe` is never held while `lifecycle` is taken.
     lifecycle: Mutex<()>,
     cancel_event: OwnedHandle,
     connect_event: OwnedEvent,
     connected: AtomicBool,
+    /// Set once, under `lifecycle`, by the one-shot or the terminal close.
+    /// The one-shot sets it only while `cancelled` is clear, so a consumed
+    /// instance was never cancelled before its one-shot.
     consumed: AtomicBool,
-    /// Set by [`WindowsNamedPipeServer::cancel`] while the instance is not yet
-    /// consumed, and never cleared. The event above wakes a pending accept and
+    /// Set by [`WindowsNamedPipeServer::cancel`], under `lifecycle`, while the
+    /// instance is not yet consumed, and never cleared; once it is set the
+    /// one-shot is refused. The event above wakes a pending accept and
     /// `CancelIoEx` aborts pending stream I/O, but neither reaches I/O that a
     /// waiter issues after the cancel; this flag does: an unconsumed server
     /// stream refuses to start new I/O once it is set, and a waiter that
@@ -430,11 +439,7 @@ impl WindowsNamedPipeServer {
     }
 
     pub(crate) fn disconnect_for_retry(&self) -> io::Result<()> {
-        let _lifecycle = self
-            .inner
-            .lifecycle
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let _lifecycle = self.lock_lifecycle();
         if self.inner.consumed.load(Ordering::Acquire) {
             return Err(io::Error::new(
                 io::ErrorKind::NotConnected,
@@ -467,24 +472,35 @@ impl WindowsNamedPipeServer {
         })
     }
 
-    pub(crate) fn consume(&self) {
+    /// Takes this instance's one-shot and reports whether it was taken. It is
+    /// refused, and `false` returned, when [`Self::cancel`] acted first; the
+    /// caller then sends nothing more on the connection and ends the
+    /// instance. The one-shot and the cancel are serialised on the lifecycle
+    /// lock, so a cancel either acts wholly before the one-shot, which is then
+    /// refused, or finds the instance consumed and does nothing: it never
+    /// signals or aborts I/O of an admitted stream.
+    #[must_use = "a refused one-shot means a cancel won; the caller must end the instance"]
+    pub(crate) fn consume(&self) -> bool {
         #[cfg(test)]
         wait_at_test_consume_gate(&self.inner.before_consume);
+        let _lifecycle = self.lock_lifecycle();
+        if self.inner.cancelled.load(Ordering::Acquire) {
+            return false;
+        }
         self.inner.consumed.store(true, Ordering::Release);
+        true
     }
 
     /// Ends this instance's pending and future accept and stream waits until it
     /// is consumed: it is a no-op on a consumed instance, so a cancel that
-    /// races an admission never touches the admitted stream. The order is the
-    /// flag, then the event, then `CancelIoEx`: I/O issued after the flag is
-    /// refused at once, a pending accept wakes on the event, and pending stream
-    /// I/O is aborted. Idempotent.
+    /// races an admission never touches the admitted stream, and once it has
+    /// acted the one-shot is refused ([`Self::consume`]). The check and the
+    /// act run under the lifecycle lock, as the one-shot does. The order is
+    /// the flag, then the event, then `CancelIoEx`: I/O issued after the flag
+    /// is refused at once, a pending accept wakes on the event, and pending
+    /// stream I/O is aborted. None of them waits. Idempotent.
     pub(crate) fn cancel(&self) -> io::Result<()> {
-        let _lifecycle = self
-            .inner
-            .lifecycle
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let _lifecycle = self.lock_lifecycle();
         if self.inner.consumed.load(Ordering::Acquire) {
             return Ok(());
         }
@@ -522,11 +538,7 @@ impl WindowsNamedPipeServer {
     }
 
     pub(crate) fn close_terminal(&self) -> io::Result<()> {
-        let _lifecycle = self
-            .inner
-            .lifecycle
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let _lifecycle = self.lock_lifecycle();
         self.inner.consumed.store(true, Ordering::Release);
         self.cancel_pending_io()?;
         // SAFETY: the server owns the live handle and all pending operations
@@ -797,6 +809,36 @@ impl WindowsNamedPipeServer {
     fn raw_cancel_event(&self) -> *mut core::ffi::c_void {
         self.inner.cancel_event.as_raw_handle()
     }
+
+    /// The instance's lifecycle lock (see [`ServerInner::lifecycle`]). Under
+    /// test, a thread that finds it held reports so once on the installed
+    /// witness before it waits.
+    fn lock_lifecycle(&self) -> MutexGuard<'_, ()> {
+        #[cfg(test)]
+        self.report_lifecycle_wait();
+        self.inner
+            .lifecycle
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    #[cfg(test)]
+    fn report_lifecycle_wait(&self) {
+        let held = matches!(
+            self.inner.lifecycle.try_lock(),
+            Err(std::sync::TryLockError::WouldBlock)
+        );
+        if held
+            && let Some(witness) = self
+                .inner
+                .lifecycle_waiter
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take()
+        {
+            let _ = witness.send(());
+        }
+    }
 }
 
 impl WindowsNamedPipeCanceller {
@@ -983,11 +1025,7 @@ impl WindowsNamedPipeStream {
         let server = WindowsNamedPipeServer {
             inner: Arc::clone(&self.inner),
         };
-        let _lifecycle = self
-            .inner
-            .lifecycle
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let _lifecycle = server.lock_lifecycle();
         let cancel_error = server.cancel_pending_io().err();
         // SAFETY: this is the live server pipe handle. Cancelling does not
         // free another operation's OVERLAPPED or buffer; each operation owner
@@ -1028,9 +1066,7 @@ impl WindowsNamedPipeStream {
         if self.inner.cancelled.load(Ordering::Acquire)
             && !self.inner.consumed.load(Ordering::Acquire)
         {
-            return Err(io::Error::from_raw_os_error(
-                ERROR_OPERATION_ABORTED.cast_signed(),
-            ));
+            return Err(operation_aborted());
         }
         Ok(())
     }
@@ -1707,6 +1743,12 @@ fn duration_to_wait_ms(timeout: Option<Duration>) -> u32 {
         .max(1)
         .min(u128::from(INFINITE - 1));
     u32::try_from(millis).unwrap_or(INFINITE - 1)
+}
+
+/// `ERROR_OPERATION_ABORTED`, the code a cancelled pending operation reports:
+/// the one error for I/O or a one-shot that a cancel of the instance refused.
+pub(crate) fn operation_aborted() -> io::Error {
+    io::Error::from_raw_os_error(ERROR_OPERATION_ABORTED.cast_signed())
 }
 
 fn connect_deadline_error() -> io::Error {

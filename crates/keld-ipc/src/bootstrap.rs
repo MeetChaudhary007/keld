@@ -43,7 +43,7 @@ use crate::token::{SessionToken, format_app_link};
 #[cfg(windows)]
 use crate::windows_named_pipe::{
     WaitOutcome, WindowsNamedPipeCanceller, WindowsNamedPipeServer, WindowsNamedPipeStream,
-    WindowsPeerTokenFacts,
+    WindowsPeerTokenFacts, operation_aborted,
 };
 
 #[cfg(unix)]
@@ -1043,7 +1043,11 @@ pub(crate) fn connected_named_pipe_pair() -> io::Result<(
         }
     }
     let server_stream = server.stream()?;
-    server.consume();
+    if !server.consume() {
+        return Err(io::Error::other(
+            "pair: the uncancelled instance refused its one-shot",
+        ));
+    }
     drop(server);
     let client_stream = client
         .join()
@@ -1242,7 +1246,17 @@ impl WindowsLifecycleRendezvousListener {
                 }
                 #[cfg(test)]
                 wait_at_test_consume_gate(&self.before_consume);
-                server.consume();
+                if !server.consume() {
+                    // No canceller reaches this instance; a refused one-shot
+                    // still fails closed: no receipt, the locator closed.
+                    drop(stream);
+                    server.close_terminal()?;
+                    self.server
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .take();
+                    return Err(operation_aborted());
+                }
                 #[cfg(test)]
                 wait_at_test_consume_gate(&self.before_receipt);
                 self.server
@@ -1902,8 +1916,22 @@ impl WindowsNamedPipeBootstrapListener {
                         );
                         return Ok(WindowsNamedPipeBootstrapAdmission::DeadlineElapsed);
                     }
+                    // `shutdown`'s cancel and the one-shot are serialised on
+                    // the instance: a cancel that acted first refuses it, even
+                    // one that passed the `stopping` checks above in flight,
+                    // and one that comes later never touches this stream.
+                    if !server.consume() {
+                        drop(stream);
+                        server.close_terminal()?;
+                        drop(
+                            self.server
+                                .lock()
+                                .unwrap_or_else(PoisonError::into_inner)
+                                .take(),
+                        );
+                        return Ok(WindowsNamedPipeBootstrapAdmission::Cancelled);
+                    }
                     stream.0.set_absolute_deadline(None);
-                    server.consume();
                     drop(
                         self.server
                             .lock()
@@ -3242,7 +3270,10 @@ mod named_pipe_tests {
             matches!(read, Ok(0) | Err(_)),
             "fake endpoint must receive no HELLO byte, got {read:?}"
         );
-        server.consume();
+        assert!(
+            server.consume(),
+            "an uncancelled instance takes its one-shot"
+        );
         drop(stream);
         let output = child.wait_with_output().expect("wait fake-endpoint client");
         assert!(
@@ -3396,7 +3427,10 @@ mod named_pipe_tests {
             child.id(),
             "server must report the exact connecting process"
         );
-        server.consume();
+        assert!(
+            server.consume(),
+            "an uncancelled instance takes its one-shot"
+        );
         drop(stream);
         drop(server);
         let output = child.wait_with_output().expect("wait for pipe client");
@@ -4497,25 +4531,30 @@ socket.end();
     /// the cancel at once with `ERROR_OPERATION_ABORTED` (995), the code a
     /// cancelled pending operation reports: `CancelIoEx` reaches only the
     /// operations pending at the cancel, so without the gate such a read
-    /// would wait out its own deadline. Consuming the instance lifts the
-    /// gate, so an admitted stream is never refused. Oracles: the raw code,
-    /// the elapsed time against the read deadline, and the byte the client
-    /// wrote.
+    /// would wait out its own deadline. The cancel also refuses the
+    /// instance's one-shot, so the gate is never lifted. An instance consumed
+    /// before a cancel is never refused: that cancel is a no-op and the
+    /// admitted stream reads on. Oracles: the raw code, the elapsed time
+    /// against the read deadline, and the byte the client wrote.
     #[test]
-    fn a_cancelled_unconsumed_server_stream_refuses_new_io_until_consumed() {
-        let endpoint = super::random_pipe_endpoint().expect("mint pipe endpoint");
-        let server = WindowsNamedPipeServer::bind(&endpoint).expect("bind pipe server");
-        let mut client = WindowsNamedPipeServer::connect_client(&endpoint).expect("client");
-        assert_eq!(
-            server
-                .accept_until(Some(Instant::now() + Duration::from_secs(5)))
-                .expect("accept the client"),
-            WaitOutcome::Ready
-        );
-        let mut stream = server.stream().expect("server stream");
-        stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .expect("read deadline");
+    fn a_cancelled_unconsumed_server_stream_refuses_new_io_and_its_one_shot() {
+        let connected = || {
+            let endpoint = super::random_pipe_endpoint().expect("mint pipe endpoint");
+            let server = WindowsNamedPipeServer::bind(&endpoint).expect("bind pipe server");
+            let client = WindowsNamedPipeServer::connect_client(&endpoint).expect("client");
+            assert_eq!(
+                server
+                    .accept_until(Some(Instant::now() + Duration::from_secs(5)))
+                    .expect("accept the client"),
+                WaitOutcome::Ready
+            );
+            let stream = server.stream().expect("server stream");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("read deadline");
+            (server, client, stream)
+        };
+        let (server, mut client, mut stream) = connected();
         server.cancel().expect("cancel the unconsumed instance");
         let refused_at = Instant::now();
         let mut byte = [0_u8; 1];
@@ -4531,12 +4570,29 @@ socket.end();
             refused_at.elapsed() < Duration::from_secs(1),
             "refused at once, not at the read deadline"
         );
-        server.consume();
+        assert!(
+            !server.consume(),
+            "a cancel that acted first refuses the one-shot"
+        );
+        client.write_all(&[7]).expect("client write");
+        let still = stream
+            .read(&mut byte)
+            .expect_err("a refused one-shot never lifts the gate");
+        assert_eq!(still.raw_os_error(), Some(995), "{still}");
+
+        let (server, mut client, mut stream) = connected();
+        assert!(
+            server.consume(),
+            "an uncancelled instance takes its one-shot"
+        );
+        server
+            .cancel()
+            .expect("a cancel after the one-shot is a no-op");
         client.write_all(&[7]).expect("client write");
         assert_eq!(
             stream.read(&mut byte).expect("an admitted stream reads"),
             1,
-            "consuming the instance lifts the gate"
+            "a cancel after the one-shot never refuses the admitted stream"
         );
         assert_eq!(byte, [7]);
     }
