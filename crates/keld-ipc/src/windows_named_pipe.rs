@@ -23,6 +23,8 @@ use std::time::{Duration, Instant};
 #[cfg(test)]
 use std::{cell::RefCell, sync::mpsc};
 
+#[cfg(test)]
+use crate::bootstrap::{TestConsumeGate, wait_at_test_consume_gate};
 use windows_permissions::constants::{SeObjectType, SecurityInformation};
 use windows_permissions::utilities::current_process_sid;
 use windows_permissions::wrappers::{
@@ -108,6 +110,18 @@ struct ServerInner {
     active_stream_io: AtomicUsize,
     #[cfg(test)]
     force_cancel_error: AtomicBool,
+    /// Test barrier between [`WindowsNamedPipeServer::cancel`]'s "not yet
+    /// consumed" check and its act, crossed with the lifecycle lock held.
+    #[cfg(test)]
+    cancel_gate: Mutex<Option<TestConsumeGate>>,
+    /// Test barrier at the entry of [`WindowsNamedPipeServer::consume`],
+    /// before it takes the lifecycle lock.
+    #[cfg(test)]
+    before_consume: Mutex<Option<TestConsumeGate>>,
+    /// Test witness: reported once by a thread that finds the lifecycle lock
+    /// held and is about to wait for it.
+    #[cfg(test)]
+    lifecycle_waiter: Mutex<Option<mpsc::SyncSender<()>>>,
 }
 
 /// One host-owned named-pipe instance.
@@ -355,6 +369,12 @@ impl WindowsNamedPipeServer {
                 active_stream_io: AtomicUsize::new(0),
                 #[cfg(test)]
                 force_cancel_error: AtomicBool::new(false),
+                #[cfg(test)]
+                cancel_gate: Mutex::new(None),
+                #[cfg(test)]
+                before_consume: Mutex::new(None),
+                #[cfg(test)]
+                lifecycle_waiter: Mutex::new(None),
             }),
         })
     }
@@ -448,6 +468,8 @@ impl WindowsNamedPipeServer {
     }
 
     pub(crate) fn consume(&self) {
+        #[cfg(test)]
+        wait_at_test_consume_gate(&self.inner.before_consume);
         self.inner.consumed.store(true, Ordering::Release);
     }
 
@@ -466,6 +488,8 @@ impl WindowsNamedPipeServer {
         if self.inner.consumed.load(Ordering::Acquire) {
             return Ok(());
         }
+        #[cfg(test)]
+        wait_at_test_consume_gate(&self.inner.cancel_gate);
         self.inner.cancelled.store(true, Ordering::Release);
         // SAFETY: the cancellation event handle remains live in `inner`.
         if unsafe { SetEvent(self.raw_cancel_event()) } == 0 {
@@ -596,6 +620,12 @@ impl WindowsNamedPipeServer {
                 active_stream_io: AtomicUsize::new(0),
                 #[cfg(test)]
                 force_cancel_error: AtomicBool::new(false),
+                #[cfg(test)]
+                cancel_gate: Mutex::new(None),
+                #[cfg(test)]
+                before_consume: Mutex::new(None),
+                #[cfg(test)]
+                lifecycle_waiter: Mutex::new(None),
             }),
             local_is_server: false,
             read_event: OwnedEvent::new()?,
@@ -614,6 +644,39 @@ impl WindowsNamedPipeServer {
     #[cfg(test)]
     pub(crate) fn is_accept_pending(&self) -> bool {
         self.inner.accept_pending.load(Ordering::Acquire)
+    }
+
+    /// Holds the next [`Self::cancel`] that finds this instance unconsumed at
+    /// `gate`, after its check and before its act, with the lifecycle lock held.
+    #[cfg(test)]
+    pub(crate) fn install_cancel_gate(&self, gate: TestConsumeGate) {
+        *self
+            .inner
+            .cancel_gate
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(gate);
+    }
+
+    /// Holds the next [`Self::consume`] at `gate`, before it takes the
+    /// lifecycle lock.
+    #[cfg(test)]
+    pub(crate) fn install_before_consume_gate(&self, gate: TestConsumeGate) {
+        *self
+            .inner
+            .before_consume
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(gate);
+    }
+
+    /// Reports once on `witness` when a thread finds this instance's lifecycle
+    /// lock held and is about to wait for it.
+    #[cfg(test)]
+    pub(crate) fn install_lifecycle_wait_witness(&self, witness: mpsc::SyncSender<()>) {
+        *self
+            .inner
+            .lifecycle_waiter
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(witness);
     }
 
     pub(crate) fn connect_client_until(
