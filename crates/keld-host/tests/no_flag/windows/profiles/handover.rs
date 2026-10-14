@@ -58,60 +58,13 @@ const QUIT_DEADLINE: Duration = Duration::from_secs(10);
 const FORCED_END_HOST_SLACK: Duration = Duration::from_secs(1);
 const FORCED_END_TEST_SLACK: Duration = Duration::from_secs(2);
 
-/// keld-wv's release-barrier constants, read from their one definition so that this
-/// harness follows any change to them (no copy of their values lives here).
-const KELD_WV_WEBVIEW2_SOURCE: &str = include_str!("../../../../../keld-wv/src/webview2/mod.rs");
-
-/// The `Duration` value of the `const <name>: Duration = Duration::from_<unit>(<n>);`
-/// item in keld-wv's `webview2/mod.rs`.
-fn keld_wv_duration(name: &str) -> Duration {
-    let prefix = format!("const {name}: Duration = Duration::from_");
-    let item = KELD_WV_WEBVIEW2_SOURCE
-        .lines()
-        .find_map(|line| line.trim_start().strip_prefix(prefix.as_str()))
-        .unwrap_or_else(|| panic!("keld-wv defines `{name}` as a whole-unit Duration"));
-    let (unit, rest) = item
-        .split_once('(')
-        .unwrap_or_else(|| panic!("`{name}`: {item}"));
-    let amount: u64 = rest
-        .strip_suffix(");")
-        .and_then(|value| value.parse().ok())
-        .unwrap_or_else(|| panic!("`{name}` has a literal amount: {item}"));
-    match unit {
-        "millis" => Duration::from_millis(amount),
-        "secs" => Duration::from_secs(amount),
-        "mins" => Duration::from_mins(amount),
-        _ => panic!("`{name}` uses an unparsed Duration unit: {item}"),
-    }
-}
-
 /// Kill switch over each wait of a handover cell, never a synchronization wait. The
-/// longest wait is a UI end: the liveness-gated release barrier runs up to keld-wv's
-/// `BROWSER_SHUTDOWN_HANG_GUARD` while the browser lives and then up to its
-/// `BROWSER_EXIT_GRACE` once the browser exited, so a healthy UI end takes at most
-/// their sum; the forced end adds D, and the harness's per-step `PRODUCT_DEADLINE`
-/// covers the rest of the step (the window close, the record writes, the control
-/// line). Each wait stays below the nextest per-test terminate timeout (10 min).
+/// longest wait is a UI end, which keld-wv bounds by its one owner of that rule,
+/// `keld_wv::webview2::WEBVIEW2_UI_END_BOUND`. The forced end adds D, and the
+/// harness's per-step `PRODUCT_DEADLINE` covers the rest of the step: the window
+/// close, the record writes and the control line.
 fn handover_kill_switch() -> Duration {
-    keld_wv_duration("BROWSER_SHUTDOWN_HANG_GUARD")
-        + keld_wv_duration("BROWSER_EXIT_GRACE")
-        + QUIT_DEADLINE
-        + PRODUCT_DEADLINE
-}
-
-/// The kill switch reads keld-wv's barrier constants in every ordinary run, so a renamed
-/// or reshaped constant fails here rather than first inside a stalled cell, and each
-/// handover wait is bounded above the healthy barrier's maximum plus D.
-#[test]
-fn handover_kill_switch_covers_the_keld_wv_barrier_and_d() {
-    let hang_guard = keld_wv_duration("BROWSER_SHUTDOWN_HANG_GUARD");
-    let grace = keld_wv_duration("BROWSER_EXIT_GRACE");
-    assert!(!hang_guard.is_zero() && !grace.is_zero());
-    assert!(
-        handover_kill_switch() > hang_guard + grace + QUIT_DEADLINE,
-        "{:?} must exceed {hang_guard:?} + {grace:?} + {QUIT_DEADLINE:?}",
-        handover_kill_switch()
-    );
+    keld_wv::webview2::WEBVIEW2_UI_END_BOUND + QUIT_DEADLINE + PRODUCT_DEADLINE
 }
 
 /// The run-owned installation, profile root and control listener one cell uses.

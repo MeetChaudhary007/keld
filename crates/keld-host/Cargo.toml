@@ -30,6 +30,7 @@ keld-runtime = { workspace = true }
 
 [dev-dependencies]
 keld-cli = { workspace = true }
+keld-wv = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
 windows-sys = { workspace = true }

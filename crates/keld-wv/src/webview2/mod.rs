@@ -292,6 +292,19 @@ const BROWSER_EXIT_GRACE: Duration = Duration::from_secs(85);
 /// profile contract tolerates (quarantine plus exclusive-UDF probe).
 const BROWSER_SHUTDOWN_HANG_GUARD: Duration = Duration::from_mins(4);
 
+/// The longest a healthy UI end takes after a terminal command, such as the
+/// session's `Quit` or a handover. The liveness-gated release barrier waits up
+/// to the shutdown hang guard (240 s) while the browser lives, then up to the
+/// post-exit grace (85 s) once the browser has exited. Its bound is therefore
+/// their sum.
+///
+/// This constant is the one owner of that rule. A caller that must outlast a UI
+/// end reads it rather than restating the barrier's parts. Examples are a test
+/// harness's kill switch and the S6c coordinator before it launches a candidate.
+/// If the barrier ever gains another wait, this sum changes with it.
+pub const WEBVIEW2_UI_END_BOUND: Duration =
+    BROWSER_SHUTDOWN_HANG_GUARD.saturating_add(BROWSER_EXIT_GRACE);
+
 const LAUNCH_DEADLINE_EXPIRED: &str =
     "the WebView2 launch deadline expired before the environment or controller completed";
 const MESSAGE_WAIT_FAILED: &str = "the Win32 message wait failed while waiting for WebView2";

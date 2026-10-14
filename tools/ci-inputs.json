@@ -393,7 +393,7 @@
         "rust-toolchain.toml",
         ".cargo/*"
       ],
-      "sha256": "2621735d79b605f0fca388fa64e33a05c9b3da698ee39c1a23a99f1b73d9c394"
+      "sha256": "7ec28e424054f13fc1223111466622b52686f592651a32d77abf9a88307db420"
     },
     "dependency-command": {
       "patterns": [

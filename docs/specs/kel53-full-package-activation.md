@@ -1865,7 +1865,7 @@ handover's step 3b, the time the application has after `LastWindowClosed` to req
 `Quit`, at least four times the maximum that the S6c2a pull request measures for the
 reference application on the same harness, floor 10 s, because no landed deadline
 bounds that wait (the loop waits for the application's `Quit` without one,
-`mod.rs:3338-3353` and `:3357-3361`: a window's close only sends
+`mod.rs:3351-3366` and `:3370-3374`: a window's close only sends
 `LastWindowClosed`, and the loop exits only after a terminal command;
 `HOST_ANSWER_BUDGET` and `APP_LINK_IO_DEADLINE` bound single
 writes and reads, not the application's decision). D is measured on the reference
@@ -1992,7 +1992,7 @@ census interaction, the dependencies and the rejected alternatives.
 *Facts.* A Windows release host selects its persistent profile identity before any
 listener, child or window (Architecture 05 §1, `05-webview-and-native.md:55-56`) and
 takes the KEL-135 lease when it constructs its engine: `WebView2Engine::new`
-(`crates/keld-wv/src/webview2/mod.rs:2944-2947`) prepares the profile (`mod.rs:834-842`),
+(`crates/keld-wv/src/webview2/mod.rs:2957-2960`) prepares the profile (`mod.rs:834-842`),
 which opens `profile.lock` (`mod.rs:188`) with share mode zero (`mod.rs:517-523`, the
 open at `:792-795`); a second opener gets `ProfileInUse` (`mod.rs:521-538`). Every environment of that engine requests
 exclusive user-data-folder access (`mod.rs:1200`), so even a free lease admits no second
@@ -2036,7 +2036,7 @@ mints the identities, writing nothing
 (`crates/keld-update/src/windows_baseline/activate.rs:170-186`); (2) the owner creates
 and holds its endpoint and reads the descriptor back ("Candidate connect-back",
 *Order*); (3) the handover, a cooperative quit in three parts: (3a) the host ends its
-UI through the existing `Quit` command of the UI loop (`mod.rs:3314-3319`: `stopping`
+UI through the existing `Quit` command of the UI loop (`mod.rs:3327-3332`: `stopping`
 is committed, the views are dropped, the loop waits for the barrier, writes `idle` and
 releases the lease; the command's documentation widens from "the correlated Quit reply
 has been written" to "the session is ending", a doc change on a public item), and,
@@ -2044,7 +2044,7 @@ once the loop has returned, the host itself writes `LastWindowClosed` to the
 application through the router's `signal_last_window_closed`
 (`app_session.rs:5784-5796`), the same write a window's close triggers
 (`app_session.rs:4527`), because the `Quit` command's path emits no `LastWindowClosed`
-(`mod.rs:3314-3319`; only a window's close does, `:3349-3352`); (3b) the host waits
+(`mod.rs:3327-3332`; only a window's close does, `:3362-3365`); (3b) the host waits
 up to the quit deadline D of *Margin and deadlines*, counted from that write, for the
 application's `Quit`, which the landed lifecycle-Quit handler admits by claiming the
 session cause (`app_session.rs:6574`) and answers with the reply, the quiesce and
@@ -2054,7 +2054,7 @@ which before S6c2a failed on the closed window-commands channel (`:7119-7121`), 
 no-op once a handover has ended the UI loop, under whichever cause the tail runs; that
 session fact is set in the same transition-guard hold as the handover's `Quit` send,
 after that send succeeds, and read under the guard by `finish_tail`, because the loop's wake bridge
-drops its command receiver on the first terminal command (`mod.rs:3447-3457`), so a
+drops its command receiver on the first terminal command (`mod.rs:3460-3470`), so a
 `Quit` the application sends after the loop returned cannot race it; (3c) only when D
 passes without a `Quit`, the host claims the handover cause, the session's third
 (`SESSION_HANDOVER`, beside the lifecycle-Quit and CLI-lease-loss causes,
@@ -2999,7 +2999,7 @@ Implement in:
     The handover is the cooperative quit of step 3: the router's crate-private
     `request_handover` (`app_session.rs:5817-5835`; S6c2a; the entry the coordinator
     calls) sends the existing
-    `Quit` command, which ends the UI (`crates/keld-wv/src/webview2/mod.rs:3314-3319`;
+    `Quit` command, which ends the UI (`crates/keld-wv/src/webview2/mod.rs:3327-3332`;
     its documentation widens to the host-initiated session end) and emits no
     `LastWindowClosed`, so once the loop has returned the main thread writes
     `LastWindowClosed` itself through `signal_last_window_closed`
@@ -3018,7 +3018,7 @@ Implement in:
     wait with `ClaimCancelled` (`KELD-IPC-028`) and is serialised with the one-shot;
     no production FFI call and no crate is added; no
     `AppWindowCommand` variant is added (`crates/keld-wv/src/engine.rs:91-100`), and
-    `WebView2Engine::new` (`crates/keld-wv/src/webview2/mod.rs:2921-2944`) is
+    `WebView2Engine::new` (`crates/keld-wv/src/webview2/mod.rs:2934-2957`) is
     documented as constructible again on the main thread after a previous engine's
     session ended, which the two-sessions cell proves. The loop keeps per process the
     boot selection, the installed version-tree pin, the profile mode selected at boot,
@@ -3502,7 +3502,10 @@ Must not touch in Slice A:
           `LastWindowClosed`; crates `keld-core`, `keld-wv` (the documentation and the
           `profile-test-hooks` barrier fault fixture of h9), `keld-host` (tests);
           gates: public API (the `Quit` documentation; the feature-gated
-          `TEST_WINDOWS_BARRIER_GRACE_EXPIRY_ENV` constant), permission model none;
+          `TEST_WINDOWS_BARRIER_GRACE_EXPIRY_ENV` constant; the
+          `keld_wv::webview2::WEBVIEW2_UI_END_BOUND` constant, keld-wv's one owner
+          of the longest healthy UI end, from which the handover cells' kill switch
+          is derived), permission model none;
           cells h11, h12 (the forced end no earlier than D and less than 1 s after it
           on the host's clock, at most 2 s after it on the test's), the tail half of
           h9, h8's window census (asserted by h12 once the application is told; h11
@@ -3868,7 +3871,9 @@ source SHA, package/signature identity and raw crash cuts. Other OS results are 
   crate-private; the public items are the widened documentation of
   `AppWindowCommand::Quit` and the `profile-test-hooks`-gated
   `keld_wv::TEST_WINDOWS_BARRIER_GRACE_EXPIRY_ENV` constant of the h9 fault fixture,
-  which lib.rs refuses in release), the documented second construction of
+  which lib.rs refuses in release, and `keld_wv::webview2::WEBVIEW2_UI_END_BOUND`,
+  the documented bound of a healthy UI end: the shutdown hang guard plus the
+  post-exit grace), the documented second construction of
   `WebView2Engine` (S6c1), the `keld-ipc` attempt endpoint's claim-wait canceller seam
   (S6c2b), the debug-only evidence seams, the volume-GUID source and the own-process
   `AttemptOwner`/`InitiatingLogon` reader the coordinator's trust inputs need (S6c2e;
