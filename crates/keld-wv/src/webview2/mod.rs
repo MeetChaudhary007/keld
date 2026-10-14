@@ -217,20 +217,22 @@ const PROFILE_LAUNCH_DEADLINE: Duration = Duration::from_secs(15);
 /// Uncensored re-sample 2026-10-14, Windows 11 10.0.26300 (RAMANI, Ryzen 7
 /// 5800H, 16 logical cores), `WebView2` runtime 155.0.4283.45, 84
 /// media-acceptance fixture runs under a diagnostic 120 s grace and a 10 min
-/// fixture watchdog, none cut (source: the measurement table in the KEL-270
-/// F55 fix PR):
-/// - idle: host-own n=42, every event drained at or before the poll that saw
-///   the handle signaled (max 0 ms); probe n=42 median 10 ms, p90 19 ms,
-///   max 239 ms;
+/// fixture watchdog, none cut (source: the measurement table in
+/// <https://github.com/gyldlab/keld/pull/717>):
+/// - idle: host-own 42 runs, 2 armed the grace (the other 40 drained the
+///   event before the handle poll), armed max 0 ms; probe n=41 armed (1
+///   drained before the poll) median 10 ms, p90 19 ms, max 239 ms;
 /// - full-core load (16 busy-loop burners on 16 logical cores): host-own
-///   n=42 median 196 ms, p90 5.3 s, max 21.2 s; probe n=42 median 194 ms,
+///   n=38 armed (4 drained before the handle poll) median 196 ms, p90 5.3 s,
+///   max 21.2 s; probe n=38 armed (4 drained before the poll) median 194 ms,
 ///   p90 517 ms, max 587 ms.
 ///
 /// 4 x 21.218 s = 84.9 s -> 85 s. The host site rules; the hidden probe
-/// stayed below 0.6 s under the same load. As with the hang guard, a false
-/// expiry fails a healthy host release typed and retains a healthy leaf as
-/// unproven, while a late detection of a lost event only costs time in a
-/// session that is already broken.
+/// stayed below 0.6 s under the same load (a roughly 36x asymmetry, cause not
+/// established). As with the hang guard, a false expiry fails a healthy host
+/// release typed and retains a healthy leaf as unproven, while a late
+/// detection of a lost event only costs time in a session that is already
+/// broken.
 const BROWSER_EXIT_GRACE: Duration = Duration::from_secs(85);
 
 /// Kill switch on a browser that never exits after `Close`: the shutdown hang

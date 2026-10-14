@@ -142,10 +142,10 @@ function Invoke-ProfileRegressionCases {
     )
     # Outer kill switches only; every child bounds itself with its own watchdog.
     # The two swallowed-event cases (host site, probe site) wait out the full
-    # production post-exit grace (BROWSER_EXIT_GRACE, 85 s) on purpose, and their
-    # child watchdog is FIXTURE_DEADLINE + 2 x that grace (230 s), so their outer
-    # deadline must stay above that child watchdog; every other case keeps the
-    # 90 s kill switch.
+    # production post-exit grace (BROWSER_EXIT_GRACE) on purpose, so their outer
+    # kill switch must exceed FIXTURE_DEADLINE + 2 x BROWSER_EXIT_GRACE (the child
+    # watchdog); re-derive it when either constant changes. Every other case keeps
+    # the 90 s kill switch.
     $outerDeadlines = @{
         'windows_swallowed_browser_exit_fails_bounded_subprocess' = 300000
         'windows_unproven_probe_retains_predecessor_subprocess' = 300000

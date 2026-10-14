@@ -2182,8 +2182,8 @@ second collection while one is alive; it no longer rests on the old host holding
 lease.
 
 *Dependencies.* S6c starts only after (a) PR #658 (KEL-135, head `2550bc4b`) has
-landed: it makes the `BrowserProcessExited` barrier liveness-gated with a 5 s post-exit
-grace in place of the unmeasured 15 s bound at `mod.rs:186`, and the handover waits on
+landed: it makes the `BrowserProcessExited` barrier liveness-gated with a post-exit
+grace (5 s when #658 landed; re-measured to 85 s by KEL-270 F55, #717) in place of the unmeasured 15 s bound at `mod.rs:186`, and the handover waits on
 that barrier once per update; and (b) the F51 fix to the same-token launch (Linear
 KEL-270 comment `fffd7f38`): the candidate holds no handle of the owner's standard
 streams, so a reader of the old host's piped stdout or stderr observes end of file when

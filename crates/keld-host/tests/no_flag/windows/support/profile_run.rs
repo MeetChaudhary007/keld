@@ -208,10 +208,13 @@ impl SignedProfileStateRun {
     pub(crate) fn finish_after_retention(self) {
         // The window and each control read retain the existing product deadline.
         // The separate outer host-reap watchdog starts after LINK_EOF and covers
-        // the approved KEL-135 240 s live-browser guard plus its post-exit grace.
+        // the live-browser shutdown hang guard (BROWSER_SHUTDOWN_HANG_GUARD) plus the
+        // post-exit grace (BROWSER_EXIT_GRACE), plus margin: re-derive this budget
+        // whenever either constant changes. It must stay below the nextest per-test
+        // terminate timeout (slow-timeout period x terminate-after, .config/nextest.toml).
         self.finish_with_deadlines(
             Instant::now() + PRODUCT_DEADLINE,
-            Some(Duration::from_mins(5)),
+            Some(Duration::from_mins(6)),
         );
     }
 

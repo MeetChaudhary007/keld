@@ -52,7 +52,7 @@ const FIXTURE_DEADLINE: Duration = Duration::from_mins(1);
 /// re-measured (KEL-270 F55: the 60 s fixture budget cut the probe case at
 /// an 85 s grace).
 const SWALLOWED_EXIT_FIXTURE_DEADLINE: Duration =
-    Duration::from_secs(FIXTURE_DEADLINE.as_secs() + 2 * super::BROWSER_EXIT_GRACE.as_secs());
+    FIXTURE_DEADLINE.saturating_add(super::BROWSER_EXIT_GRACE.saturating_mul(2));
 const WATCHDOG_PROBE_DEADLINE: Duration = Duration::from_millis(100);
 const PARENT_DEADLINE_MARGIN: Duration = Duration::from_secs(30);
 
