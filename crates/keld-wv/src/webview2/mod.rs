@@ -201,12 +201,39 @@ const PROFILE_LAUNCH_DEADLINE: Duration = Duration::from_secs(15);
 ///
 /// `WebView2` raises the event only after the browser collection has released
 /// its resources, including the user data folder
-/// (`ICoreWebView2Environment5::add_BrowserProcessExited`). Termination to
-/// callback was measured at about 8 ms (KEL-132 diagnosis, 60 runs), so this
-/// bounds that documented contract, not shutdown itself. Shutdown is gated on
-/// process liveness instead: three hosted runs exceeded the former 15 s
-/// wall-clock bound while the browser was still shutting down normally.
-const BROWSER_EXIT_GRACE: Duration = Duration::from_secs(5);
+/// (`ICoreWebView2Environment5::add_BrowserProcessExited`), so this bounds
+/// that documented contract, not shutdown itself. Shutdown is gated on
+/// process liveness and bounded by [`BROWSER_SHUTDOWN_HANG_GUARD`] instead:
+/// three hosted runs exceeded the former 15 s wall-clock bound while the
+/// browser was still shutting down normally (KEL-132).
+///
+/// Value: 4x the largest observed healthy termination-to-event latency (the
+/// poll that first sees the handle signaled to the poll that drains the
+/// event), rounded up to a whole second, with a floor of the former 5 s: the
+/// hang guard's rule on a 1 s grid. The former 5 s came from the KEL-132
+/// diagnosis (about 8 ms over 60 idle runs); it expired in 7 of 70
+/// full-core-load fixture runs in <https://github.com/gyldlab/keld/pull/658>
+/// and censored that PR's own load sample at 5 s (KEL-270 finding F55).
+/// Uncensored re-sample 2026-10-14, Windows 11 10.0.26300 (RAMANI, Ryzen 7
+/// 5800H, 16 logical cores), `WebView2` runtime 155.0.4283.45, 84
+/// media-acceptance fixture runs under a diagnostic 120 s grace and a 10 min
+/// fixture watchdog, none cut (source: the measurement table in
+/// <https://github.com/gyldlab/keld/pull/717>):
+/// - idle: host-own 42 runs, 2 armed the grace (the other 40 drained the
+///   event before the handle poll), armed max 0 ms; probe n=41 armed (1
+///   drained before the poll) median 10 ms, p90 19 ms, max 239 ms;
+/// - full-core load (16 busy-loop burners on 16 logical cores): host-own
+///   n=38 armed (4 drained before the handle poll) median 196 ms, p90 5.3 s,
+///   max 21.2 s; probe n=38 armed (4 drained before the poll) median 194 ms,
+///   p90 517 ms, max 587 ms.
+///
+/// 4 x 21.218 s = 84.9 s -> 85 s. The host site rules; the hidden probe
+/// stayed below 0.6 s under the same load (a roughly 36x asymmetry, cause not
+/// established). As with the hang guard, a false expiry fails a healthy host
+/// release typed and retains a healthy leaf as unproven, while a late
+/// detection of a lost event only costs time in a session that is already
+/// broken.
+const BROWSER_EXIT_GRACE: Duration = Duration::from_secs(85);
 
 /// Kill switch on a browser that never exits after `Close`: the shutdown hang
 /// guard.
@@ -238,10 +265,12 @@ const BROWSER_EXIT_GRACE: Duration = Duration::from_secs(5);
 ///   16 logical cores), host-own n=57 max 59.1 s and probe n=46 max 43.9 s,
 ///   every one healthy (its event came).
 ///
-/// The load sample is right-censored: 19 of 70 load runs were cut by the
-/// fixture's own 60 s watchdog, so 59.1 s is a lower bound on that load's
-/// maximum, not its maximum; KEL-270 finding F55 re-samples it uncensored.
-/// 4 x 59.07 s = 236.3 s -> 240 s. The idle and hosted basis alone would give
+/// That first load sample was right-censored: 19 of 70 load runs were cut by
+/// the fixture's own 60 s watchdog. The KEL-270 F55 re-sample (2026-10-14,
+/// runtime 155.0.4283.45, diagnostic 10 min fixture watchdog, 84 runs, none
+/// cut) observed the same load uncensored: host-own n=42 max 49.6 s and
+/// probe n=42 max 57.8 s, both inside the 59.07 s basis, so the value
+/// stands. 4 x 59.07 s = 236.3 s -> 240 s. The idle and hosted basis alone would give
 /// 4 x 16.58 s = 66.3 s -> 75 s; the saturated-load basis rules, because a
 /// false trip quarantines a healthy store while a late true-hang detection
 /// only costs time in a session that is already broken.

@@ -1,15 +1,18 @@
 # Spec: host-owned persistent webview profile identity
 Status: approved
-Linear: KEL-135 · Owner: GYLDLAB · Updated: 2026-10-08
+Linear: KEL-135 · Owner: GYLDLAB · Updated: 2026-10-14
 Approval: Linear comment `75d75f6e-76e9-4fd1-a130-9d57548d0372` · decision SHA-256 `b9f48f14a5d6fefe4cd0f94b1a97b14292cead5ba0202facbd81c6b6a1a44040`
 
 Windows release-barrier clarification, 2026-10-08 (KEL-132 hosted-CI diagnosis; §4
 Platform policy): the `BrowserProcessExited` waits are liveness-gated on the browser
-process handle with a 5 s post-exit grace and a measured 240 s shutdown hang guard that
-fails closed while the browser stays alive, and an unproven scavenge probe retains the
-leaf without failing the current host. No boundary change: it names the barrier the
-approved contract already required and claims no new approval; the fix PR carries the
-owner's review.
+process handle with a measured 85 s post-exit grace and a measured 240 s shutdown hang
+guard that fails closed while the browser stays alive, and an unproven scavenge probe
+retains the leaf without failing the current host. No boundary change: it names the
+barrier the approved contract already required and claims no new approval; the fix PR
+carries the owner's review. Post-exit grace re-measured, 2026-10-14 (KEL-270 finding
+F55): the former 5 s grace was unmeasured and expired under full-core load; 85 s is four
+times the largest healthy termination-to-event latency observed uncensored (21.2 s at the
+host site), the hang guard's rule. No boundary change.
 
 Media acceptance amendment: **adopted**, 2026-09-10; see §7.1. The approved
 status and approval above apply to the original T0 contract, not retrospectively
@@ -429,9 +432,12 @@ releases it. That wait is liveness-gated: the host opens a `SYNCHRONIZE` handle 
 probe's browser process before `Close`; while that handle is unsignaled no correctness
 bound applies, and only a measured shutdown hang guard (240 s: four times the largest
 observed healthy shutdown, a kill switch in the pattern of the navigation deadline;
-the load sample behind it is right-censored by its fixture's 60 s watchdog and is
-re-sampled uncensored under KEL-270 finding F55) bounds the wait; once the handle is signaled, a 5 s post-exit grace bounds the event,
-because WebView2 raises it only after the collection has released the UDF. An abnormal
+the first load sample behind it was right-censored by the fixture's 60 s watchdog, and
+the uncensored KEL-270 F55 re-sample stayed inside its basis) bounds the wait; once the
+handle is signaled, a measured 85 s post-exit grace bounds the event (KEL-270 F55: four
+times the largest healthy termination-to-event latency observed uncensored under
+full-core load, 21.2 s at the host site; the former 5 s was unmeasured and expired under
+that load), because WebView2 raises it only after the collection has released the UDF. An abnormal
 exit of the expected process, a dropped observer, that grace expiry, or the hang guard
 expiring while the browser is still alive proves failure: the hang guard never passes
 the barrier, so recovery and purge fail typed and the store stays quarantined, exactly
@@ -453,7 +459,7 @@ Windows dev-ephemeral UDFs live at a unique owner-private
 marker and exclusive lease; they are never selected by a later app session. Graceful
 exit waits for `BrowserProcessExited` under the same liveness-gated barrier (browser
 process handle opened before `Close`; the 240 s shutdown hang guard while it stays alive;
-the 5 s post-exit grace once it is signaled) before guarded deletion. A hang-guard
+the 85 s post-exit grace once it is signaled) before guarded deletion. A hang-guard
 expiry fails the host's own release typed: the host exits, its host-death Job reaps the
 browser, and the next launch treats the leaf as a predecessor. After host crash, the
 next host performs bounded marker-validated scavenging; a still-busy leaf, or one whose
