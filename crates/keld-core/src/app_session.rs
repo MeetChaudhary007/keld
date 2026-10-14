@@ -4817,28 +4817,7 @@ fn coordinate_window_events(
     commands: &Sender<AppWindowCommand>,
     mut on_ready: impl FnMut(&PrimaryRouterHandle) -> Result<(), HostAppError>,
 ) -> Result<(), HostAppError> {
-    loop {
-        #[cfg(target_os = "macos")]
-        let event = {
-            if router.shutdown.reader_stop.load(Ordering::Acquire) {
-                break;
-            }
-            match events.recv_timeout(APP_LINK_READER_POLL) {
-                Ok(event) => {
-                    if router.shutdown.reader_stop.load(Ordering::Acquire) {
-                        break;
-                    }
-                    event
-                }
-                Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            }
-        };
-        #[cfg(not(target_os = "macos"))]
-        let event = match events.recv() {
-            Ok(event) => event,
-            Err(_) => break,
-        };
+    let mut process_event = |event| {
         let result = match event {
             AppWindowEvent::NavigationReady => {
                 router.signal_ready().and_then(|()| on_ready(router))
@@ -4847,8 +4826,31 @@ fn coordinate_window_events(
         };
         if let Err(error) = result {
             let _ = commands.send(AppWindowCommand::Fatal);
-            return Err(error);
+            Err(error)
+        } else {
+            Ok(())
         }
+    };
+    #[cfg(target_os = "macos")]
+    loop {
+        if router.shutdown.reader_stop.load(Ordering::Acquire) {
+            break;
+        }
+        let event = match events.recv_timeout(APP_LINK_READER_POLL) {
+            Ok(event) => {
+                if router.shutdown.reader_stop.load(Ordering::Acquire) {
+                    break;
+                }
+                event
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        };
+        process_event(event)?;
+    }
+    #[cfg(not(target_os = "macos"))]
+    while let Ok(event) = events.recv() {
+        process_event(event)?;
     }
     Ok(())
 }
