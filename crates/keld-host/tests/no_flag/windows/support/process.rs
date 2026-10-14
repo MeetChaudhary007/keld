@@ -4,11 +4,54 @@ use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
 use std::process::{Child, Command, ExitStatus};
 use std::thread;
 use std::time::{Duration, Instant};
-use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+use windows_sys::Win32::Foundation::{FILETIME, HANDLE, WAIT_OBJECT_0};
 use windows_sys::Win32::System::Threading::{
-    OpenProcess, PROCESS_DUP_HANDLE, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
-    PROCESS_TERMINATE, TerminateProcess, WaitForSingleObject,
+    GetProcessTimes, OpenProcess, PROCESS_DUP_HANDLE, PROCESS_QUERY_LIMITED_INFORMATION,
+    PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, TerminateProcess, WaitForSingleObject,
 };
+
+/// Kernel creation and exit times of one process, in `FILETIME` units (100 ns since
+/// 1601). `exit` is zero while the process is still running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ProcessTimes {
+    pub(crate) creation: u64,
+    pub(crate) exit: u64,
+}
+
+/// Reads the exact kernel process identity times through `process`, which needs at
+/// least `PROCESS_QUERY_LIMITED_INFORMATION` (a `Child` handle or `open_process_for_wait`).
+pub(crate) fn process_times(process: HANDLE) -> ProcessTimes {
+    let empty = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    let (mut creation, mut exit, mut kernel, mut user) = (empty, empty, empty, empty);
+    // SAFETY: `process` is a live handle the test owns with query rights; the four
+    // FILETIME outputs live for this synchronous call, which neither retains nor
+    // closes the handle. Contract:
+    // https://learn.microsoft.com/windows/win32/api/processthreadsapi/nf-processthreadsapi-getprocesstimes
+    let ok = unsafe {
+        GetProcessTimes(
+            process,
+            &raw mut creation,
+            &raw mut exit,
+            &raw mut kernel,
+            &raw mut user,
+        )
+    };
+    assert_ne!(
+        ok,
+        0,
+        "GetProcessTimes on a test-owned process handle: {}",
+        std::io::Error::last_os_error()
+    );
+    let filetime =
+        |value: FILETIME| (u64::from(value.dwHighDateTime) << 32) | u64::from(value.dwLowDateTime);
+    ProcessTimes {
+        creation: filetime(creation),
+        exit: filetime(exit),
+    }
+}
 
 pub(crate) fn open_process_for_census(pid: u32) -> OwnedHandle {
     // SAFETY: numeric PID belongs to a live test-owned process; the returned

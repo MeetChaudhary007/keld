@@ -238,9 +238,10 @@ enum WindowsBootMode {
 
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
 struct GuardSnapshot {
-    // T2 retains the verified policy for the whole app session. T3 prepares
+    // T2 retains the verified policy for the whole host process. T3 prepares
     // the sole native FS broker from the same immutable snapshot before any
-    // child/listener/window resource exists.
+    // child/listener/window resource exists; `prepare_next_session` does the
+    // same for each later application session of the process.
     verified: VerifiedManifest,
     fs: Arc<FsDispatchSession>,
     initial_broker: Mutex<Option<FsBroker>>,
@@ -278,6 +279,34 @@ impl GuardSnapshot {
                 )
             })
     }
+
+    /// Prepares the filesystem state of the next application session from the
+    /// immutable policy, before that session creates any child, listener or
+    /// window (KEL-53 §5 `run_app_direct`): the dispatch session returns to its
+    /// initial shape and a fresh sole broker replaces the one the previous
+    /// session's worker consumed and dropped. Fails closed when the previous
+    /// session never transferred its broker, which means it never ran its router.
+    #[cfg(any(target_os = "linux", windows))]
+    fn prepare_next_session(&self) -> Result<(), HostAppError> {
+        let mut slot = self.initial_broker.lock().map_err(|_| {
+            app_detail(
+                "filesystem session preparation",
+                "broker transfer lock poisoned",
+            )
+        })?;
+        if slot.is_some() {
+            return Err(app_detail(
+                "filesystem session preparation",
+                "the previous session never transferred its broker",
+            ));
+        }
+        self.fs.reset_for_next_session()?;
+        *slot = Some(
+            FsBroker::prepare(&self.verified)
+                .map_err(|source| HostAppError::fs_prepare(&source))?,
+        );
+        Ok(())
+    }
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
@@ -310,18 +339,27 @@ struct FsDispatchSession {
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+impl FsDispatchState {
+    /// The state of a session whose first generation's broker is prepared and
+    /// accepting, with nothing admitted.
+    const fn initial() -> Self {
+        Self {
+            accepting: true,
+            prepared_attempt: Some(1),
+            in_flight: 0,
+            call_outstanding: false,
+            pending_call: None,
+            failed_write_attempt: None,
+        }
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 impl FsDispatchSession {
     fn new(verified: VerifiedManifest) -> Self {
         Self {
             verified,
-            state: Mutex::new(FsDispatchState {
-                accepting: true,
-                prepared_attempt: Some(1),
-                in_flight: 0,
-                call_outstanding: false,
-                pending_call: None,
-                failed_write_attempt: None,
-            }),
+            state: Mutex::new(FsDispatchState::initial()),
             handler_transition: Mutex::new(()),
             drained: Condvar::new(),
             #[cfg(all(test, target_os = "macos"))]
@@ -329,6 +367,25 @@ impl FsDispatchSession {
             #[cfg(all(test, target_os = "macos"))]
             terminal_write_hold: Mutex::new(None),
         }
+    }
+
+    /// Returns the dispatch state to its initial shape for the next application
+    /// session of this process. Refuses while a call is admitted, outstanding or
+    /// pending: the previous session's router must have quiesced and drained.
+    #[cfg(any(target_os = "linux", windows))]
+    fn reset_for_next_session(&self) -> Result<(), HostAppError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| app_detail("filesystem session reset", "in-flight lock poisoned"))?;
+        if state.in_flight != 0 || state.call_outstanding || state.pending_call.is_some() {
+            return Err(app_detail(
+                "filesystem session reset",
+                "the previous session's filesystem calls have not drained",
+            ));
+        }
+        *state = FsDispatchState::initial();
+        Ok(())
     }
 
     #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
@@ -2708,8 +2765,10 @@ impl ValidatedAppIdentity {
     }
 }
 
+/// Selected once per process at boot; every application session of the process
+/// constructs its engine from a copy.
 #[cfg(windows)]
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 enum WindowsProfileMode {
     Persistent(WebProfileSelection),
     EphemeralDev,
@@ -2904,79 +2963,117 @@ fn verified_windows_image(
     Ok((verified, identity))
 }
 
+/// Inputs that outlive every application session of one host process: the boot
+/// selection's paths and renderer, the profile mode selected at boot and the verified
+/// guard snapshot. A session borrows them and owns nothing here.
 #[cfg(any(target_os = "linux", windows))]
-#[allow(clippy::too_many_lines)] // one shared direct-owner state machine keeps Linux/Windows lifecycle transitions identical
-fn run_app_direct(
-    boot: AppBootSelection,
-    guard_snapshot: Option<&GuardSnapshot>,
-) -> Result<(), HostAppError> {
-    let shutdown = SessionShutdownState::new();
-    let AppBootSelection {
-        root,
-        name,
-        entry_path,
-        entry_file,
-        renderer_html,
-        auth_configuration: _auth_configuration,
-        #[cfg(windows)]
-        mode,
-    } = boot;
-    // Held until this session returns, so the installed version tree it runs from
-    // stays pinned through teardown.
+struct DirectSessionInputs<'a> {
+    root: &'a Path,
+    name: &'a str,
+    entry_path: &'a Path,
+    html: &'a str,
     #[cfg(windows)]
-    let (installed_identity, _installed_package) = match mode {
-        WindowsBootMode::DevStage => (None, None),
-        WindowsBootMode::Installed { identity, active } => (Some(identity), Some(active)),
-    };
-    let html = String::from_utf8(renderer_html).map_err(|source| {
-        HostAppError::new(
-            "KELD-CORE-036",
-            "renderer",
-            source.to_string(),
-            "Regenerate the stage with UTF-8 renderer HTML.",
-        )
-    })?;
-    drop(entry_file);
-    #[cfg(windows)]
-    let dev_lease = prepare_windows_dev_lease(&shutdown)?;
-    #[cfg(windows)]
-    let windows_profile_mode =
-        select_windows_profile_mode(installed_identity, dev_lease.is_some())?;
-    #[cfg(target_os = "linux")]
-    let mut dev_lease = DevHostLease::from_environment()?;
-    #[cfg(target_os = "linux")]
-    if let Some(lease) = dev_lease.as_mut()
-        && lease.poll_lost()?
-    {
-        return Ok(());
+    windows_profile_mode: WindowsProfileMode,
+    guard_snapshot: Option<&'a GuardSnapshot>,
+}
+
+/// What the session loop does once an application session has returned.
+#[cfg(any(target_os = "linux", windows))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirectSessionNext {
+    /// Return the session's result from `run_app_direct`: the host exits.
+    Exit,
+    /// Run one more full application session in this process.
+    RunAnother,
+}
+
+/// Decides the loop's post-session action from the facts a session left behind
+/// (KEL-53 §4 "Profile handover", *Rollback and restore*; §5 `run_app_direct`).
+///
+/// Another session follows only a session that returned `Ok` under the application's
+/// lifecycle-Quit cause, and only when a requester asked for one. A fatal, CLI lease
+/// loss or an error always exits. The only requester today is the debug-only
+/// evidence seam, so production runs exactly one session.
+#[cfg(any(target_os = "linux", windows))]
+const fn next_direct_session(
+    ended_ok: bool,
+    cause: u8,
+    another_requested: bool,
+) -> DirectSessionNext {
+    if ended_ok && cause == SESSION_LIFECYCLE_QUIT && another_requested {
+        DirectSessionNext::RunAnother
+    } else {
+        DirectSessionNext::Exit
     }
-    let prestart_lease_result = || {
-        #[cfg(windows)]
-        {
-            take_direct_prestart_lease_result(dev_lease.as_ref())
+}
+
+/// Debug-only S6c evidence trigger, in the shape of `KELD_TEST_WINDOWS_LEASE_CENSUS`:
+/// `KELD_TEST_WINDOWS_SECOND_SESSION=1` asks the session loop for exactly one more
+/// application session after the first ended under the lifecycle-Quit cause (the
+/// KEL-53 §7 "8, 20 (profile handover)" cell h5). Absent from release builds.
+#[cfg(all(debug_assertions, windows))]
+const TEST_WINDOWS_SECOND_SESSION_ENV: &str = "KELD_TEST_WINDOWS_SECOND_SESSION";
+
+/// The remaining extra sessions the seam may request; read once per process.
+#[cfg(all(debug_assertions, windows))]
+#[derive(Debug)]
+struct TestSecondSessionSeam {
+    remaining: u8,
+}
+
+#[cfg(all(debug_assertions, windows))]
+impl TestSecondSessionSeam {
+    fn from_environment(has_dev_lease: bool) -> Result<Self, HostAppError> {
+        let requested = std::env::var_os(TEST_WINDOWS_SECOND_SESSION_ENV).as_deref()
+            == Some(std::ffi::OsStr::new("1"));
+        Self::from_request(requested, has_dev_lease)
+    }
+
+    /// A dev-stage host runs under its CLI lease, whose standard-input monitor belongs
+    /// to the first session only, so the seam refuses a dev lease as the lease-census
+    /// seam refuses the lack of one.
+    fn from_request(requested: bool, has_dev_lease: bool) -> Result<Self, HostAppError> {
+        if requested && has_dev_lease {
+            return Err(app_detail(
+                "Windows session loop",
+                "test second session requested under a dev lease",
+            ));
         }
-        #[cfg(target_os = "linux")]
-        {
-            Ok(())
-        }
-    };
-    #[cfg(target_os = "linux")]
-    let direct_engine = WebKitGtkEngine::new()
-        .map_err(|source| app_detail("Linux GPU safe mode", source.to_string()))?;
-    #[cfg(target_os = "linux")]
-    let config = linux_strict_primary_config(&root, &entry_path)?;
-    #[cfg(windows)]
+        Ok(Self {
+            remaining: u8::from(requested),
+        })
+    }
+
+    /// Consumes one requested extra session, if any remains.
+    fn take_request(&mut self) -> bool {
+        let requested = self.remaining > 0;
+        self.remaining = self.remaining.saturating_sub(1);
+        requested
+    }
+}
+
+/// The Bun primary command of one Windows application session. Test-only variables
+/// never reach the child: the lease-census seam hands over the host lease handle only
+/// under a live dev lease, and the second-session seam is removed from the child.
+#[cfg(windows)]
+fn windows_primary_config(
+    root: &Path,
+    entry_path: &Path,
+    dev_lease: Option<&WindowsDevLeaseMonitor>,
+) -> Result<PrimaryRoleConfig, HostAppError> {
     let config = PrimaryRoleConfig::new("bun")
         .arg("run")
-        .arg(root.join(&entry_path))
-        .current_dir(&root)
+        .arg(root.join(entry_path))
+        .current_dir(root)
         .env_remove(DEV_LEASE_ENV)
         .env_remove(keld_runtime::windows_job::WINDOWS_LAUNCH_GATE_ENV);
-    #[cfg(all(debug_assertions, windows))]
+    #[cfg(debug_assertions)]
+    let config = config.env_remove(TEST_WINDOWS_SECOND_SESSION_ENV);
+    #[cfg(debug_assertions)]
     let config = if std::env::var_os("KELD_TEST_WINDOWS_LEASE_CENSUS").as_deref()
         == Some(std::ffi::OsStr::new("1"))
     {
-        let handle = dev_lease.as_ref().ok_or_else(|| {
+        let handle = dev_lease.ok_or_else(|| {
             app_detail(
                 "Windows dev-host lease census",
                 "test census requested without a live dev lease",
@@ -2991,9 +3088,127 @@ fn run_app_direct(
     } else {
         config
     };
+    #[cfg(not(debug_assertions))]
+    let _ = dev_lease;
+    Ok(config)
+}
+
+/// Runs the host's application sessions: a per-process prelude, then a loop of full
+/// sessions on the main thread (KEL-53 §5 `run_app_direct`). A session ends by the
+/// application's Quit, a fatal or CLI lease loss; `next_direct_session` decides whether
+/// another follows. Today nothing but the debug-only evidence seam requests one.
+#[cfg(any(target_os = "linux", windows))]
+fn run_app_direct(
+    boot: AppBootSelection,
+    guard_snapshot: Option<&GuardSnapshot>,
+) -> Result<(), HostAppError> {
+    let AppBootSelection {
+        root,
+        name,
+        entry_path,
+        entry_file,
+        renderer_html,
+        auth_configuration: _auth_configuration,
+        #[cfg(windows)]
+        mode,
+    } = boot;
+    // Held until the last session returns, so the installed version tree every
+    // session runs from stays pinned through teardown.
+    #[cfg(windows)]
+    let (installed_identity, _installed_package) = match mode {
+        WindowsBootMode::DevStage => (None, None),
+        WindowsBootMode::Installed { identity, active } => (Some(identity), Some(active)),
+    };
+    let html = String::from_utf8(renderer_html).map_err(|source| {
+        HostAppError::new(
+            "KELD-CORE-036",
+            "renderer",
+            source.to_string(),
+            "Regenerate the stage with UTF-8 renderer HTML.",
+        )
+    })?;
+    drop(entry_file);
+    // Per-process state ends below; everything a session owns is created inside
+    // `run_direct_app_session`. The first session takes the CLI dev-lease monitor,
+    // whose standard-input reader lives for the process, so a dev-stage host runs one
+    // session; the `PerUserDirect` handover and restore run without a lease.
+    let shutdown = SessionShutdownState::new();
+    #[cfg(windows)]
+    let dev_lease = prepare_windows_dev_lease(&shutdown)?;
+    #[cfg(windows)]
+    let windows_profile_mode =
+        select_windows_profile_mode(installed_identity, dev_lease.is_some())?;
+    #[cfg(all(debug_assertions, windows))]
+    let mut second_session_seam = TestSecondSessionSeam::from_environment(dev_lease.is_some())?;
+    #[cfg(target_os = "linux")]
+    let mut dev_lease = DevHostLease::from_environment()?;
+    #[cfg(target_os = "linux")]
+    if let Some(lease) = dev_lease.as_mut()
+        && lease.poll_lost()?
+    {
+        return Ok(());
+    }
+    let inputs = DirectSessionInputs {
+        root: &root,
+        name: &name,
+        entry_path: &entry_path,
+        html: &html,
+        #[cfg(windows)]
+        windows_profile_mode,
+        guard_snapshot,
+    };
+    let mut session = (shutdown, dev_lease);
+    loop {
+        let (shutdown, dev_lease) = session;
+        let result = run_direct_app_session(&inputs, &shutdown, dev_lease);
+        #[cfg(all(debug_assertions, windows))]
+        let another_requested = second_session_seam.take_request();
+        #[cfg(not(all(debug_assertions, windows)))]
+        let another_requested = false;
+        match next_direct_session(result.is_ok(), shutdown.cause(), another_requested) {
+            DirectSessionNext::Exit => return result,
+            DirectSessionNext::RunAnother => {
+                // The next session's guard preflight, before any of its resources.
+                if let Some(snapshot) = inputs.guard_snapshot {
+                    snapshot.prepare_next_session()?;
+                }
+                session = (SessionShutdownState::new(), None);
+            }
+        }
+    }
+}
+
+/// One full application session: the Bun primary, the router, the window and its UI
+/// loop, then the ordered teardown. Every session of one process, the first and each
+/// one `run_app_direct` runs after it, is this same body.
+#[cfg(any(target_os = "linux", windows))]
+#[allow(clippy::too_many_lines)] // one shared direct-owner state machine keeps Linux/Windows lifecycle transitions identical
+fn run_direct_app_session(
+    inputs: &DirectSessionInputs<'_>,
+    shutdown: &SessionShutdownState,
+    #[cfg(windows)] dev_lease: Option<WindowsDevLeaseMonitor>,
+    #[cfg(target_os = "linux")] dev_lease: Option<DevHostLease>,
+) -> Result<(), HostAppError> {
+    let prestart_lease_result = || {
+        #[cfg(windows)]
+        {
+            take_direct_prestart_lease_result(dev_lease.as_ref())
+        }
+        #[cfg(target_os = "linux")]
+        {
+            Ok(())
+        }
+    };
+    #[cfg(target_os = "linux")]
+    let direct_engine = WebKitGtkEngine::new()
+        .map_err(|source| app_detail("Linux GPU safe mode", source.to_string()))?;
+    #[cfg(target_os = "linux")]
+    let config = linux_strict_primary_config(inputs.root, inputs.entry_path)?;
+    #[cfg(windows)]
+    let config = windows_primary_config(inputs.root, inputs.entry_path, dev_lease.as_ref())?;
     LISTENER_ATTEMPTS.fetch_add(1, Ordering::AcqRel);
     CHILD_ATTEMPTS.fetch_add(1, Ordering::AcqRel);
-    let supervisor = run_direct_startup_if_session_running(&shutdown, || {
+    let supervisor = run_direct_startup_if_session_running(shutdown, || {
         PrimaryRoleSupervisor::start_with_bound_generations_gated(config)
             .map_err(|source| app_runtime("direct primary startup", &source))
     });
@@ -3004,7 +3219,7 @@ fn run_app_direct(
     let initial = match await_direct_bound_generation(
         &supervisor,
         &recovery,
-        &shutdown,
+        shutdown,
         Instant::now() + APP_LINK_IO_DEADLINE,
     ) {
         Ok(bound) => bound,
@@ -3066,7 +3281,7 @@ fn run_app_direct(
         window_commands_tx.clone(),
         primary_owner.handle(),
         shutdown.clone(),
-        guard_snapshot,
+        inputs.guard_snapshot,
     )?;
     primary_owner.attach_router(router.handle())?;
     let lease_errors = start_direct_dev_lease_tail(dev_lease, router.handle())?;
@@ -3081,13 +3296,13 @@ fn run_app_direct(
         .map_err(|source| app_io("direct window event coordinator", &source))?;
 
     let spec = WebviewSpec {
-        title: name,
-        initial: NavTarget::Html(html),
+        title: inputs.name.to_owned(),
+        initial: NavTarget::Html(inputs.html.to_owned()),
         ..WebviewSpec::default()
     };
-    let engine = run_direct_startup_if_session_running(&shutdown, || {
+    let engine = run_direct_startup_if_session_running(shutdown, || {
         #[cfg(windows)]
-        let mut direct_engine = match windows_profile_mode {
+        let mut direct_engine = match inputs.windows_profile_mode {
             WindowsProfileMode::Persistent(selection) => WebView2Engine::new(selection),
             WindowsProfileMode::EphemeralDev => WebView2Engine::new_dev_ephemeral(),
         }
@@ -3109,7 +3324,9 @@ fn run_app_direct(
         let lease_result = take_direct_lease_error(lease_errors.as_ref());
         let router_result = router.shutdown();
         let owner_result = primary_owner.shutdown();
-        let _retained_digest = guard_snapshot.map(|snapshot| snapshot.verified.verified_sha256());
+        let _retained_digest = inputs
+            .guard_snapshot
+            .map(|snapshot| snapshot.verified.verified_sha256());
         return collapse_app_results([lease_result, event_result, router_result, owner_result]);
     };
     let engine = match engine {
@@ -3123,8 +3340,9 @@ fn run_app_direct(
             let lease_result = take_direct_lease_error(lease_errors.as_ref());
             let router_result = router.shutdown();
             let owner_result = primary_owner.shutdown();
-            let _retained_digest =
-                guard_snapshot.map(|snapshot| snapshot.verified.verified_sha256());
+            let _retained_digest = inputs
+                .guard_snapshot
+                .map(|snapshot| snapshot.verified.verified_sha256());
             return Err(collapse_app_failures(
                 &primary,
                 [lease_result, event_result, router_result, owner_result],
@@ -3140,7 +3358,9 @@ fn run_app_direct(
     let lease_result = take_direct_lease_error(lease_errors.as_ref());
     let router_result = router.shutdown();
     let owner_result = primary_owner.shutdown();
-    let _retained_digest = guard_snapshot.map(|snapshot| snapshot.verified.verified_sha256());
+    let _retained_digest = inputs
+        .guard_snapshot
+        .map(|snapshot| snapshot.verified.verified_sha256());
 
     let owner_result = match owner_result {
         Err(primary) if primary.code == "KELD-CORE-033" => {
@@ -7773,6 +7993,159 @@ mod tests {
                 .expect_err("a noncanonical verified app id has no profile identity");
             assert_eq!(error.code(), "KELD-WV-009");
         }
+    }
+
+    /// The session loop runs another session only after an `Ok` lifecycle-Quit
+    /// session that a requester asked to follow; every other outcome exits.
+    #[test]
+    #[cfg(any(target_os = "linux", windows))]
+    fn direct_session_loop_runs_another_session_only_for_a_requested_lifecycle_quit() {
+        assert_eq!(
+            next_direct_session(true, SESSION_LIFECYCLE_QUIT, true),
+            DirectSessionNext::RunAnother
+        );
+        // Production has no requester: one session, whatever the cause.
+        for cause in [
+            SESSION_RUNNING,
+            SESSION_LIFECYCLE_QUIT,
+            SESSION_CLI_LEASE_LOST,
+        ] {
+            assert_eq!(
+                next_direct_session(true, cause, false),
+                DirectSessionNext::Exit,
+                "cause {cause}"
+            );
+            assert_eq!(
+                next_direct_session(false, cause, false),
+                DirectSessionNext::Exit,
+                "cause {cause}"
+            );
+        }
+        // A requested session never follows a failed session, a CLI lease loss or a
+        // session that returned without claiming a cause.
+        assert_eq!(
+            next_direct_session(false, SESSION_LIFECYCLE_QUIT, true),
+            DirectSessionNext::Exit
+        );
+        assert_eq!(
+            next_direct_session(true, SESSION_CLI_LEASE_LOST, true),
+            DirectSessionNext::Exit
+        );
+        assert_eq!(
+            next_direct_session(true, SESSION_RUNNING, true),
+            DirectSessionNext::Exit
+        );
+    }
+
+    /// Each application session of a process takes the sole broker once; the next
+    /// session gets a fresh one only after the previous transferred its own and
+    /// drained, with the dispatch state back at its initial shape.
+    #[test]
+    #[cfg(any(target_os = "linux", windows))]
+    fn guard_snapshot_prepares_filesystem_state_for_each_session() {
+        let temp = tempfile::tempdir().expect("FS session temp root");
+        let allowed = temp.path().join("allowed");
+        fs::create_dir(&allowed).expect("allowed root");
+        let scope = allowed.display().to_string().replace('\\', "/");
+        let manifest_text = format!(r#"{{"app":{{"fs":{{"read":["{scope}/**"]}}}}}}"#);
+        let manifest_path = temp.path().join(PERMISSIONS_FILE);
+        fs::write(&manifest_path, &manifest_text).expect("write FS manifest");
+        // The loader's integrity refusal names the digest of the exact bytes it read.
+        let Err(ManifestError::IntegrityMismatch { actual: digest, .. }) = load_verified_manifest(
+            File::open(&manifest_path).expect("open FS manifest for its digest"),
+            manifest_path.clone(),
+            [0_u8; 32],
+        ) else {
+            panic!("a zero digest must be refused with the actual digest");
+        };
+        let verified = load_verified_manifest(
+            File::open(&manifest_path).expect("open FS manifest"),
+            manifest_path,
+            digest,
+        )
+        .expect("verify FS manifest");
+        let snapshot = GuardSnapshot::prepare(verified).expect("prepare the first session");
+
+        // An untransferred broker means the previous session never ran its router.
+        let error = snapshot
+            .prepare_next_session()
+            .expect_err("a session that never took its broker cannot be followed");
+        assert!(
+            error.to_string().contains("never transferred its broker"),
+            "{error}"
+        );
+        drop(
+            snapshot
+                .take_initial_broker()
+                .expect("first session broker"),
+        );
+        let error = snapshot
+            .take_initial_broker()
+            .expect_err("the sole broker transfers once per session");
+        assert!(error.to_string().contains("already transferred"), "{error}");
+
+        // Undrained calls refuse the reset and leave no broker behind.
+        snapshot.fs.state.lock().expect("dispatch state").in_flight = 1;
+        let error = snapshot
+            .prepare_next_session()
+            .expect_err("an undrained session cannot be followed");
+        assert!(error.to_string().contains("have not drained"), "{error}");
+        assert!(
+            snapshot.take_initial_broker().is_err(),
+            "a refused preparation leaves no broker"
+        );
+        {
+            let mut state = snapshot.fs.state.lock().expect("dispatch state");
+            state.in_flight = 0;
+            state.prepared_attempt = Some(3);
+            state.accepting = false;
+        }
+
+        snapshot
+            .prepare_next_session()
+            .expect("the drained session is followed by a prepared one");
+        {
+            let state = snapshot.fs.state.lock().expect("dispatch state");
+            assert!(state.accepting, "the next session accepts from its start");
+            assert_eq!(
+                state.prepared_attempt,
+                Some(1),
+                "attempts restart per session"
+            );
+            assert_eq!(state.in_flight, 0);
+        }
+        drop(
+            snapshot
+                .take_initial_broker()
+                .expect("second session broker"),
+        );
+        assert!(
+            snapshot.take_initial_broker().is_err(),
+            "the second session's broker also transfers once"
+        );
+    }
+
+    /// The debug seam grants exactly one extra session, never under a dev lease.
+    #[test]
+    #[cfg(all(debug_assertions, windows))]
+    fn second_session_seam_requests_one_session_without_a_dev_lease() {
+        let mut seam = TestSecondSessionSeam::from_request(true, false)
+            .expect("an installed host may request one extra session");
+        assert!(seam.take_request());
+        assert!(!seam.take_request(), "exactly one extra session");
+        assert!(!seam.take_request());
+
+        let mut absent =
+            TestSecondSessionSeam::from_request(false, false).expect("no request, no error");
+        assert!(!absent.take_request());
+        let mut absent_dev =
+            TestSecondSessionSeam::from_request(false, true).expect("a dev lease alone is fine");
+        assert!(!absent_dev.take_request());
+
+        let error = TestSecondSessionSeam::from_request(true, true)
+            .expect_err("a dev-stage host cannot run a second session");
+        assert_eq!(error.code(), "KELD-CORE-037");
+        assert!(error.to_string().contains("under a dev lease"), "{error}");
     }
 
     #[test]
