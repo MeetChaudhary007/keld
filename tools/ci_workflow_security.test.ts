@@ -36,6 +36,23 @@ test("actual workflow passes parsed security admission", () => {
   expect(() => checkWorkflowSecurity(source)).not.toThrow();
 });
 
+test("source-budget reporting stays advisory, visible and unprivileged", () => {
+  const workflow = fixture();
+  const s = step(workflow, "changes", "Source budget proposals (report only)");
+  const command = String(s.run);
+  const env = s.env as Record<string, unknown>;
+  expect(s["continue-on-error"]).toBeUndefined();
+  expect(s.if).toBeUndefined();
+  expect(command).toContain("tools/source_budget_report.py");
+  expect(command).toContain("--policy candidate");
+  expect(command).toContain("GITHUB_STEP_SUMMARY");
+  expect(command).not.toContain("--enforce");
+  expect(String(env.KELD_BUDGET_BASE_SHA)).toContain("github.event.pull_request.base.sha");
+  expect(String(env.KELD_BUDGET_HEAD_SHA)).toContain("github.event.pull_request.head.sha");
+});
+
+
+
 test("Windows media oracle matches its reviewed full-file digest", () => {
   expect(() => checkWindowsMediaOracle(windowsMediaOracle)).not.toThrow();
   const mutated = Buffer.concat([windowsMediaOracle, Buffer.from("\n# inert override\n")]);

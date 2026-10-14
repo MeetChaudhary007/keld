@@ -90,6 +90,33 @@ jobs:
           KELD_CI_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
           KELD_CI_BEFORE_SHA: ${{ github.event.before || '' }}
         run: tools/ci_changes.sh github
+      # Advisory only; proposals are not enforced and no second checkout is needed.
+      - name: Source budget proposals (report only)
+        env:
+          KELD_BUDGET_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before || '' }}
+          KELD_BUDGET_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          mkdir -p target/source-budget
+          if [[ ! "$KELD_BUDGET_BASE_SHA" =~ ^[0-9a-f]{40,64}$ ]] || ! git cat-file -e "${KELD_BUDGET_BASE_SHA}^{commit}" 2>/dev/null; then
+            echo 'source-budget: comparison base unavailable; proposals not assessed'
+            echo '### Source budgets (advisory)' >> "$GITHUB_STEP_SUMMARY"
+            echo 'Comparison base unavailable; no hard cap is enforced.' >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          if [[ ! "$KELD_BUDGET_HEAD_SHA" =~ ^[0-9a-f]{40,64}$ ]] || ! git cat-file -e "${KELD_BUDGET_HEAD_SHA}^{commit}" 2>/dev/null; then
+            echo 'source-budget: Git head unavailable' >&2
+            exit 1
+          fi
+          python3 -B tools/source_budget_report.py --repo . \
+            --base "$KELD_BUDGET_BASE_SHA" --head "$KELD_BUDGET_HEAD_SHA" \
+            --policy candidate --output target/source-budget/report.json \
+            | tee target/source-budget/brief.json
+          echo '### Source budget simulation (no hard limits active)' >> "$GITHUB_STEP_SUMMARY"
+          echo 'No file is rejected for exceeding proposed caps.' >> "$GITHUB_STEP_SUMMARY"
+          echo '~~~json' >> "$GITHUB_STEP_SUMMARY"
+          cat target/source-budget/brief.json >> "$GITHUB_STEP_SUMMARY"
+          echo '~~~' >> "$GITHUB_STEP_SUMMARY"
 
   fmt:
     name: rustfmt
