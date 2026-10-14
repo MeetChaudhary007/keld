@@ -254,7 +254,8 @@ struct SessionShutdownState {
 }
 
 /// The handover's instants on the host's monotonic clock, each set once: the request,
-/// the UI loop's return, the `LastWindowClosed` write (D runs from it), the
+/// the UI loop's return, the handover's own `LastWindowClosed` write (D runs from it; a
+/// window's earlier close of the last window is not recorded here), the
 /// lifecycle-Quit handler's entry for the `Quit` frame that claims the session (the D
 /// sample) and the forced claim at D.
 #[cfg(any(target_os = "linux", windows))]
@@ -3324,9 +3325,9 @@ impl TestSessionSeam {
 /// and otherwise claims [`SESSION_HANDOVER`] and runs the forced tail on this thread;
 /// when the application's `Quit` won, this thread awaits that tail's end before the
 /// teardown, as it awaited the loop's return before. A `LastWindowClosed` write that
-/// fails ends the session at once under the handover cause (fail closed, no D). The
-/// instants of the loop's return and of the forced claim join the session's
-/// [`HandoverClock`]. `quit_deadline` is D: [`HANDOVER_QUIT_DEADLINE`] in the host; the
+/// fails ends the session at once under the handover cause (fail closed, no D). D runs
+/// from the return of this function's own write alone, which it records in the session's
+/// [`HandoverClock`] beside the instants of the loop's return and of the forced claim. `quit_deadline` is D: [`HANDOVER_QUIT_DEADLINE`] in the host; the
 /// unit cells pass a shorter one.
 #[cfg(any(target_os = "linux", windows))]
 fn complete_profile_handover(
@@ -3337,15 +3338,12 @@ fn complete_profile_handover(
     let clock = &shutdown.handover_clock;
     let _ = clock.ui_returned.set(Instant::now());
     let written = router.signal_last_window_closed();
-    let written_at = clock
-        .last_window_closed_written
-        .get()
-        .copied()
-        .unwrap_or_else(Instant::now);
-    let deadline = if written.is_ok() {
-        written_at + quit_deadline
-    } else {
-        Instant::now()
+    let deadline = match &written {
+        Ok(written_at) => {
+            let _ = clock.last_window_closed_written.set(*written_at);
+            *written_at + quit_deadline
+        }
+        Err(_) => Instant::now(),
     };
     let tail = match shutdown.await_quit_or_claim_handover(deadline) {
         HandoverWait::ClaimedHandover => {
@@ -3357,7 +3355,7 @@ fn complete_profile_handover(
             Ok(())
         }
     };
-    collapse_app_results([written, tail])
+    collapse_app_results([written.map(drop), tail])
 }
 
 #[cfg(all(debug_assertions, windows))]
@@ -4543,7 +4541,7 @@ fn coordinate_window_events(
             AppWindowEvent::NavigationReady => {
                 router.signal_ready().and_then(|()| on_ready(router))
             }
-            AppWindowEvent::LastWindowClosed => router.signal_last_window_closed(),
+            AppWindowEvent::LastWindowClosed => router.signal_last_window_closed().map(drop),
         };
         if let Err(error) = result {
             let _ = commands.send(AppWindowCommand::Fatal);
@@ -5800,18 +5798,16 @@ impl PrimaryRouterHandle {
         Ok(())
     }
 
-    fn signal_last_window_closed(&self) -> Result<(), HostAppError> {
+    /// Writes `LastWindowClosed` to the application and returns the instant the write
+    /// returned. A window's own close ignores that instant; a profile handover counts
+    /// its quit deadline D from the instant of its own write
+    /// (`complete_profile_handover`), so an earlier close of the last window, after
+    /// which the application kept running windowless, never starts D.
+    fn signal_last_window_closed(&self) -> Result<Instant, HostAppError> {
         let _transition = self.shutdown.transition_guard();
         self.last_window_closed.store(true, Ordering::Release);
-        let written = self.write_event_guarded(LifecycleEvent::LastWindowClosed);
-        // The quit deadline D runs from the return of this write.
-        #[cfg(any(target_os = "linux", windows))]
-        let _ = self
-            .shutdown
-            .handover_clock
-            .last_window_closed_written
-            .set(Instant::now());
-        written.map_err(Into::into)
+        self.write_event_guarded(LifecycleEvent::LastWindowClosed)?;
+        Ok(Instant::now())
     }
 
     /// Requests a profile handover (KEL-53 §4 "Profile handover", step 3a): the UI loop
