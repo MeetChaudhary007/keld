@@ -23,7 +23,7 @@ use crate::support::profile_run::{ProfileTestRoot, assert_profile_test_root_feat
 use serde_json::Value;
 use std::io::BufReader;
 use std::net::{TcpListener, TcpStream};
-use std::os::windows::io::AsRawHandle as _;
+use std::os::windows::io::{AsRawHandle as _, OwnedHandle};
 use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -286,8 +286,33 @@ fn run_handover_then_second_session(
         );
     }
 
-    // The loop proceeds: a second full session in the same process, ended by the
-    // controller as h5 ends its sessions.
+    let (bun_2, transitions, evidence, stdout) =
+        second_session_then_exit(cell, seamed, watch, bun_1, &bun_1_handle, &link_1);
+    HandoverRun {
+        host_pid,
+        bun_pids: [bun_1, bun_2],
+        window_census_at_last_window_closed,
+        control_ms_from_last_window_closed_to_link_eof,
+        quit_reply,
+        transitions,
+        evidence,
+        stdout,
+    }
+}
+
+/// The loop proceeds after the handover: a second full session in the same process,
+/// ended by the controller as h5 ends its sessions, then the host's orderly exit and
+/// its evidence (the Bun reap order, the released profile, two engine constructions
+/// and the host's handover line).
+fn second_session_then_exit(
+    cell: &HandoverCell,
+    mut seamed: SeamedHost,
+    watch: WindowWatch,
+    bun_1: u32,
+    bun_1_handle: &OwnedHandle,
+    link_1: &str,
+) -> (u32, Vec<(u64, u64)>, Value, String) {
+    let host_pid = seamed.pid;
     let second =
         ObservedSession::observe(&cell.control, &mut seamed.host, host_pid, cell.root.path());
     seamed.assert_same_live_process();
@@ -296,11 +321,12 @@ fn run_handover_then_second_session(
         "the second session starts a new Bun primary"
     );
     assert_ne!(
-        link_1, second.link,
+        link_1,
+        second.link.as_str(),
         "the second session mints fresh app-link authority"
     );
     assert_eq!(
-        wait_for_process_signal(&bun_1_handle, 0),
+        wait_for_process_signal(bun_1_handle, 0),
         WAIT_OBJECT_0,
         "the first Bun primary is reaped before the second session's generation binds"
     );
@@ -342,16 +368,7 @@ fn run_handover_then_second_session(
         Some(u64::try_from(QUIT_DEADLINE.as_micros()).expect("D fits u64")),
         "the host's quit deadline is D as the spec records it: {evidence}"
     );
-    HandoverRun {
-        host_pid,
-        bun_pids: [bun_1, bun_2],
-        window_census_at_last_window_closed,
-        control_ms_from_last_window_closed_to_link_eof,
-        quit_reply,
-        transitions,
-        evidence,
-        stdout,
-    }
+    (bun_2, transitions, evidence, stdout)
 }
 
 /// h11, cooperative quit: the reference application receives `LastWindowClosed` after

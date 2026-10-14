@@ -2641,17 +2641,6 @@ impl ProfileReleaseWait {
         self
     }
 
-    const fn release_event_withheld(&self) -> bool {
-        #[cfg(feature = "profile-test-hooks")]
-        {
-            self.withhold_release_event
-        }
-        #[cfg(not(feature = "profile-test-hooks"))]
-        {
-            false
-        }
-    }
-
     /// Registers the wake that drives [`Self::poll`] from the tao loop once
     /// the browser process exits; the registration then owns the handle.
     /// Without a handle there is nothing to wait on and the post-exit grace
@@ -2694,10 +2683,14 @@ impl ProfileReleaseWait {
             self.observed.set(true);
             return;
         };
+        #[cfg(feature = "profile-test-hooks")]
+        let withhold_release_event = self.withhold_release_event;
+        #[cfg(not(feature = "profile-test-hooks"))]
+        let withhold_release_event = false;
         // The barrier observable is drained first: a queued event is proof of
         // release whatever the process handle or the grace say.
         match receiver.try_recv() {
-            Ok(Ok(())) if self.release_event_withheld() => {
+            Ok(Ok(())) if withhold_release_event => {
                 // The h9 fault fixture: the event is consumed and lost, and the
                 // exited browser is judged by the grace alone below.
             }
