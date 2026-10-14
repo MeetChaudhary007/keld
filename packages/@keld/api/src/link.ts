@@ -39,6 +39,7 @@ import {
   APP_LINK_IO_DEADLINE_MS,
   ECHO_CHANNEL,
   FS_CHANNEL,
+  AUTH_CHANNEL,
   LIFECYCLE_CHANNEL,
   WorkerLink,
   kipcError,
@@ -147,6 +148,14 @@ export class LifecycleLink {
       return Promise.reject(this.#dead ?? kipcError("KELD-IPC-001", "session is closed"));
     }
     return this.#link.call(FS_CHANNEL, payload, APP_LINK_IO_DEADLINE_MS);
+  }
+
+  /** Package-private auth call with an explicit finite caller reply deadline. */
+  callAuth(payload: Uint8Array, deadlineMs: number): Promise<Uint8Array> {
+    if (this.#closed || this.#quitPromise !== undefined) {
+      return Promise.reject(this.#dead ?? kipcError("KELD-IPC-001", "session is closed"));
+    }
+    return this.#link.call(AUTH_CHANNEL, payload, deadlineMs);
   }
 
   close(): void {

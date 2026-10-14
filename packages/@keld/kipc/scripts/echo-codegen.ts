@@ -14,6 +14,8 @@ const channelTableSourcePath = resolve(repositoryRoot, "crates/keld-ipc/src/chan
 const transportPath = resolve(repositoryRoot, "packages/@keld/kipc/src/transport.ts");
 const fsSourcePath = resolve(repositoryRoot, "crates/keld-native/src/fs.rs");
 const fsGeneratedPath = resolve(repositoryRoot, "packages/@keld/api/src/fs.generated.ts");
+const authSourcePath = resolve(repositoryRoot, "crates/keld-native/src/auth/mod.rs");
+const authGeneratedPath = resolve(repositoryRoot, "packages/@keld/api/src/auth.generated.ts");
 
 type StructName = (typeof STRUCT_NAMES)[number];
 type SupportedRustType = "String" | "u32";
@@ -103,82 +105,95 @@ export function assertEchoArtifactFresh(rustSource: string, artifact: Uint8Array
   }
 }
 
-// Bounded KEL-140 target: native enum declaration and field order own postcard.
-type FsEnumName = "FsRequest" | "FsResponse";
-type FsFieldType = "String" | "Vec<u8>";
-interface FsField { name: string; rustType: FsFieldType }
-interface FsVariant { name: "Read" | "Write"; fields: FsField[] }
+// Native enum declaration grammar is shared; each target admits its own closed schema.
+type NativeEnumName = "FsRequest" | "FsResponse" | "AuthRequest" | "AuthResponse";
+type NativeFieldType = "String" | "Vec<u8>" | "Vec<String>" | "Option<String>" | "Option<Vec<String>>" | "u64";
+interface NativeField { name: string; rustType: NativeFieldType }
+interface NativeVariant { name: string; fields: NativeField[] }
+type NativeSchema = Readonly<Record<string, Readonly<Record<string, NativeFieldType>>>>;
 
-function parseFsEnum(lines: readonly string[], name: FsEnumName): FsVariant[] {
-  const declaration = new RegExp(`^\\s*(?:pub(?:\\([^)]*\\))?\\s+)?enum\\s+${name}\\b`);
+const NATIVE_SCHEMAS: Readonly<Record<NativeEnumName, NativeSchema>> = {
+  FsRequest: { Read: { path: "String" }, Write: { path: "String", bytes: "Vec<u8>" } },
+  FsResponse: { Read: { bytes: "Vec<u8>" }, Write: {} },
+  AuthRequest: {
+    Begin: { provider: "String", scopes: "Option<Vec<String>>", login_hint: "Option<String>" },
+    Token: { account_id: "String", scopes: "Option<Vec<String>>" },
+  },
+  AuthResponse: {
+    Begin: { account_id: "String", granted_scopes: "Vec<String>" },
+    Token: { access_token: "String", expires_at: "u64", token_type: "String" },
+  },
+};
+
+function parseNativeEnum(lines: readonly string[], name: NativeEnumName): NativeVariant[] {
+  const declaration = new RegExp("^\\s*(?:pub(?:\\([^)]*\\))?\\s+)?enum\\s+" + name + "\\b");
   const starts = lines.flatMap((line, index) => declaration.test(line) ? [index] : []);
-  if (starts.length !== 1) fail(`native ${name} requires exactly one public enum declaration`);
+  if (starts.length !== 1) fail("native " + name + " requires exactly one public enum declaration");
   const start = starts[0];
-  if (lines[start] !== `pub enum ${name} {`) fail(`native ${name} must use the rustfmt-normalized named enum form`);
+  if (lines[start] !== "pub enum " + name + " {") fail("native " + name + " must use the rustfmt-normalized named enum form");
   let derives = 0;
   for (let index = start - 1; index >= 0; index -= 1) {
     const line = lines[index];
     if (line.length === 0 || /^\/\/\/(?: |$)/.test(line)) continue;
     if (line.startsWith("#[")) {
-      if (!/^#\[derive\((?:Debug, )?Serialize, Deserialize\)\]$/.test(line)) {
-        fail(`native ${name} has unsupported enum attribute on source line ${index + 1}`);
+      if (!/^#\[derive\((?:(?:Debug|Clone), )?Serialize, Deserialize\)\]$/.test(line)) {
+        fail("native " + name + " has unsupported enum attribute on source line " + (index + 1));
       }
       derives += 1;
       continue;
     }
     if (line === "}" || line.endsWith(";")) break;
-    fail(`native ${name} has unsupported declaration prefix on source line ${index + 1}`);
+    fail("native " + name + " has unsupported declaration prefix on source line " + (index + 1));
   }
-  if (derives !== 1) fail(`native ${name} requires one admitted Serialize/Deserialize derive`);
-  const variants: FsVariant[] = [];
+  if (derives !== 1) fail("native " + name + " requires one admitted Serialize/Deserialize derive");
+  const schema = NATIVE_SCHEMAS[name];
+  const variants: NativeVariant[] = [];
   for (let index = start + 1; index < lines.length; index += 1) {
     const line = lines[index];
     if (line === "}") {
-      if (variants.length !== 2 || !variants.some((variant) => variant.name === "Read") ||
-          !variants.some((variant) => variant.name === "Write")) {
-        fail(`native ${name} must contain exactly Read and Write`);
-      }
+      if (variants.length !== Object.keys(schema).length) fail("native " + name + " variants differ from its closed schema");
       for (const variant of variants) {
-        const expected: Record<string, FsFieldType> = name === "FsRequest"
-          ? variant.name === "Read" ? { path: "String" } : { path: "String", bytes: "Vec<u8>" }
-          : variant.name === "Read" ? { bytes: "Vec<u8>" } : {};
+        const expected = schema[variant.name];
         if (variant.fields.length !== Object.keys(expected).length ||
             variant.fields.some((field) => expected[field.name] !== field.rustType)) {
-          fail(`native ${name}::${variant.name} fields differ from the admitted path/bytes schema`);
+          fail("native " + name + "::" + variant.name + " fields differ from the admitted schema");
         }
       }
       return variants;
     }
     if (line.length === 0 || /^    \/\/\/(?: |$)/.test(line)) continue;
-    const opening = /^    (Read|Write)( \{|,)$/.exec(line);
-    if (!opening) fail(`native ${name} contains unsupported variant syntax on source line ${index + 1}`);
-    const variantName = opening[1] as FsVariant["name"];
-    if (variants.some((variant) => variant.name === variantName)) fail(`native ${name} has duplicate ${variantName}`);
-    const fields: FsField[] = [];
+    const opening = /^    ([A-Z][A-Za-z0-9_]*)( \{|,)$/.exec(line);
+    if (!opening || !Object.hasOwn(schema, opening[1])) {
+      fail("native " + name + " contains unsupported variant syntax on source line " + (index + 1));
+    }
+    const variantName = opening[1];
+    if (variants.some((variant) => variant.name === variantName)) fail("native " + name + " has duplicate " + variantName);
+    const fields: NativeField[] = [];
     if (opening[2] === " {") {
       let closed = false;
       for (index += 1; index < lines.length; index += 1) {
         const fieldLine = lines[index];
         if (fieldLine === "    },") { closed = true; break; }
         if (fieldLine.length === 0 || /^        \/\/\/(?: |$)/.test(fieldLine)) continue;
-        const field = /^        ([A-Za-z_][A-Za-z0-9_]*): (String|Vec<u8>),$/.exec(fieldLine);
-        if (!field) fail(`native ${name}::${variantName} has unsupported field syntax on source line ${index + 1}`);
-        if (fields.some((candidate) => candidate.name === field[1])) fail(`native ${name}::${variantName} has duplicate field ${field[1]}`);
-        fields.push({ name: field[1], rustType: field[2] as FsFieldType });
+        const field = /^        ([A-Za-z_][A-Za-z0-9_]*): (String|Vec<u8>|Vec<String>|Option<String>|Option<Vec<String>>|u64),$/.exec(fieldLine);
+        if (!field) fail("native " + name + "::" + variantName + " has unsupported field syntax on source line " + (index + 1));
+        if (fields.some((candidate) => candidate.name === field[1])) fail("native " + name + "::" + variantName + " has duplicate field " + field[1]);
+        fields.push({ name: field[1], rustType: field[2] as NativeFieldType });
       }
-      if (!closed || fields.length === 0) fail(`native ${name}::${variantName} must have a nonempty named body`);
+      if (!closed || fields.length === 0) fail("native " + name + "::" + variantName + " must have a nonempty named body");
     }
     variants.push({ name: variantName, fields });
   }
-  return fail(`unterminated native ${name}`);
+  return fail("unterminated native " + name);
 }
+
 
 /** Renders the one bounded native FS payload binding; Rust owns all variant/field order. */
 export function renderFsBinding(rustSource: string): string {
   const lines = rustSource.replaceAll("\r\n", "\n").split("\n");
   if (lines.some((line) => /^\s*#!\[/.test(line))) fail("native FS source-level attributes are not admitted");
-  const request = parseFsEnum(lines, "FsRequest");
-  const response = parseFsEnum(lines, "FsResponse");
+  const request = parseNativeEnum(lines, "FsRequest");
+  const response = parseNativeEnum(lines, "FsResponse");
   const output = [
     "// @generated by packages/@keld/kipc/scripts/echo-codegen.ts.",
     "// Source: crates/keld-native/src/fs.rs. Do not edit by hand.",
@@ -241,7 +256,7 @@ export function renderFsBinding(rustSource: string): string {
   response.forEach((variant, index) => {
     output.push(`    case ${index}: {`);
     for (const field of variant.fields) {
-      // Only response byte vectors are admitted by parseFsEnum's current schema.
+      // Only response byte vectors are admitted by parseNativeEnum's current schema.
       output.push(
         `      const [${field.name}Length, afterLength] = decodeVarint(payload, offset);`,
         `      const end = afterLength + ${field.name}Length;`,
@@ -269,6 +284,129 @@ export function assertFsArtifactFresh(rustSource: string, artifact: Uint8Array):
     fail("committed fs.generated.ts is stale; run bun run echo:generate");
   }
 }
+
+const AUTH_RUNTIME = "function appendPart(parts: Uint8Array[], part: Uint8Array, length: number): number {\n  const total = length + part.byteLength;\n  if (total > MAX_FRAME_LEN) throw kipcError(\"KELD-IPC-003\", \"auth payload exceeds MAX_FRAME_LEN\");\n  parts.push(part);\n  return total;\n}\n\nfunction encodeStringVector(value: readonly string[], field: string): Uint8Array {\n  if (!Array.isArray(value)) throw kipcError(\"KELD-IPC-003\", field + \" must be a string array\");\n  const parts: Uint8Array[] = [encodeVarint(value.length)];\n  let length = parts[0].byteLength;\n  for (const item of value) length = appendPart(parts, encodePostcardString(item, field), length);\n  return Buffer.concat(parts, length);\n}\n\nfunction encodeOptionalString(value: string | null, field: string): Uint8Array {\n  if (value === null) return new Uint8Array([0]);\n  const encoded = encodePostcardString(value, field);\n  if (encoded.byteLength + 1 > MAX_FRAME_LEN) throw kipcError(\"KELD-IPC-003\", \"auth payload exceeds MAX_FRAME_LEN\");\n  return Buffer.concat([new Uint8Array([1]), encoded]);\n}\n\nfunction encodeOptionalScopes(value: readonly string[] | null, field: string): Uint8Array {\n  if (value === null) return new Uint8Array([0]);\n  const encoded = encodeStringVector(value, field);\n  if (encoded.byteLength + 1 > MAX_FRAME_LEN) throw kipcError(\"KELD-IPC-003\", \"auth payload exceeds MAX_FRAME_LEN\");\n  return Buffer.concat([new Uint8Array([1]), encoded]);\n}\n\nfunction decodeStringVector(payload: Uint8Array, start: number): [readonly string[], number] {\n  const [length, afterLength] = decodeVarint(payload, start);\n  if (length > payload.byteLength - afterLength) throw kipcError(\"KELD-IPC-003\", \"auth string vector cannot fit payload\");\n  const values: string[] = [];\n  let offset = afterLength;\n  for (let index = 0; index < length; index += 1) {\n    const [value, next] = decodePostcardStringAt(payload, offset);\n    values.push(value);\n    offset = next;\n  }\n  return [values, offset];\n}\n\n";
+
+function authFieldTsType(field: NativeField): string {
+  switch (field.rustType) {
+    case "String": return "string";
+    case "Vec<String>": return "readonly string[]";
+    case "Option<Vec<String>>": return "readonly string[] | null";
+    case "Option<String>": return "string | null";
+    case "u64": return "bigint";
+    default: return fail("unsupported auth field type " + field.rustType);
+  }
+}
+
+function authEncodeField(field: NativeField): string {
+  const fieldName = "AuthRequest." + field.name;
+  switch (field.rustType) {
+    case "String": return "encodePostcardString(value." + field.name + ", " + JSON.stringify(fieldName) + ")";
+    case "Option<Vec<String>>": return "encodeOptionalScopes(value." + field.name + ", " + JSON.stringify(fieldName) + ")";
+    case "Option<String>": return "encodeOptionalString(value." + field.name + ", " + JSON.stringify(fieldName) + ")";
+    default: return fail("unsupported auth request field type " + field.rustType);
+  }
+}
+
+function parseAuthCallerDeadlines(rustSource: string): Readonly<Record<string, number>> {
+  const values: Record<string, number> = {};
+  for (const name of ["AUTH_BEGIN_CALL_DEADLINE_MS", "AUTH_TOKEN_CALL_DEADLINE_MS"]) {
+    const pattern = new RegExp("^pub const " + name + ": u32 = ([0-9](?:_?[0-9])*);$", "gm");
+    const matches = [...rustSource.matchAll(pattern)];
+    if (matches.length !== 1) fail(name + " needs one canonical Native u32 policy constant");
+    const value = Number(matches[0][1].replaceAll("_", ""));
+    if (!Number.isInteger(value) || value <= 0 || value > 0xffff_ffff) fail(name + " must be a positive u32");
+    values[name] = value;
+  }
+  return values;
+}
+
+/** Generate only the approved auth DTOs/codecs and Native-owned caller defaults. */
+export function renderAuthBinding(rustSource: string): string {
+  const lines = rustSource.replaceAll("\r\n", "\n").split("\n");
+  if (lines.some((line) => /^\s*#!\[/.test(line))) fail("native auth source-level attributes are not admitted");
+  const request = parseNativeEnum(lines, "AuthRequest");
+  const response = parseNativeEnum(lines, "AuthResponse");
+  const deadlines = parseAuthCallerDeadlines(rustSource);
+  const output = [
+    "// @generated by packages/@keld/kipc/scripts/echo-codegen.ts.",
+    "// Source: crates/keld-native/src/auth/mod.rs. Do not edit by hand.",
+    "",
+    'import { MAX_FRAME_LEN, decodeVarint, decodeU64Varint, encodeVarint, encodePostcardString, decodePostcardStringAt, kipcError } from "../../kipc/src/transport.ts";',
+    "",
+  ];
+  for (const [name, variants] of [["AuthRequest", request], ["AuthResponse", response]] as const) {
+    output.push("export type " + name + " =");
+    for (const variant of variants) {
+      const fields = variant.fields.map((field) => "; " + field.name + ": " + authFieldTsType(field)).join("");
+      output.push('  | { variant: "' + variant.name + '"' + fields + " }" +
+        (variant === variants[variants.length - 1] ? ";" : ""));
+    }
+    output.push("");
+  }
+  for (const name of Object.keys(deadlines)) output.push("export const " + name + " = " + deadlines[name] + ";");
+  output.push("", AUTH_RUNTIME, "");
+  output.push(
+    "/** Snapshot an auth request in Rust enum/field declaration order. */",
+    "export function encodeAuthRequest(value: AuthRequest): Uint8Array {",
+    '  if (!value || typeof value !== "object") throw kipcError("KELD-IPC-003", "AuthRequest must be an object");',
+    "  let parts: Uint8Array[];",
+    "  switch (value.variant) {",
+  );
+  request.forEach((variant, index) => {
+    output.push('    case "' + variant.name + '": parts = [encodeVarint(' + index + "), " +
+      variant.fields.map(authEncodeField).join(", ") + "]; break;");
+  });
+  output.push(
+    '    default: throw kipcError("KELD-IPC-003", "unknown AuthRequest variant");',
+    "  }",
+    "  let length = 0;",
+    "  for (const part of parts) {",
+    "    length += part.byteLength;",
+    '    if (length > MAX_FRAME_LEN) throw kipcError("KELD-IPC-003", "auth payload exceeds MAX_FRAME_LEN");',
+    "  }",
+    "  return Buffer.concat(parts, length);",
+    "}",
+    "",
+    "/** Decode exact native success bytes, retaining the full u64 expiry domain. */",
+    "export function decodeAuthResponse(payload: Uint8Array): AuthResponse {",
+    '  if (!(payload instanceof Uint8Array) || payload.byteLength > MAX_FRAME_LEN) throw kipcError("KELD-IPC-003", "invalid AuthResponse payload envelope");',
+    "  const [variant, afterVariant] = decodeVarint(payload, 0);",
+    "  let offset = afterVariant;",
+    "  let response: AuthResponse;",
+    "  switch (variant) {",
+  );
+  response.forEach((variant, index) => {
+    output.push("    case " + index + ": {");
+    for (const field of variant.fields) {
+      const decoder = field.rustType === "String" ? "decodePostcardStringAt"
+        : field.rustType === "Vec<String>" ? "decodeStringVector"
+        : field.rustType === "u64" ? "decodeU64Varint"
+        : fail("unsupported auth response field type " + field.rustType);
+      output.push("      const [" + field.name + ", after_" + field.name + "] = " + decoder + "(payload, offset);",
+        "      offset = after_" + field.name + ";");
+    }
+    output.push('      response = { variant: "' + variant.name + '"' +
+      variant.fields.map((field) => ", " + field.name).join("") + " };", "      break;", "    }");
+  });
+  output.push(
+    '    default: throw kipcError("KELD-IPC-003", "unknown AuthResponse variant");',
+    "  }",
+    '  if (offset !== payload.byteLength) throw kipcError("KELD-IPC-003", "trailing bytes after AuthResponse");',
+    "  return response;",
+    "}",
+    "",
+  );
+  return output.join("\n");
+}
+
+/** Require the generated auth artifact to match the Native contract exactly. */
+export function assertAuthArtifactFresh(rustSource: string, artifact: Uint8Array): void {
+  if (!Buffer.from(artifact).equals(Buffer.from(renderAuthBinding(rustSource), "utf8"))) {
+    fail("committed auth.generated.ts is stale; run bun run echo:generate");
+  }
+}
+
 
 // ---------------------------------------------------------------------------
 // Channel-table target (GH-508 spec docs/specs/gh508-kipc-channel-table.md §4.3).
@@ -619,9 +757,11 @@ export function regenerateTransport(rustSource: string, transportSource: string)
 
 function generate(): void {
   const fsGenerated = renderFsBinding(readFileSync(fsSourcePath, "utf8"));
+  const authGenerated = renderAuthBinding(readFileSync(authSourcePath, "utf8"));
   const generated = currentGeneratedBytes();
   for (const path of generatedPaths) writeFileSync(path, generated, "utf8");
   writeFileSync(fsGeneratedPath, fsGenerated, "utf8");
+  writeFileSync(authGeneratedPath, authGenerated, "utf8");
   const regenerated = regenerateTransport(
     readFileSync(channelTableSourcePath, "utf8"),
     readFileSync(transportPath, "utf8"),
@@ -630,6 +770,7 @@ function generate(): void {
 }
 
 function check(): void {
+  assertAuthArtifactFresh(readFileSync(authSourcePath, "utf8"), readFileSync(authGeneratedPath));
   assertFsArtifactFresh(readFileSync(fsSourcePath, "utf8"), readFileSync(fsGeneratedPath));
   const rustSource = readFileSync(rustSourcePath, "utf8");
   for (const path of generatedPaths) {
