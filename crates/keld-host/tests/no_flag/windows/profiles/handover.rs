@@ -199,7 +199,9 @@ fn host_handover_evidence(stdout: &str) -> Value {
 struct HandoverRun {
     host_pid: u32,
     bun_pids: [u32; 2],
-    window_census_at_last_window_closed: u64,
+    /// Taken only while the host waits D (h12); the reference application's session
+    /// ends too fast for an unambiguous census (h11 records the window transitions).
+    window_census_at_last_window_closed: Option<u64>,
     control_ms_from_last_window_closed_to_link_eof: u64,
     quit_reply: bool,
     transitions: Vec<(u64, u64)>,
@@ -233,13 +235,14 @@ fn run_handover_then_second_session(
         "LAST_WINDOW_CLOSED"
     );
     let last_window_closed_at = Instant::now();
-    let (window_census_at_last_window_closed, window_title) = host_main_window_with_title(host_pid);
+    let mut window_census_at_last_window_closed = None;
     if ignore_last_window_closed {
         // The host waits D from here (10 s, write-free), so this census and record
         // read cannot race the next session: no window of the host exists once the
         // application is told, and the loop released the profile before the write.
+        let (census, window_title) = host_main_window_with_title(host_pid);
         assert_eq!(
-            window_census_at_last_window_closed, 0,
+            census, 0,
             "the application is told LastWindowClosed only after the window closed (host main window title: {window_title:?})"
         );
         assert_eq!(
@@ -247,10 +250,13 @@ fn run_handover_then_second_session(
             LifecycleObservation::idle(),
             "the profile is idle before the application is told"
         );
+        window_census_at_last_window_closed = Some(census);
     }
-    // With the reference application the next session follows its Quit within
-    // hundreds of milliseconds, so a census here may already see that session's
-    // window; the ordering is asserted by h12 and recorded here (h8).
+    // With the reference application the Quit reply, the link close and the
+    // application's exit follow within milliseconds, and a reaped peer's reset makes
+    // Windows discard control lines not yet read, so nothing may delay the reads
+    // below; the next session's window can also appear within hundreds of
+    // milliseconds, so the ordering is asserted by h12 and only recorded here (h8).
 
     // 3b / 3c as the application's mode decides.
     let next = read_handover_line(&mut reader, "await the session end");
