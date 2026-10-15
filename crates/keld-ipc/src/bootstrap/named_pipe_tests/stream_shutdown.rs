@@ -1,6 +1,12 @@
 //! Stream write-deadline and peer shutdown scenarios.
 
-use super::*;
+use super::{
+    AppLinkDeadlines, Arc, Duration, Instant, WindowsNamedPipeBootstrapAdmission,
+    WindowsNamedPipeBootstrapListener, client, handshake_client, parse_app_link,
+};
+use std::io::{Read as _, Write as _};
+use std::sync::mpsc;
+use std::thread;
 
 #[test]
 fn overlapped_write_to_non_reading_peer_hits_configured_deadline() {

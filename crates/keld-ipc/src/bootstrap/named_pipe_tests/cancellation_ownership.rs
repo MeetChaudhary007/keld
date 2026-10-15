@@ -1,6 +1,14 @@
 //! Lifecycle cancellation and resource-ownership scenarios.
 
-use super::*;
+use super::{
+    Arc, Command, Duration, Instant, PoisonError, ProcessIdToSessionId, Stdio, TestConsumeGate,
+    TestPeerProcess, WindowsLifecycleRendezvousListener, WindowsNamedPipeBootstrapAdmission,
+    WindowsNamedPipeBootstrapListener, WindowsNamedPipeServer, process_handle_count,
+    test_lifecycle_binding,
+};
+use std::io::Write as _;
+use std::sync::mpsc;
+use std::thread;
 
 /// The lifecycle rendezvous one-shot on a cancelled instance. No production
 /// path cancels this listener's instance; if one did, the refused one-shot

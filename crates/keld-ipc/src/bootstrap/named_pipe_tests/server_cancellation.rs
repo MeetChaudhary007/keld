@@ -1,6 +1,13 @@
 //! One-shot server cancellation and shutdown-race scenarios.
 
-use super::*;
+use super::{
+    AppLinkDeadlines, Arc, Duration, Instant, PoisonError, TestConsumeGate, WaitOutcome,
+    WindowsNamedPipeBootstrapAdmission, WindowsNamedPipeBootstrapListener, WindowsNamedPipeServer,
+    client, handshake_client, parse_app_link,
+};
+use std::io::{self, Read as _, Write as _};
+use std::sync::mpsc;
+use std::thread;
 
 /// A cancelled, not yet consumed server instance refuses I/O issued after
 /// the cancel at once with `ERROR_OPERATION_ABORTED` (995), the code a
