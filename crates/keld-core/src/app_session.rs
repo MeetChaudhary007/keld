@@ -4,7 +4,7 @@
 mod boot_contract;
 mod error;
 pub use self::error::HostAppError;
-#[cfg(test)]
+#[cfg(all(test, any(target_os = "macos", windows)))]
 use self::error::startup_resource_snapshot;
 
 #[cfg(all(test, windows))]
