@@ -91,6 +91,36 @@ class CounterContracts(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertEqual(expected, census.classify(path, "100644", b"line\n")[0])
 
+    def test_owner_local_test_directories_are_not_production(self):
+        # Each path is introduced by an existing stacked architecture PR.
+        test_paths = (
+            "crates/keld-ipc/src/bootstrap/named_pipe_tests/generation_deadline.rs",
+            "crates/keld-ipc/src/bootstrap/named_pipe_tests/stream_shutdown.rs",
+            "crates/keld-ipc/src/bootstrap/named_pipe_tests/server_cancellation.rs",
+            "crates/keld-ipc/src/bootstrap/named_pipe_tests/cancellation_ownership.rs",
+            "crates/keld-ipc/src/link/validated_read_tests/capacity.rs",
+        )
+        for path in test_paths:
+            with self.subTest(path=path):
+                category, _, exclusion, encoding = census.classify(
+                    path, "100644", b"#[test]\nfn contract() {}\n")
+                self.assertEqual(("C", "", "utf-8"),
+                                 (category, exclusion, encoding))
+        # A substring match would accidentally recategorize production.
+        for path in (
+            "crates/keld-ipc/src/bootstrap/named_pipe.rs",
+            "crates/keld-ipc/src/bootstrap/named_pipe_tests_helper.rs",
+            "crates/keld-ipc/src/link/validated_read.rs",
+            "crates/keld-ipc/src/link/validated_read_tests_helper.rs",
+        ):
+            with self.subTest(path=path):
+                self.assertEqual("B", census.classify(
+                    path, "100644", b"fn production() {}\n")[0])
+        # Fixture exclusions still take precedence within test-only modules.
+        self.assertEqual("F", census.classify(
+            "crates/keld-ipc/src/bootstrap/named_pipe_tests/fixtures/input.rs",
+            "100644", b"fixture")[0])
+
     def test_inline_test_ratio_is_explicitly_only_tail_proxy(self):
         body = b"fn production() {}\n#[cfg(test)]\nmod tests { fn t() {} }\n"
         e = [dict(path="crates/abc/src/code.rs", mode="100644", kind="blob", blob_sha="a")]

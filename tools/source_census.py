@@ -147,8 +147,12 @@ def classify(path, mode, data):
         data.decode("utf-8")
     except UnicodeDecodeError:
         return "F", "invalid UTF-8", "non-text for UTF-8 source budget", "non-utf8"
+    # Owner-local Rust test modules also use directories such as named_pipe_tests/.
+    # Match directory components only, so similarly named production files stay B.
     if ("/tests/" in "/" + p or "/test/" in "/" + p
-            or "/fuzz_targets/" in "/" + p or leaf.startswith("test_")
+            or "/fuzz_targets/" in "/" + p
+            or any(part.endswith("_tests") for part in parts[:-1])
+            or leaf.startswith("test_")
             or leaf.endswith(("_test.py", ".test.rs", ".spec.rs", "tests.rs",
                               ".test.ts", ".spec.ts", ".test.tsx", ".spec.tsx",
                               ".test.js", ".spec.js", "_test.sh"))):
