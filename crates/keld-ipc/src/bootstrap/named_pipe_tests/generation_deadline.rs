@@ -1,7 +1,14 @@
 //! Generation deadline lifecycle scenarios for Windows named pipes.
 //! Native observers verify no late authorization or reaccept after expiry.
 
-use super::*;
+use super::{
+    AppLinkDeadlines, Arc, BlockingObserver, BootstrapRejection, Duration, Instant, Mutex,
+    TestConsumeGate, WindowsNamedPipeBootstrapAdmission, WindowsNamedPipeBootstrapListener,
+    WindowsNamedPipeServer, client, handshake_client, parse_app_link,
+};
+use std::io::Write as _;
+use std::sync::mpsc;
+use std::thread;
 
 #[test]
 fn generation_deadline_is_terminal_without_a_client() {
