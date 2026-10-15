@@ -1,7 +1,12 @@
 //! Windows process-object claimant identity and refusal-order tests.
 //! Keeps the native launch, handle, and error oracle together.
 
-use super::*;
+use super::{
+    Command, ERROR_INVALID_HANDLE, ProcessObservation, Stdio, WindowsClaimantRefusal,
+    WindowsLaunchedProcess, WindowsProcessJob, bind_observed_claimant, blocking_stdio,
+    claimant_by_pid, recorded_launch, same_kernel_object, system32,
+};
+use std::io;
 
 #[test]
 fn claimant_binding_accepts_the_exact_launched_process_before_and_after_resume() {
