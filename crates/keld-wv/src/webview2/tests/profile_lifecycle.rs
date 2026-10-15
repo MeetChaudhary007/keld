@@ -1,7 +1,14 @@
 //! Native Windows persistent/ephemeral profile lifecycle, isolation and recovery.
 //! Includes the exclusively owned private `LocalAppData` test-root fixture helper.
 
-use super::*;
+use super::{
+    EphemeralProfile, ExclusiveUdfRelease, PROFILE_LAUNCH_DEADLINE, PROFILE_LEASE,
+    PROFILE_LIFECYCLE, PROFILE_MARKER, ProfileIdentity, ProfileLifecyclePhase,
+    ProfileLifecycleRecord, ProfileProcessIdentity, ProfilePurgePhase, ProfilePurgeRecord,
+    WebProfileSelection, dacl_has_untrusted_access, initialize_com_sta, prepare_windows_profile_at,
+    prove_exclusive_udf_released, purge_persistent_profile_at, scavenge_ephemeral_profiles,
+    try_scavenge_ephemeral_profile, windows_profile_plan,
+};
 
 /// KEL-63: the profile must be per-user, not beside the executable.
 ///
