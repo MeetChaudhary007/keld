@@ -9,8 +9,13 @@ use std::sync::atomic::AtomicU32;
 use std::sync::mpsc;
 use std::thread;
 
-use super::*;
+use super::{
+    AbsoluteDeadline, AppLinkDeadlines, AtomicBool, ChannelId, CorrelationId, Duration,
+    FrameHeader, FrameKind, Instant, Ordering, Read, read_frame_interruptible_with_limits,
+    read_validated_frame_interruptible_until, read_validated_frame_with_stall,
+};
 use crate::receive::ReceivePolicy;
+use std::io::{self, Write as _};
 
 #[cfg(unix)]
 fn connected_pair() -> (
