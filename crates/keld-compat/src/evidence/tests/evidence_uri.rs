@@ -1,6 +1,9 @@
 //! Reject untrusted evidence locations and accept immutable, pinned evidence.
 
-use super::*;
+use super::{
+    AS_OF, DIGEST_A, parse_denominator, parse_evidence, parse_ok, score, valid_denominator_json,
+    valid_evidence_json,
+};
 
 #[test]
 fn rejects_mutable_https_without_content_address() {
