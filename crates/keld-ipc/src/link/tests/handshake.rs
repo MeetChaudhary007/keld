@@ -1,4 +1,8 @@
-use super::*;
+use super::{
+    AppLinkDeadlines, ChannelId, CorrelationId, Duration, FrameKind, IpcError, TEST_TOKEN_BYTES,
+    connected_pair, handshake_client, handshake_server, read_frame, test_token, write_frame,
+};
+use std::thread;
 
 #[test]
 fn handshake_rejects_non_hello_kind() {
