@@ -1,7 +1,10 @@
 //! Window message-pump behavior under browser exit and launch deadlines.
 //! Tests exercise actual Windows message queue and thread CPU accounting.
 
-use super::*;
+use super::{
+    ProfileReleaseWait, ReleaseSite, alive_process_handle, exited_process_handle, release_channel,
+    wait_for_browser_exit, wait_for_launch_with_message_pump_until,
+};
 
 /// The probe's pump driver wakes on the process handle: a signaled handle
 /// with an empty receiver and a zero grace fails at once, attributed to
