@@ -113,8 +113,8 @@ jobs:
               { name: "size/M", max: 399 },
               { name: "size/L", max: 999 },
               { name: "size/XL", max: 1999 },
-              { name: "size/XXL", max: 3999 },
-              { name: "size/XXXL", max: Infinity },
+              { name: "size/2XL", max: 3999 },
+              { name: "size/3XL", max: Infinity },
             ];
             const ALL_SIZE_LABELS = SIZE_TIERS.map((t) => t.name);
 
