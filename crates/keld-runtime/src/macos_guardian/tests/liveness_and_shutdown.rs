@@ -1,0 +1,396 @@
+fn await_stopped_child(pid: u32, deadline: Instant) {
+    loop {
+        let output = Command::new("/bin/ps")
+            .args(["-o", "state=", "-p", &pid.to_string()])
+            .output()
+            .expect("inspect stopped child state");
+        if String::from_utf8(output.stdout)
+            .expect("process state is UTF-8")
+            .trim()
+            .starts_with('T')
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "child never stopped");
+        std::thread::yield_now();
+    }
+}
+
+struct AckSender(mpsc::Sender<[u8; SUPERVISED_QUIT_ACK.len()]>);
+
+impl io::Write for AckSender {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let ack: [u8; SUPERVISED_QUIT_ACK.len()] = bytes.try_into().map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "unexpected acknowledgment size")
+        })?;
+        self.0.send(ack).map_err(io::Error::other)?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn registration_failure_still_reaps_the_group() {
+    let (reader, writer) = liveness_pipe();
+    let pid = Arc::new(Mutex::new(None));
+    let pid_for_registration = Arc::clone(&pid);
+    let error = run_with_registration(
+        long_running_command(),
+        reader,
+        io::sink(),
+        move |child_pid| {
+            drop(writer);
+            *pid_for_registration.lock().expect("pid lock") = Some(child_pid);
+            Err(io::Error::other("registration rejected"))
+        },
+        || Ok(()),
+    )
+    .expect_err("registration failure must fail guardian startup");
+    assert!(
+        error.to_string().contains("registration rejected"),
+        "{error}"
+    );
+    assert_gone(*pid.lock().expect("pid lock"));
+}
+
+#[test]
+fn pre_child_liveness_bytes_fail_and_revoke_prepared_resources() {
+    let (reader, mut writer) = liveness_pipe();
+    std::io::Write::write_all(&mut writer, &[1_u8]).expect("write invalid liveness byte");
+    let spawned = Arc::new(AtomicBool::new(false));
+    let spawned_in_callback = Arc::clone(&spawned);
+    let revoked = Arc::new(AtomicBool::new(false));
+    let revoked_in_callback = Arc::clone(&revoked);
+    let error = run_with_registration(
+        long_running_command(),
+        reader,
+        io::sink(),
+        move |_| {
+            spawned_in_callback.store(true, Ordering::SeqCst);
+            Ok(())
+        },
+        move || {
+            revoked_in_callback.store(true, Ordering::SeqCst);
+            Ok(())
+        },
+    )
+    .expect_err("liveness bytes must fail closed");
+    assert!(
+        error.to_string().contains("carried data instead of EOF"),
+        "{error}"
+    );
+    assert!(!spawned.load(Ordering::SeqCst));
+    assert!(revoked.load(Ordering::SeqCst));
+}
+
+#[test]
+fn post_registration_liveness_bytes_still_revoke_and_reap() {
+    let (reader, mut writer) = liveness_pipe();
+    let pid = Arc::new(Mutex::new(None));
+    let pid_for_registration = Arc::clone(&pid);
+    let revoked = Arc::new(AtomicBool::new(false));
+    let revoked_in_callback = Arc::clone(&revoked);
+    let error = run_with_registration(
+        long_running_command(),
+        reader,
+        io::sink(),
+        move |child_pid| {
+            *pid_for_registration.lock().expect("pid lock") = Some(child_pid);
+            std::io::Write::write_all(&mut writer, &[1_u8])?;
+            Ok(())
+        },
+        move || {
+            revoked_in_callback.store(true, Ordering::SeqCst);
+            Ok(())
+        },
+    )
+    .expect_err("post-registration liveness bytes must fail closed");
+    assert!(
+        error.to_string().contains("carried data instead of EOF"),
+        "{error}"
+    );
+    assert!(
+        revoked.load(Ordering::SeqCst),
+        "registered resources must be revoked on every fatal liveness result"
+    );
+    assert_gone(*pid.lock().expect("pid lock"));
+}
+
+#[test]
+fn liveness_without_a_writer_fails_before_spawn() {
+    let (reader, writer) = liveness_pipe();
+    drop(writer);
+    let spawned = Arc::new(AtomicBool::new(false));
+    let spawned_in_callback = Arc::clone(&spawned);
+    let error = run_with_registration(
+        long_running_command(),
+        reader,
+        io::sink(),
+        move |_| {
+            spawned_in_callback.store(true, Ordering::SeqCst);
+            Ok(())
+        },
+        || Ok(()),
+    )
+    .expect_err("a forged bootstrap without a host writer must fail");
+    assert!(error.to_string().contains("no live writer"), "{error}");
+    assert!(!spawned.load(Ordering::SeqCst));
+}
+
+#[test]
+fn non_pipe_liveness_fails_before_spawn() {
+    let file = tempfile::tempfile().expect("temporary regular file");
+    let spawned = Arc::new(AtomicBool::new(false));
+    let spawned_in_callback = Arc::clone(&spawned);
+    let error = run_with_registration(
+        long_running_command(),
+        file,
+        io::sink(),
+        move |_| {
+            spawned_in_callback.store(true, Ordering::SeqCst);
+            Ok(())
+        },
+        || Ok(()),
+    )
+    .expect_err("a forged regular-file bootstrap must fail");
+    assert!(error.to_string().contains("is not a pipe"), "{error}");
+    assert!(!spawned.load(Ordering::SeqCst));
+}
+
+#[test]
+fn initially_nonblocking_liveness_is_normalized_to_wait_for_eof() {
+    let (reader, writer) = liveness_pipe();
+    let flags = fcntl(&reader, FcntlArg::F_GETFL).expect("read liveness flags");
+    fcntl(
+        &reader,
+        FcntlArg::F_SETFL(OFlag::from_bits_truncate(flags) | OFlag::O_NONBLOCK),
+    )
+    .expect("make liveness reader initially nonblocking");
+    let (spawned_tx, spawned_rx) = mpsc::channel();
+    let (done_tx, done_rx) = mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let result = run_with_registration(
+            long_running_command(),
+            reader,
+            io::sink(),
+            move |_| {
+                spawned_tx.send(()).map_err(io::Error::other)?;
+                Ok(())
+            },
+            || Ok(()),
+        );
+        done_tx.send(result).expect("report guardian result");
+    });
+    spawned_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("guardian child registered");
+    assert!(
+        matches!(done_rx.try_recv(), Err(TryRecvError::Empty)),
+        "guardian must still own the child while a live writer exists"
+    );
+
+    drop(writer);
+    let report = done_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("guardian finishes after EOF")
+        .expect("guardian EOF cleanup succeeds");
+    assert_eq!(report.leader_status().signal(), Some(9));
+    worker.join().expect("guardian worker joins");
+}
+
+#[test]
+fn revocation_failure_still_reaps_the_group() {
+    let (reader, writer) = liveness_pipe();
+    let pid = Arc::new(Mutex::new(None));
+    let pid_for_registration = Arc::clone(&pid);
+    let error = run_with_registration(
+        long_running_command(),
+        reader,
+        io::sink(),
+        move |child_pid| {
+            *pid_for_registration.lock().expect("pid lock") = Some(child_pid);
+            drop(writer);
+            Ok(())
+        },
+        || Err(io::Error::other("revocation rejected")),
+    )
+    .expect_err("revocation failure must block cleanup success");
+    assert!(error.to_string().contains("revocation rejected"), "{error}");
+    assert_gone(*pid.lock().expect("pid lock"));
+}
+
+#[test]
+fn registered_group_fallback_terminates_a_live_leader() {
+    let mut command = long_running_command();
+    command.process_group(0);
+    let mut child = command.spawn().expect("spawn fallback group leader");
+    let pid = child.id();
+    terminate_registered_group(pid).expect("terminate registered group");
+    let status = child.wait().expect("wait fallback group leader");
+    assert_eq!(status.signal(), Some(9));
+}
+
+#[test]
+fn guardian_death_is_typed_and_cannot_leave_the_group() {
+    let mut group_command = long_running_command();
+    group_command.process_group(0);
+    let mut group = group_command.spawn().expect("spawn registered group");
+    let group_pid = group.id();
+
+    let mut guardian_command = Command::new("/usr/bin/tail");
+    guardian_command
+        .args(["-f", "/dev/null"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut guardian = guardian_command.spawn().expect("spawn guardian stand-in");
+    let writer = guardian.stdin.take().expect("guardian liveness writer");
+    let mut owner = HostGuardian::from_registered_parts(guardian, writer, None, group_pid)
+        .expect("register host guardian owner");
+    kill(
+        Pid::from_raw(i32::try_from(owner.guardian_pid()).expect("guardian pid fits i32")),
+        Signal::SIGKILL,
+    )
+    .expect("kill guardian while host remains live");
+
+    let error = owner
+        .wait_fatal()
+        .expect_err("guardian death must be a fatal session event");
+    assert!(matches!(
+        error,
+        RuntimeError::GuardianExited {
+            group_pid: observed,
+            cleanup_error: None,
+            ..
+        } if observed == group_pid
+    ));
+    let status = group.wait().expect("wait fail-safe-killed group");
+    assert_eq!(status.signal(), Some(9));
+    assert_eq!(owner.group_pid(), None);
+}
+
+#[test]
+fn orderly_shutdown_closes_the_same_liveness_writer() {
+    let mut group_command = long_running_command();
+    group_command.process_group(0);
+    let mut group = group_command.spawn().expect("spawn registered group");
+    let group_pid = group.id();
+    let mut guardian_command = Command::new("/bin/sh");
+    guardian_command
+        .args(["-c", "read ignored || exit 0"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut guardian = guardian_command.spawn().expect("spawn guardian stand-in");
+    let writer = guardian.stdin.take().expect("guardian liveness writer");
+    let mut owner = HostGuardian::from_registered_parts(guardian, writer, None, group_pid)
+        .expect("register host guardian owner");
+    let status = owner.shutdown().expect("orderly EOF shutdown");
+    assert!(status.success());
+    assert_eq!(owner.group_pid(), None);
+    let error = owner
+        .shutdown()
+        .expect_err("terminal owner must not reuse its numeric group id");
+    assert!(error.to_string().contains("already terminal"), "{error}");
+    terminate_registered_group(group_pid).expect("remove orderly-shutdown test group");
+    let group_status = group.wait().expect("wait orderly-shutdown test group");
+    assert_eq!(group_status.signal(), Some(9));
+}
+
+#[test]
+fn orderly_shutdown_deadline_kills_guardian_and_registered_group() {
+    let mut group_command = long_running_command();
+    group_command.process_group(0);
+    let mut group = group_command.spawn().expect("spawn timeout group");
+    let group_pid = group.id();
+    let mut guardian_command = long_running_command();
+    guardian_command.stdin(Stdio::piped());
+    let mut guardian = guardian_command.spawn().expect("spawn wedged guardian");
+    let guardian_pid = guardian.id();
+    let writer = guardian.stdin.take().expect("guardian liveness writer");
+    let mut owner = HostGuardian::from_registered_parts(guardian, writer, None, group_pid)
+        .expect("register timeout owner");
+
+    let error = owner
+        .shutdown_until(Instant::now())
+        .expect_err("wedged guardian must hit the shutdown deadline");
+    assert!(error.to_string().contains("shutdown deadline"), "{error}");
+    assert_eq!(owner.group_pid(), None);
+    assert_eq!(
+        kill(
+            Pid::from_raw(i32::try_from(guardian_pid).expect("guardian pid fits i32")),
+            None,
+        ),
+        Err(Errno::ESRCH)
+    );
+    let group_status = group.wait().expect("wait timeout-killed group");
+    assert_eq!(group_status.signal(), Some(9));
+}
+
+#[test]
+fn rejected_host_registration_waits_the_guardian() {
+    let mut guardian_command = Command::new("/bin/sh");
+    guardian_command
+        .args(["-c", "read ignored || exit 0"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut guardian = guardian_command.spawn().expect("spawn guardian stand-in");
+    let guardian_pid = guardian.id();
+    let writer = guardian.stdin.take().expect("guardian liveness writer");
+    let error = HostGuardian::from_registered_parts(guardian, writer, None, 0)
+        .expect_err("zero group must reject registration");
+    assert!(
+        error.to_string().contains("process group is zero"),
+        "{error}"
+    );
+    let guardian_pid = i32::try_from(guardian_pid).expect("guardian pid fits i32");
+    assert_eq!(kill(Pid::from_raw(guardian_pid), None), Err(Errno::ESRCH));
+}
+
+#[test]
+fn unrepresentable_group_is_rejected_and_guardian_is_waited() {
+    let mut guardian_command = Command::new("/bin/sh");
+    guardian_command
+        .args(["-c", "read ignored || exit 0"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut guardian = guardian_command.spawn().expect("spawn guardian stand-in");
+    let guardian_pid = guardian.id();
+    let writer = guardian.stdin.take().expect("guardian liveness writer");
+    let error = HostGuardian::from_registered_parts(guardian, writer, None, u32::MAX)
+        .expect_err("unrepresentable group must reject registration");
+    assert!(error.to_string().contains("exceeds c_int"), "{error}");
+    let guardian_pid = i32::try_from(guardian_pid).expect("guardian pid fits i32");
+    assert_eq!(kill(Pid::from_raw(guardian_pid), None), Err(Errno::ESRCH));
+}
+
+#[test]
+fn inheritable_writer_rejection_waits_the_guardian() {
+    let mut group_command = long_running_command();
+    group_command.process_group(0);
+    let mut group = group_command.spawn().expect("spawn registered group");
+    let group_pid = group.id();
+    let mut guardian_command = Command::new("/bin/sh");
+    guardian_command
+        .args(["-c", "read ignored || exit 0"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut guardian = guardian_command.spawn().expect("spawn guardian stand-in");
+    let guardian_pid = guardian.id();
+    let writer = guardian.stdin.take().expect("guardian liveness writer");
+    fcntl(&writer, FcntlArg::F_SETFD(FdFlag::empty())).expect("make test writer inheritable");
+    let error = HostGuardian::from_registered_parts(guardian, writer, None, group_pid)
+        .expect_err("inheritable writer must reject registration");
+    assert!(error.to_string().contains("require FD_CLOEXEC"), "{error}");
+    let guardian_pid = i32::try_from(guardian_pid).expect("guardian pid fits i32");
+    assert_eq!(kill(Pid::from_raw(guardian_pid), None), Err(Errno::ESRCH));
+    terminate_registered_group(group_pid).expect("remove writer-rejection test group");
+    let group_status = group.wait().expect("wait writer-rejection test group");
+    assert_eq!(group_status.signal(), Some(9));
+}
