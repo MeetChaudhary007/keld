@@ -77,6 +77,22 @@ jobs:
           target/product-status/product-status check .
       - name: Router contract tests
         run: tools/ci_changes_test.sh
+      # Enforce explicit dependencies only for newly introduced Rust test imports.
+      # No legacy-only rejection or privileged pull_request_target execution.
+      - name: Test module import ownership
+        env:
+          KELD_IMPORT_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before || '' }}
+          KELD_IMPORT_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          KELD_IMPORT_EVENT: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          python3 -B tools/test_test_import_guard.py
+          if [[ "$KELD_IMPORT_EVENT" == 'push' && "$KELD_IMPORT_BASE_SHA" =~ ^0+$ ]]; then
+            echo 'test-imports: initial push has no before commit; PR gate remains enforced'
+            exit 0
+          fi
+          python3 -B tools/test_import_guard.py --repo . \
+            --base "$KELD_IMPORT_BASE_SHA" --head "$KELD_IMPORT_HEAD_SHA"
       # The agent playbook router and unsafe-coverage inventory reads crates/*.rs
       # as well as AGENTS and .agents files, so it runs here, where every diff
       # reaches it (#650; it was local-only before).

@@ -53,6 +53,24 @@ test("source-budget reporting stays advisory, visible and unprivileged", () => {
 
 
 
+test("new Rust test imports require explicit names in normal unprivileged CI", () => {
+  const workflow = fixture();
+  const s = step(workflow, "changes", "Test module import ownership");
+  const command = String(s.run);
+  const env = s.env as Record<string, unknown>;
+  expect(s["continue-on-error"]).toBeUndefined();
+  expect(s.if).toBeUndefined();
+  expect(command).toContain("tools/test_test_import_guard.py");
+  expect(command).toContain("tools/test_import_guard.py");
+  expect(command).toContain("--base");
+  expect(command).toContain("--head");
+  expect(String(env.KELD_IMPORT_BASE_SHA)).toContain("github.event.pull_request.base.sha");
+  expect(String(env.KELD_IMPORT_HEAD_SHA)).toContain("github.event.pull_request.head.sha");
+  const missing = fixture();
+  missing.jobs.changes!.steps = missing.jobs.changes!.steps.filter(x => x.name !== s.name);
+  expect(() => step(missing, "changes", "Test module import ownership")).toThrow("missing fixture step");
+});
+
 test("Windows media oracle matches its reviewed full-file digest", () => {
   expect(() => checkWindowsMediaOracle(windowsMediaOracle)).not.toThrow();
   const mutated = Buffer.concat([windowsMediaOracle, Buffer.from("\n# inert override\n")]);
