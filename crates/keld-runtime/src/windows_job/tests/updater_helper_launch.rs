@@ -1,6 +1,14 @@
 //! Windows updater helper launch contract: DLL search, `ShellExecute`, process identity and argument ownership.
 
-use super::*;
+use super::{
+    ERROR_CANCELLED, GetProcessId, HANDLE, OpenProcess, OwnedHandle,
+    PROCESS_QUERY_LIMITED_INFORMATION, ShellVerb, WAIT_OBJECT_0, WaitForSingleObject,
+    WindowsDllSearchError, WindowsElevatedUpdaterHelper, WindowsUpdaterHelperArgument,
+    WindowsUpdaterHelperLaunchError, WindowsUpdaterHelperPath, launch_updater_helper,
+    nul_terminated_wide, shell_execute_outcome,
+};
+use std::io;
+use std::os::windows::io::{AsHandle as _, AsRawHandle as _, FromRawHandle as _};
 
 #[test]
 fn dll_search_refusal_names_its_code_cause_and_exit_guidance() {
