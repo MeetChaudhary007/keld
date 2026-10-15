@@ -7,7 +7,9 @@ use std::sync::mpsc::{self, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use nix::fcntl::OFlag;
 use nix::sys::signal::{Signal, kill};
+use nix::unistd::Pid;
 use nix::unistd::pipe;
 
 use super::{
@@ -17,7 +19,7 @@ use super::{
     GUARDIAN_SHUTDOWN_DEADLINE, GenerationControlPeer, GenerationControlReader,
     GenerationControlRecord, GenerationProvisionFence, GuardedPrimary, GuardedPrimaryLease,
     GuardedPrimaryPreparer, GuardedPrimaryUpdate, GuardianBootstrap, HostGenerationState,
-    HostGuardian, Instant, JoinHandle, OFlag, Pid, PreparedChild, REGISTRATION_ENV, Read, Receiver,
+    HostGuardian, Instant, JoinHandle, PreparedChild, REGISTRATION_ENV, Read, Receiver,
     RecoveryState, RegisteredPrimaryGeneration, RestartPolicy, RevocationCause, RoleEvent,
     RoleGenerationOwner, RoleOwner, RuntimeError, SUPERVISED_GUARDIAN_ARG,
     SUPERVISED_QUIT_ACCEPTED, SUPERVISED_QUIT_ACK, SUPERVISED_QUIT_ACK_DEADLINE, Sender,

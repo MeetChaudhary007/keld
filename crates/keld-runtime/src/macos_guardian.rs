@@ -12,6 +12,19 @@ mod host_liveness;
 mod generation_wire;
 
 mod host_control;
+
+mod process_group;
+use self::process_group::{
+    reject_host_registration, terminate_registered_group, validate_group_leader, validate_group_pid,
+};
+
+mod supervised_ack;
+use self::supervised_ack::{
+    SUPERVISED_ORDERLY_ACK, SUPERVISED_ORDERLY_SHUTDOWN, SUPERVISED_QUIT_ACCEPTED,
+    SUPERVISED_QUIT_ACK, SUPERVISED_QUIT_ACK_DEADLINE, read_supervised_orderly_ack,
+    read_supervised_quit_ack,
+};
+
 #[cfg(test)]
 use self::host_control::interrupted_successor_preparation;
 pub(crate) use self::host_control::is_owned_preparation_interruption;
@@ -44,9 +57,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use nix::errno::Errno;
-use nix::fcntl::{FcntlArg, FdFlag, OFlag, fcntl};
-use nix::sys::signal::{Signal, killpg};
-use nix::unistd::{Pid, getpgid};
+use nix::fcntl::{FcntlArg, FdFlag, fcntl};
 
 use keld_ipc::link::handshake_client;
 use keld_ipc::{
@@ -66,11 +77,6 @@ use crate::{
 const REGISTRATION_ENV: &str = "KELD_INTERNAL_MACOS_GUARDIAN_REGISTRATION";
 const REGISTRATION_MAGIC: [u8; 4] = *b"KGR1";
 const REGISTRATION_LEN: usize = 8;
-const SUPERVISED_QUIT_ACCEPTED: u8 = b'Q';
-const SUPERVISED_QUIT_ACK: [u8; 3] = *b"KQA";
-const SUPERVISED_ORDERLY_SHUTDOWN: u8 = b'S';
-const SUPERVISED_ORDERLY_ACK: [u8; 3] = *b"KSA";
-const SUPERVISED_QUIT_ACK_DEADLINE: Duration = Duration::from_secs(5);
 const GUARDIAN_SHUTDOWN_DEADLINE: Duration = Duration::from_secs(5);
 const GENERATION_CONTROL_POLL: Duration = Duration::from_millis(20);
 
@@ -2317,98 +2323,6 @@ fn fail_before_child(
     collapse_failures(failures)
 }
 
-fn validate_group_pid(group: u32) -> Result<i32, RuntimeError> {
-    if group == 0 {
-        return Err(lifecycle_error(
-            "macOS guardian host registration",
-            io::Error::new(io::ErrorKind::InvalidInput, "process group is zero"),
-        ));
-    }
-    i32::try_from(group).map_err(|_| {
-        lifecycle_error(
-            "macOS guardian host registration",
-            io::Error::new(io::ErrorKind::InvalidInput, "process group exceeds c_int"),
-        )
-    })
-}
-
-fn validate_group_leader(group: u32) -> Result<i32, RuntimeError> {
-    let raw = validate_group_pid(group)?;
-    let observed = getpgid(Some(Pid::from_raw(raw))).map_err(|source| {
-        lifecycle_error(
-            "macOS guardian group-leader validation",
-            nix_io_error(source),
-        )
-    })?;
-    if observed.as_raw() == raw {
-        Ok(raw)
-    } else {
-        Err(lifecycle_error(
-            "macOS guardian group-leader validation",
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("reported pid {group} belongs to process group {observed}"),
-            ),
-        ))
-    }
-}
-
-fn terminate_registered_group(group: u32) -> Result<(), RuntimeError> {
-    let group = validate_group_pid(group)?;
-    match killpg(Pid::from_raw(group), Signal::SIGKILL) {
-        Ok(()) | Err(Errno::ESRCH) => Ok(()),
-        Err(Errno::EPERM) if matches!(getpgid(Some(Pid::from_raw(group))), Err(Errno::ESRCH)) => {
-            // A post-Ready link failure may have already signalled the group
-            // while the direct child was exiting. Darwin can report EPERM for
-            // the now-retired numeric group. Require getpgid to prove the
-            // leader gone; never suppress EPERM while that leader resolves.
-            Ok(())
-        }
-        Err(error) => Err(lifecycle_error(
-            "macOS guardian process-group signal",
-            io::Error::from_raw_os_error(error as i32),
-        )),
-    }
-}
-
-fn reject_host_registration(
-    mut child: Child,
-    liveness_writer: ChildStdin,
-    group_pid: Option<u32>,
-    error: RuntimeError,
-) -> RuntimeError {
-    drop(liveness_writer);
-    let mut failures = vec![error];
-    match child.wait() {
-        Ok(status) if status.success() => {}
-        Ok(status) => {
-            failures.push(lifecycle_error(
-                "macOS guardian rejected-registration wait",
-                io::Error::other(format!(
-                    "guardian exited unsuccessfully during registration cleanup: {status}"
-                )),
-            ));
-            if let Some(group_pid) = group_pid
-                && let Err(error) = terminate_registered_group(group_pid)
-            {
-                failures.push(error);
-            }
-        }
-        Err(source) => {
-            failures.push(lifecycle_error(
-                "macOS guardian rejected-registration wait",
-                source,
-            ));
-            if let Some(group_pid) = group_pid
-                && let Err(error) = terminate_registered_group(group_pid)
-            {
-                failures.push(error);
-            }
-        }
-    }
-    collapse_failures(failures)
-}
-
 fn require_close_on_exec(writer: &impl AsFd) -> Result<(), RuntimeError> {
     let raw = fcntl(writer.as_fd(), FcntlArg::F_GETFD).map_err(|source| {
         lifecycle_error(
@@ -2425,83 +2339,6 @@ fn require_close_on_exec(writer: &impl AsFd) -> Result<(), RuntimeError> {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "host-liveness writer is inheritable; require FD_CLOEXEC",
-            ),
-        ))
-    }
-}
-
-fn read_supervised_quit_ack(reader: &mut ChildStdout) -> Result<(), RuntimeError> {
-    read_supervised_ack(
-        reader,
-        SUPERVISED_QUIT_ACK,
-        "macOS guardian supervised-Quit acknowledgment",
-        "accepted Quit",
-    )
-}
-
-fn read_supervised_orderly_ack(reader: &mut ChildStdout) -> Result<(), RuntimeError> {
-    read_supervised_ack(
-        reader,
-        SUPERVISED_ORDERLY_ACK,
-        "macOS guardian orderly-shutdown acknowledgment",
-        "orderly shutdown",
-    )
-}
-
-fn read_supervised_ack(
-    reader: &mut ChildStdout,
-    expected: [u8; 3],
-    phase: &'static str,
-    action: &'static str,
-) -> Result<(), RuntimeError> {
-    let raw_flags = fcntl(reader.as_fd(), FcntlArg::F_GETFL)
-        .map_err(|source| lifecycle_error(phase, nix_io_error(source)))?;
-    fcntl(
-        reader.as_fd(),
-        FcntlArg::F_SETFL(OFlag::from_bits_truncate(raw_flags) | OFlag::O_NONBLOCK),
-    )
-    .map_err(|source| lifecycle_error(phase, nix_io_error(source)))?;
-    let deadline = Instant::now() + SUPERVISED_QUIT_ACK_DEADLINE;
-    let mut ack = [0_u8; 3];
-    let mut filled = 0;
-    while filled < ack.len() {
-        match reader.read(&mut ack[filled..]) {
-            Ok(0) => {
-                return Err(lifecycle_error(
-                    phase,
-                    io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        format!("guardian exited before acknowledging {action}"),
-                    ),
-                ));
-            }
-            Ok(read) => filled += read,
-            Err(source) if source.kind() == io::ErrorKind::Interrupted => {}
-            Err(source) if source.kind() == io::ErrorKind::WouldBlock => {
-                if Instant::now() >= deadline {
-                    return Err(lifecycle_error(
-                        phase,
-                        io::Error::new(
-                            io::ErrorKind::TimedOut,
-                            format!("guardian did not acknowledge {action} before the deadline"),
-                        ),
-                    ));
-                }
-                std::thread::yield_now();
-            }
-            Err(source) => {
-                return Err(lifecycle_error(phase, source));
-            }
-        }
-    }
-    if ack == expected {
-        Ok(())
-    } else {
-        Err(lifecycle_error(
-            phase,
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("guardian returned an invalid {action} acknowledgment"),
             ),
         ))
     }
