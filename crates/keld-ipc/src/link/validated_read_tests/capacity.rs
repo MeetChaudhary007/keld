@@ -1,4 +1,9 @@
-use super::*;
+use super::super::{
+    Duration, GuardedCallAdmission, read_frame_interruptible_validated_with,
+    read_primary_app_frame_interruptible_with_admission,
+    validate_primary_app_header_with_privileged_calls,
+};
+use super::{AtomicBool, CorrelationId, FrameKind, HEADER_LEN, Instant, IpcError, frame_bytes};
 
 #[test]
 fn capacity_refusal_consumes_complete_frame_and_keeps_next_frame_aligned() {
