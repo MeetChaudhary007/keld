@@ -2,7 +2,7 @@
 
 #[cfg(any(target_os = "macos", target_os = "linux", windows, test))]
 mod boot_contract;
-#[cfg(test)]
+#[cfg(all(test, windows))]
 use self::boot_contract::decode_digest;
 #[cfg(any(target_os = "macos", target_os = "linux", windows, test))]
 use self::boot_contract::{boot_error, parse_boot_bytes, target_error};
