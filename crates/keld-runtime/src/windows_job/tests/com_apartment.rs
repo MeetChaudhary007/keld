@@ -2,7 +2,10 @@
 //!
 //! These are tests of exact thread-local HRESULT behavior, not UI smoke tests.
 
-use super::*;
+use super::{
+    COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx, CoUninitialize, ComApartment,
+    S_FALSE, S_OK, WindowsUpdaterHelperLaunchError,
+};
 
 /// Enters COM's multithreaded apartment directly, as an independent probe of
 /// the thread's COM state, and returns the raw `HRESULT`.
