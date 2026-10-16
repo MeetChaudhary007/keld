@@ -300,6 +300,61 @@ fn orderly_shutdown_closes_the_same_liveness_writer() {
     assert_eq!(group_status.signal(), Some(9));
 }
 
+// Drop must not block forever if an otherwise owned guardian ignores host EOF.
+// The regression has an independent kill switch and always reaps its test group.
+#[test]
+fn dropping_wedged_registered_guardian_enforces_shutdown_deadline() {
+    let mut group_command = long_running_command();
+    group_command.process_group(0);
+    let mut group = group_command.spawn().expect("spawn isolated registered group");
+    let group_pid = group.id();
+
+    let mut guardian_command = long_running_command();
+    guardian_command.stdin(Stdio::piped());
+    let mut guardian = guardian_command.spawn().expect("spawn wedged guardian");
+    let guardian_pid = guardian.id();
+    let writer = guardian.stdin.take().expect("sole liveness writer");
+    let owner = HostGuardian::from_registered_parts(guardian, writer, None, group_pid)
+        .expect("register owned guardian");
+
+    let (done_tx, done_rx) = mpsc::sync_channel(1);
+    let drop_worker = thread::spawn(move || {
+        drop(owner);
+        let _ = done_tx.send(());
+    });
+    let dropped_before_deadline = done_rx
+        .recv_timeout(GUARDIAN_SHUTDOWN_DEADLINE + Duration::from_secs(2))
+        .is_ok();
+    if !dropped_before_deadline {
+        // Red-phase cleanup: unblock the old unbounded wait before assertion.
+        let _ = kill(
+            Pid::from_raw(i32::try_from(guardian_pid).expect("guardian id fits")),
+            Signal::SIGKILL,
+        );
+    }
+    drop_worker.join().expect("owned shutdown worker joins");
+
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let mut group_status = group.try_wait().expect("inspect registered group");
+    while group_status.is_none() && Instant::now() < deadline {
+        thread::yield_now();
+        group_status = group.try_wait().expect("observe registered-group retirement");
+    }
+    let group_reaped_by_drop = group_status.is_some();
+    if !group_reaped_by_drop {
+        terminate_registered_group(group_pid).expect("test fallback group signal");
+        group.wait().expect("test fallback group reap");
+    }
+    assert!(
+        dropped_before_deadline,
+        "Drop blocked beyond the guardian shutdown deadline on an unresponsive child"
+    );
+    assert!(
+        group_reaped_by_drop,
+        "bounded Drop must terminate and reap the still-registered group"
+    );
+}
+
 #[test]
 fn orderly_shutdown_deadline_kills_guardian_and_registered_group() {
     let mut group_command = long_running_command();

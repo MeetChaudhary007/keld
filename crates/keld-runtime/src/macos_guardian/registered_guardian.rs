@@ -275,19 +275,12 @@ impl HostGuardian {
 
 impl Drop for HostGuardian {
     fn drop(&mut self) {
-        if self.liveness_writer.take().is_none() {
+        if self.liveness_writer.is_none() {
             return;
         }
-        match self.child.wait() {
-            Ok(status) if status.success() => {
-                self.group_pid.take();
-            }
-            Ok(_) | Err(_) => {
-                if let Some(group_pid) = self.group_pid.take() {
-                    let _ = terminate_registered_group(group_pid);
-                }
-            }
-        }
+        // Use the same bounded, fail-safe cleanup as explicit shutdown.
+        // An unresponsive guardian must not block its host owner indefinitely.
+        let _ = self.shutdown();
     }
 }
 
