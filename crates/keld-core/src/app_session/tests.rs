@@ -11,14 +11,24 @@ use std::os::unix::fs::{PermissionsExt, symlink};
 use std::process::{Command, Stdio};
 
 use super::{
-    APP_LINK_IO_DEADLINE, ActivePrimaryGeneration, AppLinkDeadlines, AppWindowCommand, Arc,
-    AtomicBool, AtomicU32, BOOT_FILE, BootstrapStream, CorrelationId, Duration, FS_CHANNEL, File,
-    FrameKind, GuardSnapshot, HashMap, HostAppError, Instant, LIFECYCLE_CHANNEL, LifecycleEvent,
-    MAX_BOOT_BYTES, ManifestError, Mutex, Ordering, PERMISSIONS_FILE, PathBuf, PendingFsCall,
+    ActivePrimaryGeneration, AppLinkDeadlines, AppWindowCommand, Arc, AtomicBool, AtomicU32,
+    BOOT_FILE, BootstrapStream, CorrelationId, Duration, FS_CHANNEL, File, FrameKind,
+    GuardSnapshot, HashMap, HostAppError, Instant, LIFECYCLE_CHANNEL, LifecycleEvent,
+    MAX_BOOT_BYTES, ManifestError, Mutex, Ordering, PERMISSIONS_FILE, PendingFsCall,
     PlatformPrimaryOwnerHandle, PrimaryLinkIdentity, PrimaryRouter, PrimaryRouterHandle, Receiver,
     SESSION_CLI_LEASE_LOST, SESSION_LIFECYCLE_QUIT, SESSION_RUNNING, SessionShutdownState,
-    WebProfileSelection, admit_kipc_transport_sidecar, app_detail, io, load_verified_manifest,
-    mpsc, parse_boot_bytes, startup_resource_snapshot, thread, validate_from_root, write_frame,
+    admit_kipc_transport_sidecar, app_detail, io, load_verified_manifest, mpsc, parse_boot_bytes,
+    thread, validate_from_root, write_frame,
+};
+
+#[cfg(any(target_os = "macos", windows))]
+use super::{APP_LINK_IO_DEADLINE, PathBuf, WebProfileSelection, startup_resource_snapshot};
+
+#[cfg(any(target_os = "linux", windows))]
+use super::{
+    DirectSessionNext, HandoverWait, PrimaryGenerationFailure, SESSION_HANDOVER,
+    acknowledge_direct_recovery_arm, is_forced_cause, next_direct_session,
+    restart_failed_bound_generation,
 };
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -32,7 +42,7 @@ use super::{
     finish_link_shutdown, run_fs_worker, run_guarded,
 };
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(target_os = "macos")]
 use super::{DEV_LEASE_DRAIN_READS, FcntlArg, FdFlag, OFlag, fcntl};
 
 #[cfg(target_os = "macos")]
@@ -47,14 +57,12 @@ use super::{
 
 #[cfg(windows)]
 use super::{
-    DirectSessionNext, FsDispatchSession, FsInFlight, GetHandleInformation, HANDLE_FLAG_INHERIT,
-    HandoverClock, HandoverWait, PrimaryGenerationFailure, SESSION_HANDOVER, SetHandleInformation,
-    TestSessionSeam, ValidatedAppIdentity, WINDOWS_SHARING_VIOLATION, WebView2Engine,
-    WindowsBootMode, WindowsDevLeaseMonitor, WindowsProfileMode, acknowledge_direct_recovery_arm,
-    app_ipc, await_windows_quit_peer_close_until, clear_windows_handle_inheritance,
+    FsDispatchSession, FsInFlight, GetHandleInformation, HANDLE_FLAG_INHERIT, HandoverClock,
+    SetHandleInformation, TestSessionSeam, ValidatedAppIdentity, WINDOWS_SHARING_VIOLATION,
+    WebView2Engine, WindowsBootMode, WindowsDevLeaseMonitor, WindowsProfileMode, app_ipc,
+    await_windows_quit_peer_close_until, clear_windows_handle_inheritance,
     complete_profile_handover, current_windows_executable, decode_digest, installed_package_error,
-    is_forced_cause, next_direct_session, publish_windows_lease_result, receive_direct_owner_reply,
-    remove_windows_dev_stage_with, restart_failed_bound_generation,
+    publish_windows_lease_result, receive_direct_owner_reply, remove_windows_dev_stage_with,
     run_direct_startup_if_session_running, select_windows_boot_route_with,
     select_windows_profile_mode, start_direct_dev_lease_tail, target_error,
     validate_installed_current_exe, validate_installed_from_verified, validate_windows_boot_files,
