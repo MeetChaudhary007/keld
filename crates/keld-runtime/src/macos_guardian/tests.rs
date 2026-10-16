@@ -12,18 +12,17 @@ use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 
 use super::{
-    AsFd, CONTROL_CLEAR, CONTROL_CLEARED, CONTROL_PREPARE, CONTROL_PREPARED, CONTROL_REGISTERED,
+    CONTROL_CLEAR, CONTROL_CLEARED, CONTROL_PREPARE, CONTROL_PREPARED, CONTROL_REGISTERED,
     CONTROL_REVOKE, CONTROL_REVOKED, CONTROL_SPAWNED, ChildPreparer, Command, Errno,
     GENERATION_CONTROL_POLL, GUARDIAN_SHUTDOWN_DEADLINE, GenerationControlPeer,
     GenerationControlReader, GenerationControlRecord, GenerationProvisionFence, GuardedPrimary,
     GuardedPrimaryLease, GuardedPrimaryPreparer, GuardedPrimaryUpdate, GuardianBootstrap,
     HostGuardian, Instant, JoinHandle, PreparedChild, REGISTRATION_ENV, Read, Receiver,
     RecoveryState, RegisteredPrimaryGeneration, RestartPolicy, RevocationCause, RoleEvent,
-    RuntimeError, SUPERVISED_GUARDIAN_ARG, SUPERVISED_QUIT_ACCEPTED, SUPERVISED_QUIT_ACK,
-    SUPERVISED_QUIT_ACK_DEADLINE, Sender, SupervisedGuardianPreparer, Supervisor,
-    SupervisorOutcome, await_guarded_primary_liveness, handshake_client,
+    RuntimeError, SUPERVISED_GUARDIAN_ARG, SUPERVISED_QUIT_ACCEPTED, SUPERVISED_QUIT_ACK, Sender,
+    SupervisedGuardianPreparer, Supervisor, SupervisorOutcome, handshake_client,
     interrupted_successor_preparation, io, is_owned_preparation_interruption, lifecycle_error,
-    lock_generation, lock_recovery, nix_io_error, observe_guarded_liveness, parse_app_link,
+    lock_generation, lock_recovery, observe_guarded_liveness, parse_app_link,
     read_generation_control, run, run_generation_host, run_supervised_with_registration,
     run_with_registration, runtime_io_kind, set_liveness_nonblocking, terminate_registered_group,
     thread, validate_liveness_bootstrap, write_generation_control,
@@ -48,7 +47,7 @@ mod worker_outcome;
 
 mod control_acknowledgement;
 
-include!("tests/terminal_liveness.rs");
+mod terminal_liveness;
 
 // Existing approved KEL-143 §7 schedules. This test relay copies exact
 // private records; run_generation_host remains the actual mint/lease owner.
