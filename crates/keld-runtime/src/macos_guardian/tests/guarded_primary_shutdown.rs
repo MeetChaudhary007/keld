@@ -298,3 +298,81 @@ fn poll_fatal_rejects_owned_guardian_zero_even_after_shutdown_attribution() {
             .is_some()
     );
 }
+
+#[test]
+fn shutdown_worker_error_reaps_registered_group_after_zero_guardian_exit() {
+    let mut group = Command::new("/bin/sleep")
+        .arg("30")
+        .process_group(0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("own isolated process group");
+    let group_pid = group.id();
+    let raw_pid = i32::try_from(group_pid).expect("group PID fits c_int");
+    assert_eq!(
+        nix::unistd::getpgid(Some(Pid::from_raw(raw_pid)))
+            .expect("registered group leader exists")
+            .as_raw(),
+        raw_pid,
+        "fixture must not signal the test runner's process group"
+    );
+
+    let mut guardian = Command::new("/bin/cat")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("owned guardian stand-in exits zero after EOF");
+    let writer = guardian.stdin.take().expect("owned liveness writer");
+    let ack = guardian.stdout.take().expect("owned acknowledgment reader");
+    let current_generation = Arc::new(Mutex::new(Some(RegisteredPrimaryGeneration {
+        attempt: 1,
+        group_pid,
+    })));
+    let (_tx, updates_rx) = mpsc::channel();
+    let mut primary = GuardedPrimary {
+        child: guardian,
+        liveness_writer: Some(writer),
+        quit_ack_reader: ack,
+        current_generation: Arc::clone(&current_generation),
+        recovery_decision: Arc::new(Mutex::new(RecoveryState::new())),
+        updates_rx,
+        worker: Some(thread::spawn(|| {
+            Err(lifecycle_error(
+                "test generation worker failure",
+                io::Error::other("injected control-channel failure"),
+            ))
+        })),
+        shutdown_attributed: true,
+    };
+
+    let error = primary.shutdown().expect_err("worker failure stays fatal");
+    let guardian_status = primary
+        .child
+        .try_wait()
+        .expect("owned guardian reaped")
+        .expect("guardian exited");
+    let deadline = Instant::now() + GUARDIAN_SHUTDOWN_DEADLINE;
+    let mut group_status = group.try_wait().expect("inspect owned group");
+    while group_status.is_none() && Instant::now() < deadline {
+        thread::yield_now();
+        group_status = group.try_wait().expect("observe group retirement");
+    }
+    let fail_safe_reaped = group_status.is_some();
+    if !fail_safe_reaped {
+        // Keep even a failing regression from leaving a process behind.
+        terminate_registered_group(group_pid).expect("test-owned group fallback");
+        group.wait().expect("reap test-owned group");
+    }
+    assert!(guardian_status.success(), "test requires zero guardian exit");
+    assert!(
+        fail_safe_reaped,
+        "worker failure left a registered Bun process group alive: {error}"
+    );
+    assert!(
+        lock_generation(&current_generation).is_none(),
+        "worker failure retained stale group authority"
+    );
+}
