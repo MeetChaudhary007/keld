@@ -10,7 +10,6 @@ use std::time::Duration;
 use nix::fcntl::{FcntlArg, FdFlag, OFlag, fcntl};
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
-use nix::unistd::pipe;
 
 use super::{
     AsFd, CONTROL_CLEAR, CONTROL_CLEARED, CONTROL_PREPARE, CONTROL_PREPARED, CONTROL_REGISTERED,
@@ -80,4 +79,5 @@ mod runtime_race_validation {
     include!("tests/runtime_race_validation/ownership_races.rs");
 }
 
-include!("tests/test_support.rs");
+mod test_support;
+use self::test_support::{assert_gone, liveness_pipe, long_running_command};
