@@ -11,6 +11,9 @@ mod guarded_primary;
 pub use self::guarded_primary::{GuardedPrimary, GuardedPrimaryUpdate};
 use self::guarded_primary::{RegisteredPrimaryGeneration, lock_generation, take_generation};
 
+mod error;
+use self::error::{collapse_failures, lifecycle_error, nix_io_error};
+
 mod recovery_state;
 use self::recovery_state::{RecoveryState, lock_recovery};
 
@@ -94,6 +97,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+#[cfg(test)]
 use nix::errno::Errno;
 
 use keld_ipc::link::handshake_client;
@@ -229,28 +233,6 @@ fn fail_before_child(
         ));
     }
     collapse_failures(failures)
-}
-
-fn nix_io_error(source: Errno) -> io::Error {
-    io::Error::from_raw_os_error(source as i32)
-}
-
-fn lifecycle_error(phase: &'static str, source: io::Error) -> RuntimeError {
-    RuntimeError::Lifecycle { phase, source }
-}
-
-fn collapse_failures(mut failures: Vec<RuntimeError>) -> RuntimeError {
-    if failures.len() == 1
-        && let Some(error) = failures.pop()
-    {
-        return error;
-    }
-    let details = failures
-        .into_iter()
-        .map(|error| error.to_string())
-        .collect::<Vec<_>>()
-        .join("; ");
-    lifecycle_error("macOS guardian cleanup", io::Error::other(details))
 }
 
 #[cfg(test)]
