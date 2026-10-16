@@ -109,8 +109,18 @@ fn pre_registration_sigkill_role() {
             thread::park(); // Controller kills this process; no ordinary Drop or EOF injection.
         }
         "guardian" => {
+            // The child owns a live descendant before it can register its group.
+            // A group cleanup that kills only the leader must fail this proof.
+            let marker = socket.with_extension("descendant.pid");
+            let mut command = Command::new("/bin/sh");
+            command
+                .args(["-c", r#"/bin/sleep 60 & echo $! > "$1"; wait"#, "keld-prereg"])
+                .arg(marker)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
             let report = run_with_registration(
-                long_running_command(),
+                command,
                 io::stdin().lock(),
                 SocketPausedGroupRegistration {
                     socket: socket.clone(),
@@ -174,6 +184,7 @@ struct PreRegistrationProcessCleanup {
     host: Option<std::process::Child>,
     guardian_pid: Option<u32>,
     group_pid: Option<u32>,
+    descendant_pid: Option<u32>,
 }
 
 impl Drop for PreRegistrationProcessCleanup {
@@ -189,6 +200,12 @@ impl Drop for PreRegistrationProcessCleanup {
         if let Some(guardian) = self.guardian_pid {
             let _ = kill(
                 Pid::from_raw(i32::try_from(guardian).expect("guardian id fits PID")),
+                Signal::SIGKILL,
+            );
+        }
+        if let Some(descendant) = self.descendant_pid {
+            let _ = kill(
+                Pid::from_raw(i32::try_from(descendant).expect("descendant id fits PID")),
                 Signal::SIGKILL,
             );
         }
@@ -257,6 +274,7 @@ fn pre_registration_real_host_sigkill_reaps_spawned_group() {
         host: Some(host),
         guardian_pid: None,
         group_pid: None,
+        descendant_pid: None,
     };
 
     let (mut pending_registration, paused) =
@@ -268,7 +286,28 @@ fn pre_registration_real_host_sigkill_reaps_spawned_group() {
     assert!(fields.next().is_none(), "unexpected event suffix: {paused}");
     cleanup.group_pid = Some(group_pid);
     cleanup.guardian_pid = Some(guardian_pid);
+    let marker = socket.with_extension("descendant.pid");
+    let descendant_deadline = Instant::now() + Duration::from_secs(10);
+    let descendant_pid = loop {
+        if let Ok(contents) = std::fs::read_to_string(&marker)
+            && let Ok(pid) = contents.trim().parse::<u32>()
+        {
+            break pid;
+        }
+        assert!(
+            Instant::now() < descendant_deadline,
+            "descendant must start before host dies"
+        );
+        thread::sleep(Duration::from_millis(2));
+    };
+    cleanup.descendant_pid = Some(descendant_pid);
     let group = Pid::from_raw(i32::try_from(group_pid).expect("group id fits PID"));
+    let descendant = Pid::from_raw(i32::try_from(descendant_pid).expect("descendant id fits PID"));
+    assert_eq!(
+        nix::unistd::getpgid(Some(descendant)).expect("live descendant has a group"),
+        group,
+        "descendant must be enrolled in the isolated group before host death"
+    );
     assert_eq!(
         nix::unistd::getpgid(Some(group)).expect("live isolated group leader"),
         group,
@@ -294,6 +333,15 @@ fn pre_registration_real_host_sigkill_reaps_spawned_group() {
         receive_pre_registration_event(&listener, Instant::now() + Duration::from_secs(10));
     assert_eq!(finished, format!("REAPED {group_pid}"));
     assert_gone(Some(group_pid));
+    let disappearance_deadline = Instant::now() + Duration::from_secs(5);
+    while kill(descendant, None).is_ok() {
+        assert!(
+            Instant::now() < disappearance_deadline,
+            "pre-registration descendant survived group cleanup"
+        );
+        thread::sleep(Duration::from_millis(2));
+    }
     cleanup.group_pid = None;
     cleanup.guardian_pid = None;
+    cleanup.descendant_pid = None;
 }
