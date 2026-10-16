@@ -3,8 +3,7 @@ use super::{
     Child, ChildStdin, ChildStdout, ExitStatus, GUARDIAN_SHUTDOWN_DEADLINE, GuardianReport,
     Instant, RuntimeError, SUPERVISED_QUIT_ACCEPTED, Write, collapse_failures, io, lifecycle_error,
     read_supervised_quit_ack, reject_host_registration, require_close_on_exec,
-    set_liveness_nonblocking, terminate_registered_group, unexpected_guardian_exit,
-    validate_group_leader,
+    set_liveness_nonblocking, terminate_registered_group, validate_group_leader,
 };
 
 /// Host-owned handle for one registered private guardian.
@@ -303,5 +302,16 @@ impl GuardianReport {
     #[must_use]
     pub const fn leader_status(&self) -> ExitStatus {
         self.leader_status
+    }
+}
+
+fn unexpected_guardian_exit(group_pid: u32, status: ExitStatus) -> RuntimeError {
+    let cleanup_error = terminate_registered_group(group_pid)
+        .err()
+        .map(|error| io::Error::other(error.to_string()));
+    RuntimeError::GuardianExited {
+        group_pid,
+        exit_code: status.code(),
+        cleanup_error,
     }
 }

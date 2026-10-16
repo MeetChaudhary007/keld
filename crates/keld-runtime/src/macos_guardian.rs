@@ -319,17 +319,6 @@ fn fail_before_child(
     collapse_failures(failures)
 }
 
-fn unexpected_guardian_exit(group_pid: u32, status: ExitStatus) -> RuntimeError {
-    let cleanup_error = terminate_registered_group(group_pid)
-        .err()
-        .map(|error| io::Error::other(error.to_string()));
-    RuntimeError::GuardianExited {
-        group_pid,
-        exit_code: status.code(),
-        cleanup_error,
-    }
-}
-
 fn nix_io_error(source: Errno) -> io::Error {
     io::Error::from_raw_os_error(source as i32)
 }
