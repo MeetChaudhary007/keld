@@ -48,12 +48,13 @@ use super::{DEV_LEASE_DRAIN_READS, FcntlArg, FdFlag, OFlag, fcntl};
 
 #[cfg(target_os = "macos")]
 use super::{
-    FsResponse, FsWorkerTestGate, GuardedFsTestSetup, GuardianOwnerCommand, GuardianOwnerHandle,
-    MacValidatedAppIdentity, PrimaryEchoCall, PrimaryEchoReply, QuitDrainEnd,
-    configure_dev_lease_fd, finish_guarded_session, join_renderer_dispatch, macos_identity_error,
-    poll_dev_lease_reader, prepare_fs_work,
-    read_primary_app_frame_interruptible_with_privileged_call, select_macos_profile_mode_with,
-    start_renderer_dispatch,
+    FsDispatchSession, FsRecoveryAttempt, FsResponse, FsWorkerTestGate,
+    GUARDIAN_OWNER_REPLY_DEADLINE, GuardedFsTestSetup, GuardianOwner, GuardianOwnerCommand,
+    GuardianOwnerHandle, MacValidatedAppIdentity, PrimaryEchoCall, PrimaryEchoReply, QuitDrainEnd,
+    RecoveryArm, apply_guardian_recovery_arm, configure_dev_lease_fd, finish_guarded_session,
+    join_renderer_dispatch, macos_identity_error, poll_dev_lease_reader, prepare_fs_work,
+    read_primary_app_frame_interruptible_with_privileged_call, read_primary_frames,
+    select_macos_profile_mode_with, start_renderer_dispatch,
 };
 
 #[cfg(windows)]
