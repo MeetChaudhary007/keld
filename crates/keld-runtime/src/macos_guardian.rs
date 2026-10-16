@@ -42,6 +42,7 @@ mod bootstrap;
 pub use self::bootstrap::GuardianBootstrap;
 
 mod supervision_runner;
+pub use self::supervision_runner::run_guarded_primary;
 use self::supervision_runner::{
     connect_guardian_registration, run_supervised_with_registration, run_with_registration,
     write_group_registration,
@@ -214,95 +215,6 @@ where
         revoke_registered_resources,
     )
     .map(|(_, _, output)| output)
-}
-
-/// Runs a persistent macOS guardian whose single [`Supervisor`] requests a
-/// fresh host-owned primary generation before every Bun spawn.
-///
-/// The authenticated guardian-registration stream becomes a bounded private
-/// generation-control channel. The host remains the endpoint/token/stream
-/// owner; the guardian remains the only Bun child, process-group, restart and
-/// reap owner. Public kipc frame bytes are unchanged.
-///
-/// # Errors
-///
-/// Returns [`RuntimeError`] when either private bootstrap is invalid, the host
-/// rejects a generation transition, the supervisor reaches a terminal
-/// failure, or an unrequested status-zero termination stops supervision.
-pub fn run_guarded_primary<R, C, A>(
-    mut liveness: R,
-    command_factory: C,
-    mut quit_ack: A,
-) -> Result<CapturedOutput, RuntimeError>
-where
-    R: Read + AsFd,
-    C: FnMut(&str) -> Result<Command, RuntimeError> + Send + 'static,
-    A: Write,
-{
-    let control = connect_guardian_registration()?;
-    control
-        .set_read_timeout(Some(GENERATION_CONTROL_POLL))
-        .map_err(|source| lifecycle_error("macOS guardian generation control deadline", source))?;
-    control
-        .set_write_timeout(Some(GENERATION_CONTROL_POLL))
-        .map_err(|source| lifecycle_error("macOS guardian generation control deadline", source))?;
-    validate_liveness_bootstrap(&mut liveness)?;
-    let host_unavailable = Arc::new(AtomicBool::new(false));
-    let preparation_cancelled = Arc::new(AtomicBool::new(false));
-    let supervisor = Supervisor::start_prepared(
-        RestartPolicy::default(),
-        GuardedPrimaryPreparer {
-            command_factory,
-            control: Arc::new(Mutex::new(GenerationControlPeer {
-                stream: control,
-                reader: GenerationControlReader::new(),
-            })),
-            host_unavailable: Arc::clone(&host_unavailable),
-            preparation_cancelled: Arc::clone(&preparation_cancelled),
-        },
-    )?;
-
-    set_liveness_nonblocking(&liveness, true)?;
-    let (liveness_result, quit_accepted, host_dead) = await_guarded_primary_liveness(
-        &mut liveness,
-        &supervisor,
-        &mut quit_ack,
-        &host_unavailable,
-        &preparation_cancelled,
-    );
-
-    let outcome = supervisor.wait_for_outcome();
-    let crash_ledger = supervisor.crash_ledger();
-    let output = supervisor.output();
-    let mut failures = Vec::new();
-    if let Err(error) = liveness_result {
-        failures.push(error);
-    }
-    match outcome {
-        SupervisorOutcome::CrashLoop(error) | SupervisorOutcome::Failed(error) => {
-            failures.push(error);
-        }
-        SupervisorOutcome::Stopped if !quit_accepted && !host_dead => {
-            if let Some(termination) = crash_ledger.last_self_termination {
-                failures.push(RuntimeError::ChildCrashed {
-                    pid: termination.pid,
-                    exit_code: termination.exit_code,
-                    stderr_tail: output.stderr_tail(2_000),
-                });
-            } else {
-                failures.push(lifecycle_error(
-                    "macOS guardian generation supervisor stop",
-                    io::Error::other("supervisor stopped without owned shutdown attribution"),
-                ));
-            }
-        }
-        SupervisorOutcome::Stopped => {}
-    }
-    if failures.is_empty() {
-        Ok(output)
-    } else {
-        Err(collapse_failures(failures))
-    }
 }
 
 fn fail_before_child(
