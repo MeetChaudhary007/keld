@@ -80,3 +80,220 @@ fn host_eof_before_group_registration_reaps_spawned_child() {
     assert!(revoked.load(Ordering::SeqCst), "registered resources revoked");
     assert_gone(Some(pid));
 }
+
+// Unlike the in-process pipe-close test, this proof actually SIGKILLs the
+// process holding the only liveness writer. A separate guardian process is
+// frozen in its registration writer, before any group record reaches a host.
+const RACE_ROLE_ENV: &str = "KELD_TEST_GUARDIAN_PRE_REG_ROLE";
+const RACE_SOCKET_ENV: &str = "KELD_TEST_GUARDIAN_PRE_REG_SOCKET";
+const RACE_ROLE_TEST: &str = "macos_guardian::tests::pre_registration_sigkill_role";
+
+// The host role is deliberately SIGKILLed before it can wait on its spawned
+// Guardian. The real Guardian is a separate process and remains responsible
+// for reaping its own isolated Bun group after host death.
+#[allow(clippy::zombie_processes)]
+#[test]
+fn pre_registration_sigkill_role() {
+    let Some(role) = std::env::var_os(RACE_ROLE_ENV) else {
+        return;
+    };
+    let socket = std::path::PathBuf::from(
+        std::env::var_os(RACE_SOCKET_ENV).expect("pre-registration control socket"),
+    );
+    match role.to_str().expect("UTF-8 pre-registration role") {
+        "host" => {
+            let mut command = pre_registration_role_command("guardian", &socket);
+            command.stdin(Stdio::piped());
+            let mut guardian = command.spawn().expect("spawn independent Guardian");
+            let _only_host_writer = guardian.stdin.take().expect("host owns liveness writer");
+            thread::park(); // Controller kills this process; no ordinary Drop or EOF injection.
+        }
+        "guardian" => {
+            let report = run_with_registration(
+                long_running_command(),
+                io::stdin().lock(),
+                SocketPausedGroupRegistration {
+                    socket: socket.clone(),
+                },
+                |_| Ok(()),
+                || Ok(()),
+            )
+            .expect("Guardian reaps group after real host SIGKILL before registration");
+            assert_eq!(report.leader_status().signal(), Some(9));
+            let mut stream = std::os::unix::net::UnixStream::connect(socket)
+                .expect("report independent Guardian completion");
+            writeln!(stream, "REAPED {}", report.leader_pid())
+                .expect("publish Guardian cleanup after group wait");
+        }
+        _ => panic!("unknown pre-registration process role"),
+    }
+}
+
+fn pre_registration_role_command(role: &str, socket: &std::path::Path) -> Command {
+    let mut command = Command::new(std::env::current_exe().expect("current test executable"));
+    command
+        .args(["--exact", RACE_ROLE_TEST, "--nocapture"])
+        .env(RACE_ROLE_ENV, role)
+        .env(RACE_SOCKET_ENV, socket)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit());
+    command
+}
+
+struct SocketPausedGroupRegistration {
+    socket: std::path::PathBuf,
+}
+
+impl io::Write for SocketPausedGroupRegistration {
+    fn write(&mut self, record: &[u8]) -> io::Result<usize> {
+        if record.len() != super::REGISTRATION_LEN || record[..4] != super::REGISTRATION_MAGIC {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unexpected pre-registration process record",
+            ));
+        }
+        let pid = u32::from_be_bytes(record[4..].try_into().map_err(io::Error::other)?);
+        let mut stream = std::os::unix::net::UnixStream::connect(&self.socket)?;
+        writeln!(stream, "PAUSED {pid} {}", std::process::id())?;
+        stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+        let mut resume = [0_u8; 1];
+        stream.read_exact(&mut resume)?;
+        if resume != *b"R" {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "wrong release"));
+        }
+        Ok(record.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+struct PreRegistrationProcessCleanup {
+    host: Option<std::process::Child>,
+    guardian_pid: Option<u32>,
+    group_pid: Option<u32>,
+}
+
+impl Drop for PreRegistrationProcessCleanup {
+    fn drop(&mut self) {
+        // The abnormal path must not strand a live group or guardian even if
+        // the test fails while the registration writer is deliberately gated.
+        if let Some(group) = self.group_pid {
+            let _ = nix::sys::signal::killpg(
+                Pid::from_raw(i32::try_from(group).expect("group id fits PID")),
+                Signal::SIGKILL,
+            );
+        }
+        if let Some(guardian) = self.guardian_pid {
+            let _ = kill(
+                Pid::from_raw(i32::try_from(guardian).expect("guardian id fits PID")),
+                Signal::SIGKILL,
+            );
+        }
+        if let Some(host) = self.host.as_mut() {
+            let _ = host.kill();
+            let _ = host.wait();
+        }
+    }
+}
+
+fn receive_pre_registration_event(
+    listener: &std::os::unix::net::UnixListener,
+    deadline: Instant,
+) -> (std::os::unix::net::UnixStream, String) {
+    loop {
+        match listener.accept() {
+            Ok((mut stream, _)) => {
+                // macOS can reject SO_RCVTIMEO on these Unix sockets. Read a
+                // newline under a monotonic deadline instead of relying on
+                // socket timeouts or an unbounded blocking BufReader.
+                stream
+                    .set_nonblocking(true)
+                    .expect("bound event reader via nonblocking stream");
+                let read_deadline = Instant::now() + Duration::from_secs(3);
+                let mut event = Vec::new();
+                loop {
+                    let mut byte = [0_u8; 1];
+                    match stream.read(&mut byte) {
+                        Ok(1) if byte[0] == b'\n' => break,
+                        Ok(1) => {
+                            event.push(byte[0]);
+                            assert!(event.len() <= 128, "control event exceeded 128 bytes");
+                        }
+                        Ok(0) => panic!("controller event closed before its newline"),
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                            assert!(Instant::now() < read_deadline, "control event read expired");
+                            thread::sleep(Duration::from_millis(2));
+                        }
+                        Err(error) => panic!("read control event: {error}"),
+                        Ok(_) => unreachable!("one-byte event read"),
+                    }
+                }
+                let event = String::from_utf8(event).expect("control event is UTF-8");
+                return (stream, event);
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                assert!(Instant::now() < deadline, "timed out awaiting process event");
+                thread::sleep(Duration::from_millis(2));
+            }
+            Err(error) => panic!("accept process event: {error}"),
+        }
+    }
+}
+
+#[test]
+fn pre_registration_real_host_sigkill_reaps_spawned_group() {
+    let temp = tempfile::tempdir().expect("private socket directory");
+    let socket = temp.path().join("prereg.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket)
+        .expect("bind pre-registration test control");
+    listener.set_nonblocking(true).expect("bound controller event poll");
+    let host = pre_registration_role_command("host", &socket)
+        .spawn()
+        .expect("spawn isolated host process");
+    let mut cleanup = PreRegistrationProcessCleanup {
+        host: Some(host),
+        guardian_pid: None,
+        group_pid: None,
+    };
+
+    let (mut pending_registration, paused) =
+        receive_pre_registration_event(&listener, Instant::now() + Duration::from_secs(10));
+    let mut fields = paused.split_whitespace();
+    assert_eq!(fields.next(), Some("PAUSED"), "unexpected event: {paused}");
+    let group_pid: u32 = fields.next().expect("group id").parse().expect("valid group id");
+    let guardian_pid: u32 = fields.next().expect("guardian id").parse().expect("valid guardian id");
+    assert!(fields.next().is_none(), "unexpected event suffix: {paused}");
+    cleanup.group_pid = Some(group_pid);
+    cleanup.guardian_pid = Some(guardian_pid);
+    let group = Pid::from_raw(i32::try_from(group_pid).expect("group id fits PID"));
+    assert_eq!(
+        nix::unistd::getpgid(Some(group)).expect("live isolated group leader"),
+        group,
+        "registration must still be blocked after group creation"
+    );
+    assert!(
+        kill(Pid::from_raw(i32::try_from(guardian_pid).expect("guardian id fits PID")), None)
+            .is_ok(),
+        "independent Guardian must be alive before host death"
+    );
+
+    let mut host = cleanup.host.take().expect("controller owns host child");
+    host.kill().expect("SIGKILL only the real host");
+    assert_eq!(
+        host.wait().expect("reap SIGKILLed host").signal(),
+        Some(9),
+        "real host death must be caused by SIGKILL"
+    );
+    pending_registration
+        .write_all(b"R")
+        .expect("resume Guardian after host is confirmed dead");
+    let (_notification, finished) =
+        receive_pre_registration_event(&listener, Instant::now() + Duration::from_secs(10));
+    assert_eq!(finished, format!("REAPED {group_pid}"));
+    assert_gone(Some(group_pid));
+    cleanup.group_pid = None;
+    cleanup.guardian_pid = None;
+}
