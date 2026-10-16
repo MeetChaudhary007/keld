@@ -1,12 +1,15 @@
 //! Private macOS process-group validation and rejected-registration cleanup.
 use std::io;
-use std::process::{Child, ChildStdin};
+use std::process::{Child, ChildStdin, ExitStatus};
+use std::time::Instant;
 
 use nix::errno::Errno;
 use nix::sys::signal::{Signal, killpg};
 use nix::unistd::{Pid, getpgid};
 
-use super::{RuntimeError, collapse_failures, lifecycle_error, nix_io_error};
+use super::{
+    GUARDIAN_SHUTDOWN_DEADLINE, RuntimeError, collapse_failures, lifecycle_error, nix_io_error,
+};
 
 pub(super) fn validate_group_pid(group: u32) -> Result<i32, RuntimeError> {
     if group == 0 {
@@ -62,6 +65,63 @@ pub(super) fn terminate_registered_group(group: u32) -> Result<(), RuntimeError>
     }
 }
 
+// Registration has not yet transferred ownership. A rejected or dropped
+// bootstrap must not block the host forever waiting for uncooperative EOF.
+pub(super) fn reap_pending_guardian(child: &mut Child) -> Result<ExitStatus, RuntimeError> {
+    let deadline = Instant::now() + GUARDIAN_SHUTDOWN_DEADLINE;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) if Instant::now() < deadline => std::thread::yield_now(),
+            Ok(None) => {
+                let mut failures = vec![lifecycle_error(
+                    "macOS guardian rejected-registration cleanup deadline",
+                    io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "guardian did not exit after host EOF",
+                    ),
+                )];
+                if let Err(source) = child.kill()
+                    && source.kind() != io::ErrorKind::InvalidInput
+                {
+                    failures.push(lifecycle_error(
+                        "macOS guardian rejected-registration process kill",
+                        source,
+                    ));
+                }
+                if let Err(source) = child.wait() {
+                    failures.push(lifecycle_error(
+                        "macOS guardian rejected-registration process wait",
+                        source,
+                    ));
+                }
+                return Err(collapse_failures(failures));
+            }
+            Err(source) => {
+                let mut failures = vec![lifecycle_error(
+                    "macOS guardian rejected-registration process inspection",
+                    source,
+                )];
+                if let Err(source) = child.kill()
+                    && source.kind() != io::ErrorKind::InvalidInput
+                {
+                    failures.push(lifecycle_error(
+                        "macOS guardian rejected-registration process kill",
+                        source,
+                    ));
+                }
+                if let Err(source) = child.wait() {
+                    failures.push(lifecycle_error(
+                        "macOS guardian rejected-registration process wait",
+                        source,
+                    ));
+                }
+                return Err(collapse_failures(failures));
+            }
+        }
+    }
+}
+
 pub(super) fn reject_host_registration(
     mut child: Child,
     liveness_writer: ChildStdin,
@@ -70,7 +130,7 @@ pub(super) fn reject_host_registration(
 ) -> RuntimeError {
     drop(liveness_writer);
     let mut failures = vec![error];
-    match child.wait() {
+    match reap_pending_guardian(&mut child) {
         Ok(status) if status.success() => {}
         Ok(status) => {
             failures.push(lifecycle_error(
@@ -85,11 +145,8 @@ pub(super) fn reject_host_registration(
                 failures.push(error);
             }
         }
-        Err(source) => {
-            failures.push(lifecycle_error(
-                "macOS guardian rejected-registration wait",
-                source,
-            ));
+        Err(cleanup) => {
+            failures.push(cleanup);
             if let Some(group_pid) = group_pid
                 && let Err(error) = terminate_registered_group(group_pid)
             {

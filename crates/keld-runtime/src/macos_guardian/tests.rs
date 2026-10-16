@@ -42,6 +42,7 @@ include!("tests/generation_host.rs");
 include!("tests/supervised_bootstrap.rs");
 
 include!("tests/liveness_and_shutdown.rs");
+include!("tests/rejected_registration_deadline.rs");
 
 include!("tests/guarded_primary_shutdown.rs");
 include!("tests/worker_outcome.rs");

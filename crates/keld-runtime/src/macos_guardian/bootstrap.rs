@@ -3,7 +3,8 @@ use super::{
     BootstrapAdmission, BootstrapListener, BootstrapRejection, BootstrapRejectionObserver, Child,
     ChildStdin, ChildStdout, Command, GuardedPrimary, HostGuardian, Instant, REGISTRATION_ENV,
     REGISTRATION_LEN, REGISTRATION_MAGIC, Read, RuntimeError, Stdio, collapse_failures, io,
-    lifecycle_error, reject_host_registration, require_close_on_exec, validate_group_leader,
+    lifecycle_error, reap_pending_guardian, reject_host_registration, require_close_on_exec,
+    validate_group_leader,
 };
 
 /// Host-side authenticated bootstrap for one private guardian process.
@@ -284,7 +285,7 @@ impl Drop for GuardianBootstrap {
             return;
         };
         drop(liveness_writer);
-        let _ = child.wait();
+        let _ = reap_pending_guardian(&mut child);
     }
 }
 

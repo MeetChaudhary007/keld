@@ -27,7 +27,8 @@ mod host_control;
 
 mod process_group;
 use self::process_group::{
-    reject_host_registration, terminate_registered_group, validate_group_leader, validate_group_pid,
+    reap_pending_guardian, reject_host_registration, terminate_registered_group,
+    validate_group_leader, validate_group_pid,
 };
 
 mod guarded_lease;
