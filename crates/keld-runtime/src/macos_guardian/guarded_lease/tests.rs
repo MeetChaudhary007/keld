@@ -239,6 +239,7 @@ fn failed_exchange_keeps_cleanup(reply: Reply) {
         })),
         host_unavailable: Arc::new(AtomicBool::new(false)),
         group_pid: None,
+        admission: None,
     };
     let admission = lease.child_spawned(pid, 1);
     peer.join().expect("fault peer joins");

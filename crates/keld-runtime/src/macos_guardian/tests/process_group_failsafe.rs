@@ -1,5 +1,38 @@
 // Group-leader disappearance does not establish group disappearance. An
 // unrelated process in the same private group can outlive the original leader.
+use std::os::unix::process::CommandExt as _;
+use std::process::{Command, Stdio};
+
+use nix::errno::Errno;
+use nix::sys::signal::kill;
+use nix::unistd::Pid;
+
+use super::super::process_group::{
+    finish_group_termination, terminate_registered_group, validate_guardian_child_group,
+};
+
+#[test]
+fn foreign_group_is_not_a_guardian_owned_direct_child() {
+    let mut group = Command::new("/bin/sleep")
+        .arg("30")
+        .process_group(0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn private, test-owned foreign group");
+    let group_pid = group.id();
+    let actual_parent = std::process::id();
+    let own_child = validate_guardian_child_group(group_pid, actual_parent);
+    let forged_parent = validate_guardian_child_group(group_pid, u32::MAX);
+    // Reap the test-owned process before any assertion, including red cases.
+    group.kill().expect("kill exact test-owned child");
+    group.wait().expect("reap exact test-owned child");
+    own_child.expect("kernel identifies this actual direct child");
+    let error = forged_parent.expect_err("an unrelated Guardian must not own this group");
+    assert!(error.to_string().contains("direct child"), "{error}");
+}
+
 #[test]
 fn reaped_leader_does_not_mask_live_process_group_when_signal_is_denied() {
     let mut command = Command::new("/bin/sh");
@@ -22,7 +55,10 @@ fn reaped_leader_does_not_mask_live_process_group_when_signal_is_denied() {
     let cleanup = terminate_registered_group(group_pid);
     assert_eq!(leader_gone, Err(Errno::ESRCH));
     assert_eq!(group_probe, Ok(()), "descendant still owns group");
-    assert!(outcome.is_err(), "EPERM cannot be suppressed for a live group");
+    assert!(
+        outcome.is_err(),
+        "EPERM cannot be suppressed for a live group"
+    );
     cleanup.expect("reap isolated test process group");
 }
 

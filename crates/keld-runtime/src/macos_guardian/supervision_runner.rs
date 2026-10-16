@@ -1,12 +1,17 @@
 //! Supervised child execution and authenticated private group registration.
 use super::{
-    AsFd, CapturedOutput, Command, CommandExt, CrashLedger, Duration, GENERATION_CONTROL_POLL,
-    GenerationControlPeer, GenerationControlReader, GuardedPrimaryPreparer, GuardianReport,
-    REGISTRATION_ENV, REGISTRATION_LEN, REGISTRATION_MAGIC, Read, RestartPolicy, RuntimeError,
-    Stdio, SupervisedGuardianPreparer, Supervisor, SupervisorOutcome, Write,
-    await_guarded_primary_liveness, await_host_death, collapse_failures, handshake_client, io,
-    lifecycle_error, observe_supervised_liveness, parse_app_link, set_liveness_nonblocking,
-    terminate_registered_group, validate_group_pid, validate_liveness_bootstrap,
+    AsFd, CapturedOutput, Command, CrashLedger, Duration, GENERATION_CONTROL_POLL,
+    GenerationControlPeer, GenerationControlReader, GuardedPrimaryPreparer, REGISTRATION_ENV,
+    REGISTRATION_LEN, REGISTRATION_MAGIC, Read, RestartPolicy, RuntimeError,
+    SupervisedGuardianPreparer, Supervisor, SupervisorOutcome, Write,
+    await_guarded_primary_liveness, collapse_failures, handshake_client, io, lifecycle_error,
+    observe_supervised_liveness, parse_app_link, set_liveness_nonblocking,
+    validate_liveness_bootstrap,
+};
+#[cfg(test)]
+use super::{
+    CommandExt, GuardianReport, Stdio, await_host_death, terminate_registered_group,
+    validate_group_pid,
 };
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
@@ -121,6 +126,7 @@ where
     Ok((leader_pid, crash_ledger, output))
 }
 
+#[cfg(test)]
 pub(super) fn run_with_registration<R, W, S, F>(
     mut command: Command,
     mut liveness: R,

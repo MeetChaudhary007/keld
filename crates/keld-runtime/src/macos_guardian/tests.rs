@@ -7,48 +7,46 @@ use std::sync::mpsc::{self, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use super::process_group::finish_group_termination;
 use nix::fcntl::{FcntlArg, FdFlag, OFlag, fcntl};
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 use nix::unistd::pipe;
 
 use super::{
-    AsFd, BootstrapListener, CONTROL_CLEAR, CONTROL_CLEARED, CONTROL_PREPARE, CONTROL_PREPARED,
-    CONTROL_REGISTERED, CONTROL_REVOKE, CONTROL_REVOKED, CONTROL_SPAWNED, ChildPreparer, Command,
-    DEFAULT_ADMISSION_TIMEOUT, Errno, GENERATION_CONTROL_POLL, GUARDIAN_SHUTDOWN_DEADLINE,
-    GenerationControlPeer, GenerationControlReader, GenerationControlRecord,
-    GenerationProvisionFence, GuardedPrimary, GuardedPrimaryLease, GuardedPrimaryPreparer,
-    GuardedPrimaryUpdate, GuardianBootstrap, HostGenerationState, HostGuardian, Instant,
-    JoinHandle, PreparedChild, REGISTRATION_ENV, Read, Receiver, RecoveryState,
-    RegisteredPrimaryGeneration, RestartPolicy, RevocationCause, RoleEvent, RoleGenerationOwner,
-    RoleOwner, RuntimeError, SUPERVISED_GUARDIAN_ARG, SUPERVISED_QUIT_ACCEPTED,
+    AsFd, CONTROL_CLEAR, CONTROL_CLEARED, CONTROL_PREPARE, CONTROL_PREPARED, CONTROL_REGISTERED,
+    CONTROL_REVOKE, CONTROL_REVOKED, CONTROL_SPAWNED, ChildPreparer, Command, Errno,
+    GENERATION_CONTROL_POLL, GUARDIAN_SHUTDOWN_DEADLINE, GenerationControlPeer,
+    GenerationControlReader, GenerationControlRecord, GenerationProvisionFence, GuardedPrimary,
+    GuardedPrimaryLease, GuardedPrimaryPreparer, GuardedPrimaryUpdate, GuardianBootstrap,
+    HostGenerationState, HostGuardian, Instant, JoinHandle, PreparedChild, REGISTRATION_ENV, Read,
+    Receiver, RecoveryState, RegisteredPrimaryGeneration, RestartPolicy, RevocationCause,
+    RoleEvent, RuntimeError, SUPERVISED_GUARDIAN_ARG, SUPERVISED_QUIT_ACCEPTED,
     SUPERVISED_QUIT_ACK, SUPERVISED_QUIT_ACK_DEADLINE, Sender, SupervisedGuardianPreparer,
-    Supervisor, SupervisorOutcome, await_guarded_primary_liveness, check_initial_recovery_decision,
-    control_exchange, finish_generation_control_eof, handshake_client,
-    interrupted_successor_preparation, io, is_owned_preparation_interruption, lifecycle_error,
-    lock_generation, lock_recovery, nix_io_error, observe_guarded_liveness, parse_app_link,
-    read_generation_control, require_close_on_exec, run, run_generation_host,
-    run_supervised_with_registration, run_with_registration, runtime_io_kind,
+    Supervisor, SupervisorOutcome, await_guarded_primary_liveness, control_exchange,
+    finish_generation_control_eof, handshake_client, interrupted_successor_preparation, io,
+    is_owned_preparation_interruption, lifecycle_error, lock_generation, lock_recovery,
+    nix_io_error, observe_guarded_liveness, parse_app_link, read_generation_control, run,
+    run_generation_host, run_supervised_with_registration, run_with_registration, runtime_io_kind,
     set_liveness_nonblocking, terminate_registered_group, thread, validate_liveness_bootstrap,
     write_generation_control,
 };
 
 mod generation_control_wire;
 
-include!("tests/recovery_and_revocation.rs");
+mod recovery_and_revocation;
 
 include!("tests/generation_host.rs");
 
 include!("tests/supervised_bootstrap.rs");
 
 include!("tests/liveness_and_shutdown.rs");
-include!("tests/rejected_registration_deadline.rs");
+mod rejected_registration_deadline;
 include!("tests/pre_registration_host_death.rs");
-include!("tests/process_group_failsafe.rs");
+include!("tests/guardian_crash_pre_registration.rs");
+mod process_group_failsafe;
 
 include!("tests/guarded_primary_shutdown.rs");
-include!("tests/worker_outcome.rs");
+mod worker_outcome;
 
 include!("tests/control_acknowledgement.rs");
 

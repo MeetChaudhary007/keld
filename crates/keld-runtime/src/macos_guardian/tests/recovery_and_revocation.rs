@@ -1,3 +1,20 @@
+use std::io;
+use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex, mpsc};
+use std::time::{Duration, Instant};
+
+use nix::errno::Errno;
+use nix::sys::signal::kill;
+use nix::unistd::Pid;
+
+use super::super::{
+    BootstrapListener, DEFAULT_ADMISSION_TIMEOUT, GUARDIAN_SHUTDOWN_DEADLINE, GuardedPrimary,
+    GuardianBootstrap, HostGenerationState, RecoveryState, RegisteredPrimaryGeneration, RoleEvent,
+    RoleGenerationOwner, RoleOwner, check_initial_recovery_decision, finish_generation_control_eof,
+    handshake_client, lifecycle_error, lock_recovery, parse_app_link, require_close_on_exec,
+    runtime_io_kind,
+};
+
 #[test]
 fn guarded_primary_rejects_non_supervised_bootstrap_before_generation() {
     let registration = BootstrapListener::bind().expect("guarded registration");

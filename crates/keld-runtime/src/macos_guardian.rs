@@ -31,6 +31,15 @@ use self::process_group::{
     validate_group_leader, validate_group_pid,
 };
 
+mod spawn_admission;
+use self::spawn_admission::SpawnAdmission;
+
+mod registration_ack;
+use self::registration_ack::{AwaitHostGroupRetention, HOST_GROUP_RETAINED_ACK};
+
+mod authenticated_runner;
+use self::authenticated_runner::run_with_authenticated_registration;
+
 mod guarded_lease;
 #[cfg(test)]
 use self::guarded_lease::GuardedPrimaryLease;
@@ -47,9 +56,11 @@ pub use self::bootstrap::GuardianBootstrap;
 
 mod supervision_runner;
 pub use self::supervision_runner::run_guarded_primary;
+#[cfg(test)]
+use self::supervision_runner::run_with_registration;
 use self::supervision_runner::{
     connect_guardian_registration, fail_before_child, run_supervised_with_registration,
-    run_with_registration, write_group_registration,
+    write_group_registration,
 };
 
 mod generation_host;
@@ -168,11 +179,10 @@ where
         Ok(registration) => registration,
         Err(error) => return Err(fail_before_child(error, revoke_registered_resources)),
     };
-    run_with_registration(
+    run_with_authenticated_registration(
         command,
         liveness,
-        registration,
-        |_| Ok(()),
+        AwaitHostGroupRetention::new(registration),
         revoke_registered_resources,
     )
 }
@@ -213,7 +223,7 @@ where
     };
     run_supervised_with_registration(
         liveness,
-        registration,
+        AwaitHostGroupRetention::new(registration),
         quit_ack,
         command_factory,
         |_| Ok(()),

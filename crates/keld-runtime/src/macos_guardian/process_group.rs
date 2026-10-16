@@ -4,6 +4,7 @@ use std::process::{Child, ChildStdin, ExitStatus};
 use std::time::Instant;
 
 use nix::errno::Errno;
+use nix::libc;
 use nix::sys::signal::{Signal, kill, killpg};
 use nix::unistd::{Pid, getpgid};
 
@@ -45,6 +46,45 @@ pub(super) fn validate_group_leader(group: u32) -> Result<i32, RuntimeError> {
             ),
         ))
     }
+}
+
+/// KGR1 is authenticated, but its PID field is still untrusted input. Before
+/// returning a retention ACK, verify that the *actual* process-group leader
+/// is the retained Guardian's direct child rather than an unrelated group.
+#[allow(unsafe_code)] // read-only, exact-size macOS PROC_PIDTBSDINFO observation
+pub(super) fn validate_guardian_child_group(
+    group_pid: u32,
+    guardian_pid: u32,
+) -> Result<(), RuntimeError> {
+    let pid = validate_group_leader(group_pid)?;
+    // SAFETY: proc_bsdinfo consists of integer fields and fixed arrays; a
+    // zeroed instance is a valid writable C output buffer. The kernel copies
+    // the process snapshot and retains no pointer after proc_pidinfo returns.
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = i32::try_from(std::mem::size_of::<libc::proc_bsdinfo>()).map_err(|source| {
+        lifecycle_error(
+            "macOS guardian registered child lineage",
+            io::Error::new(io::ErrorKind::InvalidData, source),
+        )
+    })?;
+    // SAFETY: the initialized buffer is writable for exactly `size` bytes,
+    // and pid is a validated c_int. No pointer is used after this call.
+    let observed =
+        unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 0, (&raw mut info).cast(), size) };
+    if observed != size
+        || info.pbi_pid != group_pid
+        || info.pbi_pgid != group_pid
+        || info.pbi_ppid != guardian_pid
+    {
+        return Err(lifecycle_error(
+            "macOS guardian registered child lineage",
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "reported group is not the retained Guardian's direct child",
+            ),
+        ));
+    }
+    Ok(())
 }
 
 pub(super) fn terminate_registered_group(group: u32) -> Result<(), RuntimeError> {

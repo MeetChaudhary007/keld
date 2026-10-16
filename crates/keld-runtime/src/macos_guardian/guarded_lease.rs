@@ -1,11 +1,13 @@
 //! Fresh-generation child preparation and the exact revocation lease.
+#[cfg(test)]
+use super::validate_group_leader;
 use super::{
     Arc, AtomicBool, CONTROL_CLEAR, CONTROL_CLEARED, CONTROL_PREPARE, CONTROL_PREPARED,
     CONTROL_REGISTERED, CONTROL_REVOKE, CONTROL_REVOKED, CONTROL_SPAWNED, ChildPreparer, Command,
     CommandExt, GenerationControlPeer, GenerationControlRecord, GenerationLease, Mutex, Ordering,
-    PreparedChild, REGISTRATION_ENV, RevocationCause, RuntimeError, Stdio, collapse_failures,
-    control_exchange, control_exchange_with_cancellation, io, lifecycle_error,
-    terminate_registered_group, validate_group_leader,
+    PreparedChild, REGISTRATION_ENV, RevocationCause, RuntimeError, SpawnAdmission, Stdio,
+    collapse_failures, control_exchange, control_exchange_with_cancellation, io, lifecycle_error,
+    terminate_registered_group,
 };
 
 pub(super) struct GuardedPrimaryPreparer<C> {
@@ -68,6 +70,16 @@ where
             .env_remove(REGISTRATION_ENV)
             .process_group(0)
             .stdin(Stdio::null());
+        let registration_control = Arc::clone(&self.control);
+        let admission = SpawnAdmission::install(&mut command, move |pid| {
+            control_exchange(
+                &registration_control,
+                &GenerationControlRecord::new(CONTROL_SPAWNED, attempt).with_pid(pid),
+                CONTROL_REGISTERED,
+                attempt,
+            )
+            .map(|_| ())
+        })?;
         Ok(PreparedChild {
             command: command.into(),
             lease: GuardedPrimaryLease {
@@ -75,6 +87,7 @@ where
                 control: Arc::clone(&self.control),
                 host_unavailable: Arc::clone(&self.host_unavailable),
                 group_pid: None,
+                admission: Some(admission),
             },
         })
     }
@@ -111,6 +124,7 @@ pub(super) struct GuardedPrimaryLease {
     control: Arc<Mutex<GenerationControlPeer>>,
     host_unavailable: Arc<AtomicBool>,
     group_pid: Option<u32>,
+    admission: Option<SpawnAdmission>,
 }
 
 impl GenerationLease for GuardedPrimaryLease {
@@ -124,20 +138,50 @@ impl GenerationLease for GuardedPrimaryLease {
                 ),
             ));
         }
-        validate_group_leader(pid)?;
-        // Cleanup belongs to the locally spawned group even if its registration
-        // acknowledgment is lost or rejected. Admission still requires the ACK.
-        self.group_pid = Some(pid);
-        control_exchange(
-            &self.control,
-            &GenerationControlRecord::new(CONTROL_SPAWNED, attempt).with_pid(pid),
-            CONTROL_REGISTERED,
-            attempt,
-        )?;
-        Ok(())
+        if let Some(admission) = self.admission.take() {
+            // The pre-exec reporter has already registered the group with the
+            // host before permitting Bun to run. Preserve its local PID for
+            // revocation even if the host's acknowledgment was malformed.
+            let (group_pid, registration) = admission.finish();
+            self.group_pid = group_pid;
+            let registered_pid = registration?;
+            if registered_pid != pid {
+                return Err(lifecycle_error(
+                    "macOS guardian generation registration",
+                    io::Error::new(io::ErrorKind::InvalidData, "pre-exec PID changed at spawn"),
+                ));
+            }
+            return Ok(());
+        }
+        #[cfg(test)]
+        {
+            // Existing synthetic ACK fault-injection tests exercise late
+            // registration directly without spawning via the preparer.
+            validate_group_leader(pid)?;
+            self.group_pid = Some(pid);
+            control_exchange(
+                &self.control,
+                &GenerationControlRecord::new(CONTROL_SPAWNED, attempt).with_pid(pid),
+                CONTROL_REGISTERED,
+                attempt,
+            )?;
+            Ok(())
+        }
+        #[cfg(not(test))]
+        Err(lifecycle_error(
+            "macOS guardian generation registration",
+            io::Error::other("pre-exec registration gate is missing"),
+        ))
     }
 
     fn revoke(mut self, cause: RevocationCause) -> Result<(), RuntimeError> {
+        if let Some(admission) = self.admission.take() {
+            let (group_pid, result) = admission.finish();
+            self.group_pid = group_pid;
+            // A failed spawn still closes the child-side permit before exec;
+            // the reporter has a bounded PID receipt/host protocol deadline.
+            let _ = result;
+        }
         let group_pid = self.group_pid.take();
         let host_available = !self.host_unavailable.load(Ordering::Acquire);
         let mut failures = Vec::new();
