@@ -56,6 +56,16 @@ use super::{
     start_renderer_dispatch,
 };
 
+// Match the native owner's observer gate: ordinary builds omit these
+// imports, while admitted debug/macOS fixtures keep their existing paths.
+#[cfg(feature = "fs-acceptance-observer")]
+keld_native::keld_native_fs_observer_items! {
+    use super::{
+        FsDispatchSession, FsRecoveryAttempt, GUARDIAN_OWNER_REPLY_DEADLINE, GuardianOwner,
+        RecoveryArm, apply_guardian_recovery_arm, read_primary_frames,
+    };
+}
+
 #[cfg(windows)]
 use super::{
     GetHandleInformation, HANDLE_FLAG_INHERIT, SetHandleInformation, TestSessionSeam,
