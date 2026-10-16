@@ -18,17 +18,16 @@ use super::{
     GENERATION_CONTROL_POLL, GUARDIAN_SHUTDOWN_DEADLINE, GenerationControlPeer,
     GenerationControlReader, GenerationControlRecord, GenerationProvisionFence, GuardedPrimary,
     GuardedPrimaryLease, GuardedPrimaryPreparer, GuardedPrimaryUpdate, GuardianBootstrap,
-    HostGenerationState, HostGuardian, Instant, JoinHandle, PreparedChild, REGISTRATION_ENV, Read,
-    Receiver, RecoveryState, RegisteredPrimaryGeneration, RestartPolicy, RevocationCause,
-    RoleEvent, RuntimeError, SUPERVISED_GUARDIAN_ARG, SUPERVISED_QUIT_ACCEPTED,
-    SUPERVISED_QUIT_ACK, SUPERVISED_QUIT_ACK_DEADLINE, Sender, SupervisedGuardianPreparer,
-    Supervisor, SupervisorOutcome, await_guarded_primary_liveness, control_exchange,
-    finish_generation_control_eof, handshake_client, interrupted_successor_preparation, io,
-    is_owned_preparation_interruption, lifecycle_error, lock_generation, lock_recovery,
-    nix_io_error, observe_guarded_liveness, parse_app_link, read_generation_control, run,
-    run_generation_host, run_supervised_with_registration, run_with_registration, runtime_io_kind,
-    set_liveness_nonblocking, terminate_registered_group, thread, validate_liveness_bootstrap,
-    write_generation_control,
+    HostGuardian, Instant, JoinHandle, PreparedChild, REGISTRATION_ENV, Read, Receiver,
+    RecoveryState, RegisteredPrimaryGeneration, RestartPolicy, RevocationCause, RoleEvent,
+    RuntimeError, SUPERVISED_GUARDIAN_ARG, SUPERVISED_QUIT_ACCEPTED, SUPERVISED_QUIT_ACK,
+    SUPERVISED_QUIT_ACK_DEADLINE, Sender, SupervisedGuardianPreparer, Supervisor,
+    SupervisorOutcome, await_guarded_primary_liveness, handshake_client,
+    interrupted_successor_preparation, io, is_owned_preparation_interruption, lifecycle_error,
+    lock_generation, lock_recovery, nix_io_error, observe_guarded_liveness, parse_app_link,
+    read_generation_control, run, run_generation_host, run_supervised_with_registration,
+    run_with_registration, runtime_io_kind, set_liveness_nonblocking, terminate_registered_group,
+    thread, validate_liveness_bootstrap, write_generation_control,
 };
 
 mod generation_control_wire;
@@ -48,7 +47,7 @@ mod rejected_registration_deadline;
 include!("tests/guarded_primary_shutdown.rs");
 mod worker_outcome;
 
-include!("tests/control_acknowledgement.rs");
+mod control_acknowledgement;
 
 include!("tests/terminal_liveness.rs");
 

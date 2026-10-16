@@ -1,3 +1,16 @@
+use std::io::{self, Write as _};
+use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex, mpsc};
+use std::time::{Duration, Instant};
+
+use super::super::{
+    CONTROL_CLEAR, CONTROL_PREPARE, CONTROL_PREPARED, GENERATION_CONTROL_POLL,
+    GUARDIAN_SHUTDOWN_DEADLINE, GenerationControlPeer, GenerationControlReader,
+    GenerationControlRecord, GuardedPrimary, HostGenerationState, RecoveryState,
+    SUPERVISED_QUIT_ACK_DEADLINE, control_exchange, finish_generation_control_eof, lock_recovery,
+    read_generation_control, runtime_io_kind, write_generation_control,
+};
+
 fn owned_acknowledgment_primary() -> GuardedPrimary {
     // This owns a real ACK pipe peer, not a guardian/native mock claim.
     // The staged-Host case above separately proves the actual guardian.
