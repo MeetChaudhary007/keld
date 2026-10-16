@@ -44,6 +44,7 @@ include!("tests/supervised_bootstrap.rs");
 include!("tests/liveness_and_shutdown.rs");
 
 include!("tests/guarded_primary_shutdown.rs");
+include!("tests/worker_outcome.rs");
 
 include!("tests/control_acknowledgement.rs");
 

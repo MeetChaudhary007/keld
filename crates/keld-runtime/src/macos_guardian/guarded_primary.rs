@@ -213,7 +213,7 @@ impl GuardedPrimary {
             }
         }
         if self.worker.as_ref().is_some_and(JoinHandle::is_finished) {
-            let result = self.join_worker();
+            let result = self.join_worker_with_shutdown_proof();
             if let Err(error) = result {
                 let cleanup = self.fail_safe_current_group().err();
                 return match cleanup {
@@ -286,7 +286,7 @@ impl GuardedPrimary {
                 }
             }
         }
-        let worker_failed = if let Err(error) = self.join_worker() {
+        let worker_failed = if let Err(error) = self.join_worker_with_shutdown_proof() {
             failures.push(error);
             true
         } else {
@@ -307,9 +307,16 @@ impl GuardedPrimary {
                 cleanup_error,
             });
         }
-        if worker_failed {
-            // A clean guardian exit does not prove the native group was retired
-            // when its host-side generation worker has already failed.
+        let group_still_registered = lock_generation(&self.current_generation).is_some();
+        if group_still_registered && !worker_failed {
+            failures.push(lifecycle_error(
+                "macOS guardian generation shutdown",
+                io::Error::other("guardian exited with a registered group"),
+            ));
+        }
+        if worker_failed || group_still_registered {
+            // Even a zero-status guardian or apparently successful worker
+            // cannot leave a native group behind after the host's shutdown.
             if let Err(error) = self.fail_safe_current_group() {
                 failures.push(error);
             }
@@ -346,6 +353,30 @@ impl GuardedPrimary {
         read_supervised_orderly_ack(ack_reader)?;
         self.shutdown_attributed = true;
         lock_recovery(&self.recovery_decision).shutdown_acknowledged = true;
+        Ok(())
+    }
+
+    // The private generation worker may return Ok only after Q/S attribution
+    // and the last native process group has been explicitly cleared.
+    // Missing either fact is a fatal owner-state mismatch, not a clean EOF.
+    fn join_worker_with_shutdown_proof(&mut self) -> Result<(), RuntimeError> {
+        let was_running = self.worker.is_some();
+        self.join_worker()?;
+        if !was_running {
+            return Ok(());
+        }
+        if !lock_recovery(&self.recovery_decision).shutdown_acknowledged {
+            return Err(lifecycle_error(
+                "macOS guardian generation host worker",
+                io::Error::other("worker ended before acknowledged shutdown"),
+            ));
+        }
+        if lock_generation(&self.current_generation).is_some() {
+            return Err(lifecycle_error(
+                "macOS guardian generation host worker",
+                io::Error::other("worker ended with a registered group"),
+            ));
+        }
         Ok(())
     }
 
