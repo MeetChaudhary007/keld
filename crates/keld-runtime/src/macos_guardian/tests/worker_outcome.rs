@@ -153,3 +153,85 @@ fn zero_guardian_exit_with_successful_worker_reaps_registered_group() {
         "host retained a stale generation after guardian exit"
     );
 }
+
+// A child may be reaped outside std::process::Child, making try_wait
+// return ECHILD. Inspection failure must not strand the enrolled group.
+#[test]
+fn poll_fatal_inspection_error_reaps_registered_group() {
+    let mut group = Command::new("/bin/sleep")
+        .arg("30")
+        .process_group(0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("isolated native process group");
+    let group_pid = group.id();
+    let raw_group = i32::try_from(group_pid).expect("group id fits c_int");
+    assert_eq!(
+        nix::unistd::getpgid(Some(Pid::from_raw(raw_group)))
+            .expect("owned group remains alive")
+            .as_raw(),
+        raw_group,
+        "never target the test runner group"
+    );
+
+    let mut guardian = Command::new("/usr/bin/true")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("owned guardian stand-in");
+    let writer = guardian.stdin.take().expect("liveness writer");
+    let ack = guardian.stdout.take().expect("ack reader");
+    // Deliberately consume the OS child status without updating Child's cache.
+    let raw_guardian = i32::try_from(guardian.id()).expect("guardian id fits c_int");
+    let guardian_pid = rustix::process::Pid::from_raw(raw_guardian).expect("positive guardian id");
+    rustix::process::waitpid(
+        Some(guardian_pid),
+        rustix::process::WaitOptions::empty(),
+    )
+    .expect("reap guardian externally")
+    .expect("wait produced exited guardian");
+
+    let current_generation = Arc::new(Mutex::new(Some(RegisteredPrimaryGeneration {
+        attempt: 1,
+        group_pid,
+    })));
+    let (_tx, updates_rx) = mpsc::channel();
+    let mut primary = GuardedPrimary {
+        child: guardian,
+        liveness_writer: Some(writer),
+        quit_ack_reader: ack,
+        current_generation: Arc::clone(&current_generation),
+        recovery_decision: Arc::new(Mutex::new(RecoveryState::new())),
+        updates_rx,
+        worker: None,
+        shutdown_attributed: false,
+    };
+    let result = primary.poll_fatal();
+    let deadline = Instant::now() + GUARDIAN_SHUTDOWN_DEADLINE;
+    let mut group_status = group.try_wait().expect("inspect registered group");
+    while group_status.is_none() && Instant::now() < deadline {
+        thread::yield_now();
+        group_status = group.try_wait().expect("observe group retirement");
+    }
+    let group_retired = group_status.is_some();
+    if !group_retired {
+        // A red-phase regression must never leave its own group alive.
+        terminate_registered_group(group_pid).expect("owned group fallback kill");
+        group.wait().expect("owned group fallback reap");
+    }
+    // The guardian was already externally reaped, so avoid Drop's Q/S I/O.
+    primary.liveness_writer.take();
+    let error = result.expect_err("failed child inspection must be fatal");
+    assert!(
+        error.to_string().contains("generation process inspection"),
+        "unexpected inspection error: {error}"
+    );
+    assert!(group_retired, "inspection failure stranded a native group");
+    assert!(
+        lock_generation(&current_generation).is_none(),
+        "failed guardian inspection retained stale group authority"
+    );
+}

@@ -206,10 +206,13 @@ impl GuardedPrimary {
                 })?;
             }
             Err(source) => {
-                return Err(lifecycle_error(
-                    "macOS guardian generation process inspection",
-                    source,
-                ));
+                let error = lifecycle_error("macOS guardian generation process inspection", source);
+                // An unobservable guardian is a loss of process authority,
+                // not a reason to leave the enrolled Bun group running.
+                return match self.fail_safe_current_group() {
+                    Ok(()) => Err(error),
+                    Err(cleanup) => Err(collapse_failures(vec![error, cleanup])),
+                };
             }
         }
         if self.worker.as_ref().is_some_and(JoinHandle::is_finished) {
