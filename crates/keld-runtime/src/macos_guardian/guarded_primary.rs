@@ -286,9 +286,12 @@ impl GuardedPrimary {
                 }
             }
         }
-        if let Err(error) = self.join_worker() {
+        let worker_failed = if let Err(error) = self.join_worker() {
             failures.push(error);
-        }
+            true
+        } else {
+            false
+        };
         if let Some(observed) = status
             && !observed.success()
         {
@@ -303,6 +306,13 @@ impl GuardedPrimary {
                 exit_code: observed.code(),
                 cleanup_error,
             });
+        }
+        if worker_failed {
+            // A clean guardian exit does not prove the native group was retired
+            // when its host-side generation worker has already failed.
+            if let Err(error) = self.fail_safe_current_group() {
+                failures.push(error);
+            }
         }
         if failures.is_empty() {
             status.ok_or_else(|| {
