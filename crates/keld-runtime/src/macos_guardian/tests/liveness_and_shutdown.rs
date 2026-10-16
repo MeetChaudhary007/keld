@@ -300,6 +300,40 @@ fn orderly_shutdown_closes_the_same_liveness_writer() {
     assert_eq!(group_status.signal(), Some(9));
 }
 
+// A zero-status guardian is not proof that its registered Bun group retired.
+#[test]
+fn zero_exit_guardian_shutdown_reaps_still_registered_group() {
+    let mut cmd = long_running_command();
+    cmd.process_group(0);
+    let mut group = cmd.spawn().expect("independent registered group");
+    let group_pid = group.id();
+    let mut cmd = Command::new("/bin/sh");
+    cmd.args(["-c", "read ignored || exit 0"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut guardian = cmd.spawn().expect("successful EOF guardian");
+    let writer = guardian.stdin.take().expect("guardian liveness writer");
+    let mut owner = HostGuardian::from_registered_parts(guardian, writer, None, group_pid)
+        .expect("registered owner");
+
+    let status = owner.shutdown().expect("successful guardian shutdown");
+    assert!(status.success());
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let mut retired = group.try_wait().expect("inspect registered group");
+    while retired.is_none() && Instant::now() < deadline {
+        thread::yield_now();
+        retired = group.try_wait().expect("observe group retirement");
+    }
+    let group_reaped = retired.is_some();
+    if !group_reaped {
+        terminate_registered_group(group_pid).expect("test fallback signal");
+        group.wait().expect("test fallback reap");
+    }
+    assert!(group_reaped, "zero-status guardian stranded its registered group");
+    assert_eq!(owner.group_pid(), None);
+}
+
 // Drop must not block forever if an otherwise owned guardian ignores host EOF.
 // The regression has an independent kill switch and always reaps its test group.
 #[test]

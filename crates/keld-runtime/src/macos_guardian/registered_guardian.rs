@@ -217,6 +217,9 @@ impl HostGuardian {
         };
         let group_pid = self.take_registered_group()?;
         if status.success() {
+            // Guardian status zero is not proof of group retirement.
+            // Finish the host's fail-safe before reporting clean shutdown.
+            terminate_registered_group(group_pid)?;
             Ok(status)
         } else {
             Err(unexpected_guardian_exit(group_pid, status))
