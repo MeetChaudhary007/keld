@@ -1,5 +1,22 @@
 // Root supplies an already-built Host artifact. Guardian stdout remains
 // exclusively the existing Q/S ACK pipe, never a libtest output stream.
+use std::fs::File;
+use std::io::{self, Read as _};
+use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
+use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex, mpsc};
+use std::thread;
+use std::time::{Duration, Instant};
+
+use nix::unistd::Pid;
+
+use super::super::{
+    GENERATION_CONTROL_POLL, GUARDIAN_SHUTDOWN_DEADLINE, GuardedPrimary, GuardedPrimaryUpdate,
+    GuardianBootstrap, RecoveryState, RegisteredPrimaryGeneration, RoleEvent, RuntimeError,
+    SUPERVISED_GUARDIAN_ARG, lifecycle_error, lock_generation, lock_recovery,
+    terminate_registered_group,
+};
+
 struct PersistentPrimaryFixture {
     primary: GuardedPrimary,
     stderr: File,
@@ -366,7 +383,10 @@ fn shutdown_worker_error_reaps_registered_group_after_zero_guardian_exit() {
         terminate_registered_group(group_pid).expect("test-owned group fallback");
         group.wait().expect("reap test-owned group");
     }
-    assert!(guardian_status.success(), "test requires zero guardian exit");
+    assert!(
+        guardian_status.success(),
+        "test requires zero guardian exit"
+    );
     assert!(
         fail_safe_reaped,
         "worker failure left a registered Bun process group alive: {error}"
