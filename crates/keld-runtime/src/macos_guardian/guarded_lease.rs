@@ -125,13 +125,15 @@ impl GenerationLease for GuardedPrimaryLease {
             ));
         }
         validate_group_leader(pid)?;
+        // Cleanup belongs to the locally spawned group even if its registration
+        // acknowledgment is lost or rejected. Admission still requires the ACK.
+        self.group_pid = Some(pid);
         control_exchange(
             &self.control,
             &GenerationControlRecord::new(CONTROL_SPAWNED, attempt).with_pid(pid),
             CONTROL_REGISTERED,
             attempt,
         )?;
-        self.group_pid = Some(pid);
         Ok(())
     }
 
@@ -173,3 +175,7 @@ impl GenerationLease for GuardedPrimaryLease {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "guarded_lease/tests.rs"]
+mod tests;
