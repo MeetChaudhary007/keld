@@ -109,9 +109,6 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-#[cfg(test)]
-use nix::errno::Errno;
-
 use keld_ipc::link::handshake_client;
 use keld_ipc::{
     BootstrapAdmission, BootstrapListener, BootstrapRejection, BootstrapRejectionObserver,

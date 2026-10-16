@@ -1,3 +1,39 @@
+use std::io;
+use std::os::unix::process::CommandExt as _;
+use std::process::Command;
+use std::sync::{Arc, Mutex, mpsc};
+use std::time::{Duration, Instant};
+
+use super::super::{
+    CONTROL_CLEAR, CONTROL_CLEARED, CONTROL_PREPARE, CONTROL_PREPARED, CONTROL_REGISTERED,
+    CONTROL_REVOKE, CONTROL_REVOKED, CONTROL_SPAWNED, GenerationControlRecord,
+    GuardedPrimaryUpdate, RecoveryState, RestartPolicy, RevocationCause, RoleEvent, RuntimeError,
+    Supervisor, SupervisorOutcome, handshake_client, interrupted_successor_preparation,
+    is_owned_preparation_interruption, lock_recovery, parse_app_link, read_generation_control,
+    run_generation_host, terminate_registered_group, write_generation_control,
+};
+use super::preparation_fixture::GatedUnmarkedFailurePreparer;
+use super::test_support::long_running_command;
+
+#[derive(Debug, Clone, Copy)]
+enum PreparationAttribution {
+    Accepted,
+    Requested,
+    Unattributed,
+}
+
+fn guardian_exchange(
+    guardian: &mut std::os::unix::net::UnixStream,
+    request: &GenerationControlRecord,
+    expected: u8,
+) -> GenerationControlRecord {
+    write_generation_control(guardian, request).expect("write guardian control request");
+    let response = read_generation_control(guardian).expect("read guardian control response");
+    assert_eq!(response.kind, expected);
+    assert_eq!(response.attempt, request.attempt);
+    response
+}
+
 #[test]
 fn generation_host_rejects_out_of_order_revoke_before_prepare() {
     let (host, mut guardian) = std::os::unix::net::UnixStream::pair().expect("KGC1 pair");

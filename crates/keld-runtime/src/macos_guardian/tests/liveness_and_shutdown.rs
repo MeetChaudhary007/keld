@@ -1,36 +1,22 @@
-fn await_stopped_child(pid: u32, deadline: Instant) {
-    loop {
-        let output = Command::new("/bin/ps")
-            .args(["-o", "state=", "-p", &pid.to_string()])
-            .output()
-            .expect("inspect stopped child state");
-        if String::from_utf8(output.stdout)
-            .expect("process state is UTF-8")
-            .trim()
-            .starts_with('T')
-        {
-            break;
-        }
-        assert!(Instant::now() < deadline, "child never stopped");
-        std::thread::yield_now();
-    }
-}
+use std::io;
+use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::TryRecvError;
+use std::sync::{Arc, Mutex, mpsc};
+use std::thread;
+use std::time::{Duration, Instant};
 
-struct AckSender(mpsc::Sender<[u8; SUPERVISED_QUIT_ACK.len()]>);
+use nix::errno::Errno;
+use nix::fcntl::{FcntlArg, FdFlag, OFlag, fcntl};
+use nix::sys::signal::{Signal, kill};
+use nix::unistd::Pid;
 
-impl io::Write for AckSender {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        let ack: [u8; SUPERVISED_QUIT_ACK.len()] = bytes.try_into().map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidData, "unexpected acknowledgment size")
-        })?;
-        self.0.send(ack).map_err(io::Error::other)?;
-        Ok(bytes.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
+use super::super::{
+    GUARDIAN_SHUTDOWN_DEADLINE, HostGuardian, RuntimeError, run_with_registration,
+    terminate_registered_group,
+};
+use super::test_support::{assert_gone, liveness_pipe, long_running_command};
 
 #[test]
 fn registration_failure_still_reaps_the_group() {
@@ -331,7 +317,10 @@ fn zero_exit_guardian_shutdown_reaps_still_registered_group() {
         terminate_registered_group(group_pid).expect("test fallback signal");
         group.wait().expect("test fallback reap");
     }
-    assert!(group_reaped, "zero-status guardian stranded its registered group");
+    assert!(
+        group_reaped,
+        "zero-status guardian stranded its registered group"
+    );
     assert_eq!(owner.group_pid(), None);
 }
 
@@ -341,7 +330,9 @@ fn zero_exit_guardian_shutdown_reaps_still_registered_group() {
 fn dropping_wedged_registered_guardian_enforces_shutdown_deadline() {
     let mut group_command = long_running_command();
     group_command.process_group(0);
-    let mut group = group_command.spawn().expect("spawn isolated registered group");
+    let mut group = group_command
+        .spawn()
+        .expect("spawn isolated registered group");
     let group_pid = group.id();
 
     let mut guardian_command = long_running_command();
@@ -373,7 +364,9 @@ fn dropping_wedged_registered_guardian_enforces_shutdown_deadline() {
     let mut group_status = group.try_wait().expect("inspect registered group");
     while group_status.is_none() && Instant::now() < deadline {
         thread::yield_now();
-        group_status = group.try_wait().expect("observe registered-group retirement");
+        group_status = group
+            .try_wait()
+            .expect("observe registered-group retirement");
     }
     let group_reaped_by_drop = group_status.is_some();
     if !group_reaped_by_drop {

@@ -14,7 +14,8 @@ use super::super::{
     await_guarded_primary_liveness, nix_io_error, set_liveness_nonblocking,
     validate_liveness_bootstrap,
 };
-use super::{GatedUnmarkedFailurePreparer, liveness_pipe};
+use super::preparation_fixture::GatedUnmarkedFailurePreparer;
+use super::test_support::liveness_pipe;
 
 struct TerminalLivenessReadProbe<'a> {
     reader: File,
