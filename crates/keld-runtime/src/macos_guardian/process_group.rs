@@ -139,20 +139,15 @@ pub(super) fn reject_host_registration(
                     "guardian exited unsuccessfully during registration cleanup: {status}"
                 )),
             ));
-            if let Some(group_pid) = group_pid
-                && let Err(error) = terminate_registered_group(group_pid)
-            {
-                failures.push(error);
-            }
         }
-        Err(cleanup) => {
-            failures.push(cleanup);
-            if let Some(group_pid) = group_pid
-                && let Err(error) = terminate_registered_group(group_pid)
-            {
-                failures.push(error);
-            }
-        }
+        Err(cleanup) => failures.push(cleanup),
+    }
+    // A rejected Guardian exiting zero says nothing about the previously
+    // enrolled Bun process group. Always retire it before returning.
+    if let Some(group_pid) = group_pid
+        && let Err(cleanup) = terminate_registered_group(group_pid)
+    {
+        failures.push(cleanup);
     }
     collapse_failures(failures)
 }

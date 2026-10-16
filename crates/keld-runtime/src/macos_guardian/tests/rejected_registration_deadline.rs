@@ -64,3 +64,51 @@ fn dropping_unregistered_bootstrap_reaps_wedged_guardian_within_shutdown_deadlin
         None
     });
 }
+
+// A guardian that exits zero is not proof its enrolled Bun group retired.
+// The rejected-registration path must independently retire that registered
+// group; the test fallback runs only if production fails to do so.
+#[test]
+fn rejected_writer_with_clean_guardian_exit_reaps_enrolled_group() {
+    let mut group_command = long_running_command();
+    group_command.process_group(0);
+    let mut group = group_command.spawn().expect("isolated registered group");
+    let group_pid = group.id();
+    let raw_group = i32::try_from(group_pid).expect("group id fits i32");
+    assert_eq!(
+        nix::unistd::getpgid(Some(Pid::from_raw(raw_group)))
+            .expect("registered group leader is alive")
+            .as_raw(),
+        raw_group,
+        "never signal the test runner process group"
+    );
+
+    let mut guardian_command = Command::new("/bin/sh");
+    guardian_command
+        .args(["-c", "read ignored || exit 0"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut guardian = guardian_command.spawn().expect("successful guardian stand-in");
+    let writer = guardian.stdin.take().expect("sole liveness writer");
+    fcntl(&writer, FcntlArg::F_SETFD(FdFlag::empty()))
+        .expect("force registered-owner rejection");
+    let error = HostGuardian::from_registered_parts(guardian, writer, None, group_pid)
+        .expect_err("inheritable writer must be rejected");
+    assert!(
+        error.to_string().contains("require FD_CLOEXEC"),
+        "unexpected rejected-registration error: {error}"
+    );
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let mut observed = group.try_wait().expect("observe registered Bun group");
+    while observed.is_none() && Instant::now() < deadline {
+        thread::yield_now();
+        observed = group.try_wait().expect("wait for group retirement");
+    }
+    let retired = observed.is_some();
+    if !retired {
+        terminate_registered_group(group_pid).expect("test-owned red-phase group kill");
+        group.wait().expect("test-owned red-phase group reap");
+    }
+    assert!(retired, "rejected Guardian status zero stranded its enrolled Bun group");
+}
