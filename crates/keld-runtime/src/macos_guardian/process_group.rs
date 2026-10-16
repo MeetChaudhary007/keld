@@ -4,7 +4,7 @@ use std::process::{Child, ChildStdin, ExitStatus};
 use std::time::Instant;
 
 use nix::errno::Errno;
-use nix::sys::signal::{Signal, killpg};
+use nix::sys::signal::{Signal, kill, killpg};
 use nix::unistd::{Pid, getpgid};
 
 use super::{
@@ -49,15 +49,20 @@ pub(super) fn validate_group_leader(group: u32) -> Result<i32, RuntimeError> {
 
 pub(super) fn terminate_registered_group(group: u32) -> Result<(), RuntimeError> {
     let group = validate_group_pid(group)?;
-    match killpg(Pid::from_raw(group), Signal::SIGKILL) {
+    let result = killpg(Pid::from_raw(group), Signal::SIGKILL);
+    finish_group_termination(result, || kill(Pid::from_raw(-group), None))
+}
+
+// A reaped process-group *leader* does not prove that its descendants left
+// that group. In particular, an EPERM from killpg must remain fail-closed
+// unless a zero-signal probe of the *group* reports ESRCH.
+pub(super) fn finish_group_termination(
+    result: Result<(), Errno>,
+    probe_group: impl FnOnce() -> Result<(), Errno>,
+) -> Result<(), RuntimeError> {
+    match result {
         Ok(()) | Err(Errno::ESRCH) => Ok(()),
-        Err(Errno::EPERM) if matches!(getpgid(Some(Pid::from_raw(group))), Err(Errno::ESRCH)) => {
-            // A post-Ready link failure may have already signalled the group
-            // while the direct child was exiting. Darwin can report EPERM for
-            // the now-retired numeric group. Require getpgid to prove the
-            // leader gone; never suppress EPERM while that leader resolves.
-            Ok(())
-        }
+        Err(Errno::EPERM) if matches!(probe_group(), Err(Errno::ESRCH)) => Ok(()),
         Err(error) => Err(lifecycle_error(
             "macOS guardian process-group signal",
             io::Error::from_raw_os_error(error as i32),

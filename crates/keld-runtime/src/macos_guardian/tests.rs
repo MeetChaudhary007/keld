@@ -7,6 +7,7 @@ use std::sync::mpsc::{self, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use super::process_group::finish_group_termination;
 use nix::fcntl::{FcntlArg, FdFlag, OFlag, fcntl};
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
@@ -43,6 +44,7 @@ include!("tests/supervised_bootstrap.rs");
 
 include!("tests/liveness_and_shutdown.rs");
 include!("tests/rejected_registration_deadline.rs");
+include!("tests/process_group_failsafe.rs");
 
 include!("tests/guarded_primary_shutdown.rs");
 include!("tests/worker_outcome.rs");

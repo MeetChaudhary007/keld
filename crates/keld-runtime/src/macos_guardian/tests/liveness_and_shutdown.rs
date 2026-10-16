@@ -295,9 +295,10 @@ fn orderly_shutdown_closes_the_same_liveness_writer() {
         .shutdown()
         .expect_err("terminal owner must not reuse its numeric group id");
     assert!(error.to_string().contains("already terminal"), "{error}");
-    terminate_registered_group(group_pid).expect("remove orderly-shutdown test group");
     let group_status = group.wait().expect("wait orderly-shutdown test group");
     assert_eq!(group_status.signal(), Some(9));
+    // Darwin may report EPERM for a killed but unreaped group leader.
+    terminate_registered_group(group_pid).expect("confirm reaped group is gone");
 }
 
 // A zero-status guardian is not proof that its registered Bun group retired.
@@ -479,7 +480,8 @@ fn inheritable_writer_rejection_waits_the_guardian() {
     assert!(error.to_string().contains("require FD_CLOEXEC"), "{error}");
     let guardian_pid = i32::try_from(guardian_pid).expect("guardian pid fits i32");
     assert_eq!(kill(Pid::from_raw(guardian_pid), None), Err(Errno::ESRCH));
-    terminate_registered_group(group_pid).expect("remove writer-rejection test group");
     let group_status = group.wait().expect("wait writer-rejection test group");
     assert_eq!(group_status.signal(), Some(9));
+    // Idempotence must be checked after reaping the zombie leader.
+    terminate_registered_group(group_pid).expect("confirm reaped group is gone");
 }
