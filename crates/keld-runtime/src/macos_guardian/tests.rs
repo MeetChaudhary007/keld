@@ -44,6 +44,7 @@ include!("tests/supervised_bootstrap.rs");
 
 include!("tests/liveness_and_shutdown.rs");
 include!("tests/rejected_registration_deadline.rs");
+include!("tests/pre_registration_host_death.rs");
 include!("tests/process_group_failsafe.rs");
 
 include!("tests/guarded_primary_shutdown.rs");
