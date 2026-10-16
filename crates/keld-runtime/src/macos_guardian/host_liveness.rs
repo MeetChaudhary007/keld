@@ -325,3 +325,24 @@ pub(super) fn await_guarded_primary_liveness(
 
     (liveness_result, quit_accepted, host_dead)
 }
+
+pub(super) fn require_close_on_exec(writer: &impl AsFd) -> Result<(), RuntimeError> {
+    let raw = fcntl(writer.as_fd(), FcntlArg::F_GETFD).map_err(|source| {
+        lifecycle_error(
+            "macOS guardian host-liveness writer flags",
+            nix_io_error(source),
+        )
+    })?;
+    let flags = FdFlag::from_bits_truncate(raw);
+    if flags.contains(FdFlag::FD_CLOEXEC) {
+        Ok(())
+    } else {
+        Err(lifecycle_error(
+            "macOS guardian host-liveness writer validation",
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "host-liveness writer is inheritable; require FD_CLOEXEC",
+            ),
+        ))
+    }
+}

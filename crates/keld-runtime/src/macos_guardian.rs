@@ -80,7 +80,7 @@ use self::generation_wire::{GENERATION_CONTROL_RECORD_LEN, read_generation_contr
 
 use self::host_liveness::{
     await_guarded_primary_liveness, await_host_death, observe_supervised_liveness,
-    set_liveness_nonblocking, validate_liveness_bootstrap,
+    require_close_on_exec, set_liveness_nonblocking, validate_liveness_bootstrap,
 };
 
 use std::io::{self, Read, Write};
@@ -94,7 +94,6 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use nix::errno::Errno;
-use nix::fcntl::{FcntlArg, FdFlag, fcntl};
 
 use keld_ipc::link::handshake_client;
 use keld_ipc::{
@@ -318,27 +317,6 @@ fn fail_before_child(
         ));
     }
     collapse_failures(failures)
-}
-
-fn require_close_on_exec(writer: &impl AsFd) -> Result<(), RuntimeError> {
-    let raw = fcntl(writer.as_fd(), FcntlArg::F_GETFD).map_err(|source| {
-        lifecycle_error(
-            "macOS guardian host-liveness writer flags",
-            nix_io_error(source),
-        )
-    })?;
-    let flags = FdFlag::from_bits_truncate(raw);
-    if flags.contains(FdFlag::FD_CLOEXEC) {
-        Ok(())
-    } else {
-        Err(lifecycle_error(
-            "macOS guardian host-liveness writer validation",
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "host-liveness writer is inheritable; require FD_CLOEXEC",
-            ),
-        ))
-    }
 }
 
 fn unexpected_guardian_exit(group_pid: u32, status: ExitStatus) -> RuntimeError {
