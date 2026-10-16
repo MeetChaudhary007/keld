@@ -1,12 +1,24 @@
 // Real macOS processes, using the shipping GuardedPrimary registration path.
 // The separate Guardian dies from SIGKILL while Bun's pre-exec gate is held.
-use nix::unistd::getpgid;
+use std::io::{self, Read as _, Write as _};
+use std::os::unix::process::CommandExt as _;
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
+
+use nix::sys::signal::{Signal, kill};
+use nix::unistd::{Pid, getpgid};
+
+use super::super::{
+    GUARDIAN_SHUTDOWN_DEADLINE, GuardedPrimary, GuardianBootstrap, run_guarded_primary,
+};
 
 const CRASH_ROLE_ENV: &str = "KELD_TEST_PREEXEC_GUARDIAN_ROLE";
 const CRASH_MARKER_ENV: &str = "KELD_TEST_PREEXEC_BUN_MARKER";
 const CRASH_GATE_ENV: &str = "KELD_TEST_GUARDIAN_PREEXEC_GATE";
 const CRASH_BUN_ENV: &str = "KELD_TEST_GUARDIAN_BUN_BINARY";
-const CRASH_ROLE_TEST: &str = "macos_guardian::tests::guarded_preexec_guardian_role";
+const CRASH_ROLE_TEST: &str =
+    "macos_guardian::tests::guardian_crash_pre_registration::guarded_preexec_guardian_role";
 
 #[test]
 fn guarded_preexec_guardian_role() {
@@ -23,7 +35,7 @@ writeFileSync(process.env.KELD_TEST_PREEXEC_BUN_MARKER, `${process.pid} ${descen
 setInterval(() => {}, 1000);
 "#;
     let bun = std::env::var_os(CRASH_BUN_ENV).expect("verified real Bun executable path");
-    if let Err(error) = super::run_guarded_primary(
+    if let Err(error) = run_guarded_primary(
         io::stdin().lock(),
         move |_| {
             let mut command = Command::new(&bun);
@@ -58,7 +70,10 @@ fn verified_real_bun() -> std::path::PathBuf {
         .arg("--version")
         .output()
         .expect("execute real Bun preflight");
-    assert!(version.status.success(), "real Bun version preflight failed: {version:?}");
+    assert!(
+        version.status.success(),
+        "real Bun version preflight failed: {version:?}"
+    );
     bun
 }
 
@@ -82,7 +97,11 @@ impl Drop for GuardianCrashFixture {
     }
 }
 
-fn guard_crash_fixture(socket: &std::path::Path, marker: &std::path::Path, bun: &std::path::Path) -> GuardianCrashFixture {
+fn guard_crash_fixture(
+    socket: &std::path::Path,
+    marker: &std::path::Path,
+    bun: &std::path::Path,
+) -> GuardianCrashFixture {
     let mut command = Command::new(std::env::current_exe().expect("test executable"));
     command
         .args(["--exact", CRASH_ROLE_TEST, "--nocapture"])
@@ -129,7 +148,10 @@ fn await_spawned_gate(
                 return (stream, pid, guardian);
             }
             Err(source) if source.kind() == io::ErrorKind::WouldBlock => {
-                assert!(Instant::now() < deadline, "Guardian never reached pre-exec gate");
+                assert!(
+                    Instant::now() < deadline,
+                    "Guardian never reached pre-exec gate"
+                );
                 thread::sleep(Duration::from_millis(3));
             }
             Err(source) => panic!("accept pre-exec PID: {source}"),
@@ -147,12 +169,18 @@ fn group_and_child_gone(group: i32, descendant: Option<i32>) {
             kill(Pid::from_raw(group), None),
             Err(nix::errno::Errno::ESRCH)
         ) && descendant.is_none_or(|pid| {
-            matches!(kill(Pid::from_raw(pid), None), Err(nix::errno::Errno::ESRCH))
+            matches!(
+                kill(Pid::from_raw(pid), None),
+                Err(nix::errno::Errno::ESRCH)
+            )
         });
         if gone {
             return;
         }
-        assert!(Instant::now() < deadline, "Bun group or descendant survived Guardian SIGKILL");
+        assert!(
+            Instant::now() < deadline,
+            "Bun group or descendant survived Guardian SIGKILL"
+        );
         thread::sleep(Duration::from_millis(3));
     }
 }
@@ -163,24 +191,40 @@ fn real_guardian_crash_at_gate(release_registration: bool) {
     let socket = temp.path().join("preexec.sock");
     let marker = temp.path().join("bun-and-descendant.pid");
     let listener = std::os::unix::net::UnixListener::bind(&socket).expect("test event socket");
-    listener.set_nonblocking(true).expect("bounded event accept");
+    listener
+        .set_nonblocking(true)
+        .expect("bounded event accept");
     let mut fixture = guard_crash_fixture(&socket, &marker, &bun);
     let (mut gate, group, reported_guardian) = await_spawned_gate(&listener);
-    assert_eq!(reported_guardian, fixture.primary.guardian_pid(), "unrelated PID cannot supply Guardian's gate receipt");
+    assert_eq!(
+        reported_guardian,
+        fixture.primary.guardian_pid(),
+        "unrelated PID cannot supply Guardian's gate receipt"
+    );
     fixture.group_pid = Some(group);
     assert_eq!(
         getpgid(Some(Pid::from_raw(group))),
         Ok(Pid::from_raw(group)),
         "pre-exec child owns the isolated group"
     );
-    assert_eq!(fixture.primary.group_pid(), None, "no premature registration");
-    assert!(!marker.exists(), "Bun executed before the host owned its group");
+    assert_eq!(
+        fixture.primary.group_pid(),
+        None,
+        "no premature registration"
+    );
+    assert!(
+        !marker.exists(),
+        "Bun executed before the host owned its group"
+    );
     let mut descendant = None;
     if release_registration {
         gate.write_all(b"R").expect("permit host registration");
         let deadline = Instant::now() + GUARDIAN_SHUTDOWN_DEADLINE;
         while fixture.primary.group_pid() != Some(group.cast_unsigned()) {
-            fixture.primary.poll_fatal().expect("registered Guardian healthy");
+            fixture
+                .primary
+                .poll_fatal()
+                .expect("registered Guardian healthy");
             assert!(Instant::now() < deadline, "group was not registered");
             thread::yield_now();
         }
@@ -198,7 +242,10 @@ fn real_guardian_crash_at_gate(release_registration: bool) {
             thread::yield_now();
         };
         assert_eq!(ids[0], group);
-        assert_eq!(getpgid(Some(Pid::from_raw(ids[1]))), Ok(Pid::from_raw(group)));
+        assert_eq!(
+            getpgid(Some(Pid::from_raw(ids[1]))),
+            Ok(Pid::from_raw(group))
+        );
         descendant = Some(ids[1]);
     }
     // SIGKILL is directed only at the independently spawned Guardian. Before

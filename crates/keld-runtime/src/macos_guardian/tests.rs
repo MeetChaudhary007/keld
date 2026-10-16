@@ -40,10 +40,10 @@ include!("tests/generation_host.rs");
 include!("tests/supervised_bootstrap.rs");
 
 include!("tests/liveness_and_shutdown.rs");
-mod rejected_registration_deadline;
-include!("tests/pre_registration_host_death.rs");
-include!("tests/guardian_crash_pre_registration.rs");
+mod guardian_crash_pre_registration;
+mod pre_registration_host_death;
 mod process_group_failsafe;
+mod rejected_registration_deadline;
 
 include!("tests/guarded_primary_shutdown.rs");
 mod worker_outcome;
