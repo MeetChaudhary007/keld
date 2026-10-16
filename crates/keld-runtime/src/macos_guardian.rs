@@ -15,6 +15,8 @@ mod recovery_state;
 use self::recovery_state::{RecoveryState, lock_recovery};
 
 mod host_liveness;
+#[cfg(test)]
+use self::host_liveness::observe_guarded_liveness;
 
 mod generation_wire;
 
@@ -77,7 +79,7 @@ use self::generation_wire::{
 use self::generation_wire::{GENERATION_CONTROL_RECORD_LEN, read_generation_control};
 
 use self::host_liveness::{
-    await_host_death, observe_guarded_liveness, observe_supervised_liveness,
+    await_guarded_primary_liveness, await_host_death, observe_supervised_liveness,
     set_liveness_nonblocking, validate_liveness_bootstrap,
 };
 
@@ -302,67 +304,6 @@ where
     } else {
         Err(collapse_failures(failures))
     }
-}
-
-fn await_guarded_primary_liveness(
-    liveness: &mut (impl Read + AsFd),
-    supervisor: &Supervisor,
-    quit_ack: &mut impl Write,
-    host_unavailable: &AtomicBool,
-    preparation_cancelled: &AtomicBool,
-) -> (Result<(), RuntimeError>, bool, bool) {
-    let mut liveness_result = Ok(());
-    let mut quit_accepted = false;
-    let mut orderly_requested = false;
-    let mut host_dead = false;
-    loop {
-        match observe_guarded_liveness(
-            liveness,
-            supervisor,
-            &mut quit_accepted,
-            &mut orderly_requested,
-            quit_ack,
-            preparation_cancelled,
-        ) {
-            Ok(true) => {
-                host_dead = true;
-                if !quit_accepted && !orderly_requested {
-                    host_unavailable.store(true, Ordering::Release);
-                }
-                supervisor.shutdown();
-                break;
-            }
-            Ok(false) => {}
-            Err(error) => {
-                liveness_result = Err(error);
-                // A liveness fault interrupts a pending read as a fatal error,
-                // never as the privately attributed stop marker.
-                host_unavailable.store(true, Ordering::Release);
-                supervisor.shutdown();
-                break;
-            }
-        }
-        match supervisor.recv_event(GENERATION_CONTROL_POLL) {
-            Some(crate::SupervisorEvent::Stopped) if quit_accepted => {
-                // Supervisor stop does not terminate this persistent guardian.
-                // Core may still own real native retirement before host EOF.
-                if let Err(error) = set_liveness_nonblocking(liveness, false) {
-                    liveness_result = Err(error);
-                    break;
-                }
-            }
-            Some(
-                crate::SupervisorEvent::RespawnFailed
-                | crate::SupervisorEvent::Failed { .. }
-                | crate::SupervisorEvent::CrashLoopTripped
-                | crate::SupervisorEvent::Stopped,
-            ) => break,
-            None => thread::yield_now(),
-            Some(_) => {}
-        }
-    }
-
-    (liveness_result, quit_accepted, host_dead)
 }
 
 fn fail_before_child(
