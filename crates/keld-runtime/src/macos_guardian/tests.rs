@@ -1,19 +1,13 @@
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
-
 use super::{
     CONTROL_CLEAR, CONTROL_CLEARED, CONTROL_PREPARE, CONTROL_PREPARED, CONTROL_REVOKE,
-    CONTROL_REVOKED, ChildPreparer, Command, GENERATION_CONTROL_POLL, GUARDIAN_SHUTDOWN_DEADLINE,
+    CONTROL_REVOKED, ChildPreparer, GENERATION_CONTROL_POLL, GUARDIAN_SHUTDOWN_DEADLINE,
     GenerationControlPeer, GenerationControlReader, GenerationControlRecord,
     GenerationProvisionFence, GuardedPrimaryLease, GuardedPrimaryPreparer, GuardedPrimaryUpdate,
-    Instant, JoinHandle, PreparedChild, Read, Receiver, RecoveryState, RegisteredPrimaryGeneration,
-    RestartPolicy, RevocationCause, RoleEvent, RuntimeError, SUPERVISED_QUIT_ACCEPTED, Sender,
-    Supervisor, SupervisorOutcome, io, is_owned_preparation_interruption, lifecycle_error,
-    lock_generation, lock_recovery, observe_guarded_liveness, parse_app_link, run_generation_host,
-    runtime_io_kind, set_liveness_nonblocking, thread, validate_liveness_bootstrap,
-    write_generation_control,
+    PreparedChild, RecoveryState, RegisteredPrimaryGeneration, RestartPolicy, RevocationCause,
+    RoleEvent, RuntimeError, SUPERVISED_QUIT_ACCEPTED, Supervisor, SupervisorOutcome,
+    is_owned_preparation_interruption, lifecycle_error, lock_generation, lock_recovery,
+    observe_guarded_liveness, parse_app_link, run_generation_host, runtime_io_kind,
+    set_liveness_nonblocking, validate_liveness_bootstrap, write_generation_control,
 };
 
 mod generation_control_wire;
@@ -43,29 +37,26 @@ mod terminal_liveness;
 // private records; run_generation_host remains the actual mint/lease owner.
 mod runtime_race_validation {
     use super::{
-        Arc, AtomicBool, CONTROL_CLEAR, CONTROL_CLEARED, CONTROL_PREPARE, CONTROL_PREPARED,
-        CONTROL_REVOKE, CONTROL_REVOKED, ChildPreparer, Command, Duration, GENERATION_CONTROL_POLL,
-        GUARDIAN_SHUTDOWN_DEADLINE, GenerationControlPeer, GenerationControlReader,
-        GenerationControlRecord, GenerationProvisionFence, GuardedPrimaryLease,
-        GuardedPrimaryPreparer, GuardedPrimaryUpdate, Instant, JoinHandle, Mutex, Ordering,
-        PreparedChild, Read, Receiver, RecoveryState, RegisteredPrimaryGeneration, RestartPolicy,
-        RevocationCause, RoleEvent, RuntimeError, SUPERVISED_QUIT_ACCEPTED, Sender, Supervisor,
-        SupervisorOutcome, assert_gone, io, is_owned_preparation_interruption, lifecycle_error,
-        liveness_pipe, lock_generation, lock_recovery, mpsc, observe_guarded_liveness,
-        parse_app_link, run_generation_host, runtime_io_kind, set_liveness_nonblocking, thread,
+        CONTROL_CLEAR, CONTROL_CLEARED, CONTROL_PREPARE, CONTROL_PREPARED, CONTROL_REVOKE,
+        CONTROL_REVOKED, ChildPreparer, GENERATION_CONTROL_POLL, GUARDIAN_SHUTDOWN_DEADLINE,
+        GenerationControlPeer, GenerationControlReader, GenerationControlRecord,
+        GenerationProvisionFence, GuardedPrimaryLease, GuardedPrimaryPreparer,
+        GuardedPrimaryUpdate, PreparedChild, RecoveryState, RegisteredPrimaryGeneration,
+        RestartPolicy, RevocationCause, RoleEvent, RuntimeError, SUPERVISED_QUIT_ACCEPTED,
+        Supervisor, SupervisorOutcome, assert_gone, is_owned_preparation_interruption,
+        lifecycle_error, liveness_pipe, lock_generation, lock_recovery, observe_guarded_liveness,
+        parse_app_link, run_generation_host, runtime_io_kind, set_liveness_nonblocking,
         validate_liveness_bootstrap, write_generation_control,
     };
-    use std::io::Write as _;
-    use std::net::Shutdown;
-    use std::os::unix::net::UnixStream;
-    use std::sync::TryLockError;
 
-    include!("tests/runtime_race_validation/records_and_cut_types.rs");
-    include!("tests/runtime_race_validation/private_record_relay.rs");
-    include!("tests/runtime_race_validation/control_plane.rs");
-    include!("tests/runtime_race_validation/delivery_fixture.rs");
-    include!("tests/runtime_race_validation/delivery_assertions.rs");
-    include!("tests/runtime_race_validation/ownership_races.rs");
+    mod records_and_cut_types;
+    use self::records_and_cut_types::{COLLECTION, receive_record, timed_pair};
+    mod control_plane;
+    mod delivery_assertions;
+    mod delivery_cut_oracles;
+    mod delivery_fixture;
+    mod ownership_races;
+    mod private_record_relay;
 }
 
 mod test_support;
