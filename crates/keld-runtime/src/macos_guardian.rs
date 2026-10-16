@@ -47,8 +47,8 @@ pub use self::bootstrap::GuardianBootstrap;
 mod supervision_runner;
 pub use self::supervision_runner::run_guarded_primary;
 use self::supervision_runner::{
-    connect_guardian_registration, run_supervised_with_registration, run_with_registration,
-    write_group_registration,
+    connect_guardian_registration, fail_before_child, run_supervised_with_registration,
+    run_with_registration, write_group_registration,
 };
 
 mod generation_host;
@@ -219,20 +219,6 @@ where
         revoke_registered_resources,
     )
     .map(|(_, _, output)| output)
-}
-
-fn fail_before_child(
-    error: RuntimeError,
-    revoke_registered_resources: impl FnOnce() -> io::Result<()>,
-) -> RuntimeError {
-    let mut failures = vec![error];
-    if let Err(source) = revoke_registered_resources() {
-        failures.push(lifecycle_error(
-            "macOS guardian pre-child registered-resource revocation",
-            source,
-        ));
-    }
-    collapse_failures(failures)
 }
 
 #[cfg(test)]

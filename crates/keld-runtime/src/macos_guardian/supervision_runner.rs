@@ -4,10 +4,9 @@ use super::{
     GenerationControlPeer, GenerationControlReader, GuardedPrimaryPreparer, GuardianReport,
     REGISTRATION_ENV, REGISTRATION_LEN, REGISTRATION_MAGIC, Read, RestartPolicy, RuntimeError,
     Stdio, SupervisedGuardianPreparer, Supervisor, SupervisorOutcome, Write,
-    await_guarded_primary_liveness, await_host_death, collapse_failures, fail_before_child,
-    handshake_client, io, lifecycle_error, observe_supervised_liveness, parse_app_link,
-    set_liveness_nonblocking, terminate_registered_group, validate_group_pid,
-    validate_liveness_bootstrap,
+    await_guarded_primary_liveness, await_host_death, collapse_failures, handshake_client, io,
+    lifecycle_error, observe_supervised_liveness, parse_app_link, set_liveness_nonblocking,
+    terminate_registered_group, validate_group_pid, validate_liveness_bootstrap,
 };
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
@@ -366,4 +365,18 @@ where
     } else {
         Err(collapse_failures(failures))
     }
+}
+
+pub(super) fn fail_before_child(
+    error: RuntimeError,
+    revoke_registered_resources: impl FnOnce() -> io::Result<()>,
+) -> RuntimeError {
+    let mut failures = vec![error];
+    if let Err(source) = revoke_registered_resources() {
+        failures.push(lifecycle_error(
+            "macOS guardian pre-child registered-resource revocation",
+            source,
+        ));
+    }
+    collapse_failures(failures)
 }
