@@ -11,7 +11,7 @@ function Assert-GateRefuses([string]$Case, [string[]]$GateArgs, [string]$Reason)
     # harness exception before the child's exit code can be inspected.
     $ErrorActionPreference = 'Continue'
     try {
-        $output = (& $powershell '-NoProfile' '-NonInteractive' '-ExecutionPolicy' 'Bypass' '-File' $gate @GateArgs 2>&1 | Out-String)
+        $output = (& $powershell '-NoProfile' '-NonInteractive' '-File' $gate @GateArgs 2>&1 | Out-String)
         $exit = $LASTEXITCODE
     } finally {
         $ErrorActionPreference = 'Stop'
