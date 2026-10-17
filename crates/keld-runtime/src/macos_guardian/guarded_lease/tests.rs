@@ -26,6 +26,9 @@ const ROOT: &str = "KELD_GUARDED_ACK_TEST_ROOT";
 const SELECTOR: &str = "macos_guardian::guarded_lease::tests::native_role";
 const BOUND: Duration = Duration::from_secs(5);
 
+#[path = "tests/native_activity.rs"]
+mod native_activity;
+
 #[test]
 fn native_role() {
     let Ok(role) = std::env::var(ROLE) else {
@@ -136,12 +139,64 @@ impl NativeGroup {
         self.root.path().join(format!("{role}.sock"))
     }
 
+    // The retained original leader Child is deliberately unreaped until
+    // NativeGroup::Drop. Query the OS process-group census, not the observer
+    // sockets: a process can close its listener and remain fully executable.
+    // Darwin reports SIGKILLed, unreaped group members as Z (zombies).
+    fn has_executing_group_members(&self) -> io::Result<bool> {
+        let group = self.leader.id().to_string();
+        let output = Command::new("/bin/ps")
+            .args(["-g", group.as_str(), "-o", "stat="])
+            .output()?;
+        Self::parse_group_census(&output)
+    }
+
+    fn parse_group_census(output: &std::process::Output) -> io::Result<bool> {
+        if !output.status.success() {
+            // The original leader Child remains unreaped for this entire
+            // observation. Even if ps exits by SIGKILL with no output, that
+            // says nothing about the native group's execution. Fail closed
+            // for EVERY non-success status rather than inferring absence.
+            return Err(io::Error::other(format!(
+                "native group census denied: status={:?}, stderr_bytes={}",
+                output.status.code(),
+                output.stderr.len()
+            )));
+        }
+        let statuses = std::str::from_utf8(&output.stdout)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let mut observed = false;
+        let mut executing = false;
+        for state in statuses
+            .lines()
+            .map(str::trim)
+            .filter(|state| !state.is_empty())
+        {
+            observed = true;
+            executing |= !state.starts_with('Z');
+        }
+        if !observed {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "successful native process-group census returned no process-state rows",
+            ));
+        }
+        Ok(executing)
+    }
+
     fn assert_stopped(&self) {
-        let deadline = Instant::now() + BOUND;
+        self.assert_stopped_with_probe_until(fresh_response, Instant::now() + BOUND);
+    }
+
+    fn assert_stopped_with_probe_until(
+        &self,
+        mut activity: impl FnMut(&Path) -> io::Result<u32>,
+        deadline: Instant,
+    ) {
         for role in ["leader", "descendant"] {
             let socket = self.socket(role);
             loop {
-                match fresh_response(&socket) {
+                match activity(&socket) {
                     Ok(_) => {}
                     Err(error)
                         if matches!(
@@ -150,9 +205,18 @@ impl NativeGroup {
                                 | io::ErrorKind::ConnectionReset
                                 | io::ErrorKind::UnexpectedEof
                                 | io::ErrorKind::BrokenPipe
-                        ) =>
+                        ) || error.raw_os_error() == Some(nix::libc::EINVAL) =>
                     {
-                        break;
+                        // A Darwin peer disappearing during a connect/read
+                        // can return EINVAL (not solely ConnectionRefused).
+                        // Accept it ONLY after the independent kernel group
+                        // census proves that no original-group member runs.
+                        if !self
+                            .has_executing_group_members()
+                            .expect("independent native process-group activity observer")
+                        {
+                            break;
+                        }
                     }
                     Err(error)
                         if matches!(
@@ -165,7 +229,7 @@ impl NativeGroup {
                 }
                 assert!(
                     Instant::now() < deadline,
-                    "{role} still executes or lacks a closed socket after product revoke, before fixture cleanup"
+                    "{role} still executes or native group has running members after product revoke, before fixture cleanup"
                 );
                 thread::yield_now();
             }
