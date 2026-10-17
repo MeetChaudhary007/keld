@@ -16,10 +16,10 @@ python_command := if os() == "windows" { "python" } else { "python3" }
 hello:
     cargo run -p keld-host --bin keld-host -- --hello
 
-# Run every applicable CI gate locally (deny requires `cargo install cargo-deny --locked`).
 # Independent policy gates run together. TypeScript then Rust run one at a time:
 # measured compiler and host-test deadlines cannot share the policy batch's load.
 # gitleaks stays GitHub-only (pinned OSS CLI in .github/workflows/ci.yml).
+# Run all applicable local CI gates (deny requires `cargo install cargo-deny --locked`).
 ci:
     {{python_command}} -B tools/ci_local.py ci-inventory
 
@@ -252,9 +252,9 @@ fmt-check:
 clippy:
     cargo clippy --workspace --all-targets -- -D warnings
 
-# CI gate: tests (unit + integration + doctests). Matches CI nextest profile.
 # The Linux host suite owns real GTK windows, so preserve its virtual-display
 # contract for the full root gate as well as the routed Ubuntu package lane.
+# Run workspace tests (matches CI nextest profile: unit + integration + doctests).
 test:
     #!/usr/bin/env bash
     set -euo pipefail
