@@ -6,9 +6,12 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use nix::sys::signal::{Signal, kill};
+use nix::sys::signal::kill;
 use nix::unistd::{Pid, getpgid};
 
+use super::super::process_group::{
+    GroupIdentity, terminate_attested_group, validate_guardian_child_group,
+};
 use super::super::{
     GUARDIAN_SHUTDOWN_DEADLINE, GuardedPrimary, GuardianBootstrap, run_guarded_primary,
 };
@@ -21,6 +24,8 @@ const CRASH_BUN_ENV: &str = "KELD_TEST_GUARDIAN_BUN_BINARY";
 const CRASH_ROLE_TEST: &str =
     "macos_guardian::tests::guardian_crash_pre_registration::guarded_preexec_guardian_role";
 
+#[path = "guardian_crash_pre_registration/cleanup_authority.rs"]
+mod cleanup_authority;
 mod retained_ack;
 
 #[test]
@@ -56,27 +61,24 @@ setInterval(() => {}, 1000);
 
 struct GuardianCrashFixture {
     primary: GuardedPrimary,
-    group_pid: Option<i32>,
-    descendant_pid: Option<i32>,
+    /// Kernel birth acquired while this group was the original Guardian's
+    /// live direct child. A private fixture marker/PGID alone grants nothing.
+    group_birth: Option<GroupIdentity>,
 }
 
 impl Drop for GuardianCrashFixture {
     fn drop(&mut self) {
-        // The failure cleanup is intentionally separate from assertions and
-        // can only signal a verified, test-owned process group.
+        // The failure cleanup is intentionally separate from assertions. An
+        // old marker PID or current same-group membership is NOT authority
+        // to signal a possibly recycled/foreign numeric group.
         let _ = self.primary.child.kill();
         let _ = self.primary.poll_fatal();
-        if let Some(group) = self.group_pid {
-            let pid = Pid::from_raw(group);
-            // An already-reaped leader can leave its same-group descendant
-            // alive. Validate either *owned* member before emergency killpg.
-            let leader_member = getpgid(Some(pid)) == Ok(pid);
-            let descendant_member = self
-                .descendant_pid
-                .is_some_and(|child| getpgid(Some(Pid::from_raw(child))) == Ok(pid));
-            if (leader_member || descendant_member) && pid != nix::unistd::getpgrp() {
-                let _ = nix::sys::signal::killpg(pid, Signal::SIGKILL);
-            }
+        // A synthetic test Guardian has no generation worker or liveness
+        // writer. Retain its actual Child until reaped even if poll_fatal saw
+        // the SIGKILL before the kernel published its terminal status.
+        let _ = self.primary.child.wait();
+        if let Some(group) = self.group_birth.take() {
+            let _ = terminate_attested_group(group);
         }
     }
 }
@@ -93,8 +95,7 @@ fn guard_crash_fixture(
         .expect("actual authenticated Guardian control bootstrap");
     GuardianCrashFixture {
         primary,
-        group_pid: None,
-        descendant_pid: None,
+        group_birth: None,
     }
 }
 
@@ -164,7 +165,13 @@ fn real_guardian_crash_at_gate(release_registration: bool) {
         fixture.primary.guardian_pid(),
         "unrelated PID cannot supply Guardian's gate receipt"
     );
-    fixture.group_pid = Some(group);
+    fixture.group_birth = Some(
+        validate_guardian_child_group(
+            u32::try_from(group).expect("real positive native group"),
+            fixture.primary.guardian_pid(),
+        )
+        .expect("the pre-exec group belongs to the retained original Guardian"),
+    );
     assert_eq!(
         getpgid(Some(Pid::from_raw(group))),
         Ok(Pid::from_raw(group)),
@@ -210,7 +217,6 @@ fn real_guardian_crash_at_gate(release_registration: bool) {
             Ok(Pid::from_raw(group))
         );
         descendant = Some(ids[1]);
-        fixture.descendant_pid = Some(ids[1]);
     }
     // SIGKILL is directed only at the independently spawned Guardian. Before
     // registration, the permit pipe must close promptly through EOF, rather
@@ -236,7 +242,7 @@ fn real_guardian_crash_at_gate(release_registration: bool) {
         );
         assert!(!marker.exists(), "unregistered Bun was allowed to execute");
     }
-    fixture.group_pid = None;
+    fixture.group_birth = None;
 }
 
 #[test]
