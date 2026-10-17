@@ -254,7 +254,7 @@ clippy:
 
 # The Linux host suite owns real GTK windows, so preserve its virtual-display
 # contract for the full root gate as well as the routed Ubuntu package lane.
-# Run workspace tests (matches CI nextest profile: unit + integration + doctests).
+# Run workspace tests (matches CI nextest profile: unit + integration tests; nextest does not run doctests).
 test:
     #!/usr/bin/env bash
     set -euo pipefail

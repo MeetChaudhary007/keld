@@ -174,8 +174,9 @@ Recipes are grouped by developer task and lifecycle stage:
     concludes an active task record with a closeout receipt.
   - `just work-clean <task-name> --session <id> [--apply --receipt <receipt-path>]`:
     dry-run inspection of scratch by default. With `--apply` and a matching receipt, deletes
-    **only admitted, released-session scratch** under `.keld-work/tmp/`. It **preserves** the
-    Git worktree, branch, caches, and evidence; it does *not* retire or remove the Git worktree.
+    **only admitted, released-session scratch** under `.keld-work/tmp/` (primary session scratch)
+    and, when present, the legacy path `.keld-work/sessions/<session>/scratch`. It **preserves**
+    the Git worktree, branch, caches, and evidence; it does *not* retire or remove the Git worktree.
 - **Optional maintainer-only / network workflows:**
   - `just research-sync` · `just hooks-install`: maintainer research synchronization and
     checkout hook installation. These recipes are **strictly optional** and not required
