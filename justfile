@@ -112,31 +112,31 @@ agent-context-test:
     {{python_command}} -B tools/test_session_closeout_hook.py
     {{python_command}} -B tools/test_workspace.py
 
-# Create an isolated worktree branch for a task or single concern.
+# Allocate an isolated task worktree below .keld-work/ (usage: just work-start <issue-id> <slug> [--session <id>]).
 work-start *args:
     #!/usr/bin/env bash
     set -euo pipefail
     {{python_command}} -B tools/workspace.py start "$@"
 
-# Inspect status of managed worktrees and task branches (read-only).
+# Inspect status of managed worktrees and task branches (read-only; pass --sizes for disk usage).
 work-status *args:
     #!/usr/bin/env bash
     set -euo pipefail
     {{python_command}} -B tools/workspace.py status "$@"
 
-# Run a command inside an isolated worktree directory.
+# Execute a command inside a task worktree (usage: just work-run <task-name> --session <id> -- <cmd>).
 work-run *args:
     #!/usr/bin/env bash
     set -euo pipefail
     {{python_command}} -B tools/workspace.py run "$@"
 
-# Check and conclude an active worktree.
+# Conclude an active task record with a closeout receipt (requires task, --session, and --receipt).
 work-finish *args:
     #!/usr/bin/env bash
     set -euo pipefail
     {{python_command}} -B tools/workspace.py finish "$@"
 
-# Inspect or prune stale worktrees (read-only by default; pass --apply to mutate).
+# Inspect or delete released-session scratch (dry run by default; pass task, session, --receipt and --apply to delete scratch).
 work-clean *args:
     #!/usr/bin/env bash
     set -euo pipefail

@@ -120,8 +120,14 @@ just --show ci       # safely inspect recipe definition and dependencies without
 just fmt-check       # fast, non-mutating formatting check
 ```
 
-If optional tools (like `cargo-nextest` or Docker) are not installed, raw `cargo` commands
-serve as fallbacks (listed in the reference table below).
+When optional tools are missing, specific fallbacks apply to individual components
+(e.g., `cargo test --workspace` can run unit tests when `cargo-nextest` is not installed),
+but raw Cargo commands cannot replace the complete pinned `just ci` gate (which runs
+independent policy gates, TypeScript compilation, formatting, clippy, docs, and dependency
+verification). Similarly, Mermaid diagram rendering in `just ci-full` and
+`just mermaid-render-check` strictly requires a Docker-compatible engine; raw Cargo commands
+cannot render SVG diagrams. State unavailable tools and skipped gates honestly rather
+than claiming a full gate pass.
 
 #### 3.3.2 Task-oriented command guide
 
@@ -134,11 +140,11 @@ Recipes are grouped by developer task and lifecycle stage:
     follow [Run the current demo](README.md#run-the-current-demo) using
     `keld create → doctor → dev`.
 - **Fast edit loop (rapid local feedback):**
-  - `just fmt-check`: verifies Rust code formatting without touching files (read-only, fast).
-  - `just fmt`: formats Rust files in place (**file-mutating**).
+  - `just fmt-check`: verifies Rust code formatting without touching files (fast check).
+  - `just fmt`: formats Rust files in place (**modifies tracked source files**).
   - `just clippy`: runs workspace lints with warnings treated as errors (`-D warnings`).
-  - Scoped tests: `cargo nextest run -p <crate> -- <filter>` runs focused tests without the
-    full suite overhead.
+  - Scoped tests: `cargo nextest run -p <crate> -- <filter>` runs focused tests without
+    the full suite overhead.
 - **Pre-PR verification gates:**
   - `just ci`: standard local pre-PR gate. Runs independent policy gates in parallel,
     followed by TypeScript compilation, formatting checks, clippy, workspace tests,
@@ -147,21 +153,29 @@ Recipes are grouped by developer task and lifecycle stage:
   - `just ci-full`: full assurance mode. Runs `just ci` with full-corpus Mermaid validation
     and digest-pinned container rendering (requires a Docker-compatible engine).
 - **Docs, architecture, and generated sources:**
-  - `just llms` (**file-mutating** generator) · `just llms-check` · `just llms-test`:
-    maintains the agent-readable `llms.txt` corpus.
-  - `just product-status` (**file-mutating** generator) · `just product-status-check` ·
+  - `just llms` (**tracked file-mutating** generator) · `just llms-check` · `just llms-test`:
+    maintains the agent-readable `llms.txt` and `llms-full.txt` corpus.
+  - `just product-status` (**tracked file-mutating** generator) · `just product-status-check` ·
     `just product-status-test`: renders the Markdown view from the canonical TSV ledger.
   - `just doc-placeholders-check` · `just doc-placeholders-test`: enforces that no template
     placeholders reach checked-in prose.
   - `just mermaid-check` · `just mermaid-test` · `just mermaid-render-check`: validates
     Mermaid diagrams and renders SVG assets via container.
 - **Managed worktrees & session helpers:**
-  - `just work-start <task-id>`: provisions an isolated worktree branch for a single concern.
-  - `just work-status`: inspects active worktrees and task branches (read-only).
-  - `just work-run <task-id> <cmd>`: executes a command inside a managed worktree.
-  - `just work-finish <task-id>`: checks and concludes an active worktree.
-  - `just work-clean`: inspects stale worktrees (read-only by default; pass `--apply` for
-    **mutating cleanup**).
+  - `just work-start <tracker-id> <slug> [--session <id>]`: allocates an isolated task
+    worktree under `.keld-work/worktrees/<task-name>` (e.g.,
+    `just work-start kel-245 workspace --session manual-session-1`).
+  - `just work-status [--sizes]`: inspects active worktrees, task allocations, and session
+    evidence without modifying state (`--sizes` reports disk usage).
+  - `just work-run <task-name> --session <id> -- <command>`: executes a command inside the
+    designated task worktree (e.g.,
+    `just work-run kel-245-workspace --session manual-session-1 -- just ci`).
+  - `just work-finish <task-name> --session <id> --receipt <receipt-path>`: checks and
+    concludes an active task record with a closeout receipt.
+  - `just work-clean <task-name> --session <id> [--apply --receipt <receipt-path>]`:
+    dry-run inspection of scratch by default. With `--apply` and a matching receipt, deletes
+    **only admitted, released-session scratch** under `.keld-work/tmp/`. It **preserves** the
+    Git worktree, branch, caches, and evidence; it does *not* retire or remove the Git worktree.
 - **Optional maintainer-only / network workflows:**
   - `just research-sync` · `just hooks-install`: maintainer research synchronization and
     checkout hook installation. These recipes are **strictly optional** and not required
@@ -169,20 +183,20 @@ Recipes are grouped by developer task and lifecycle stage:
 
 #### 3.3.3 Command properties & safety reference
 
-| Recipe | Equivalent command / fallback | Side effect | Cost | Notes |
+| Recipe | Primary fallback | Filesystem impact | Cost | Notes |
 |---|---|---|---|---|
-| `just hello` | `cargo run -p keld-host --bin keld-host -- --hello` | Read-only | Moderate | Diagnostic window only; not the app-session demo |
-| `just fmt-check` | `cargo fmt --all --check` | Read-only | Fast | Non-mutating format gate |
-| `just fmt` | `cargo fmt --all` | **File-mutating** | Fast | Overwrites unformatted Rust files |
-| `just clippy` | `cargo clippy --workspace --all-targets -- -D warnings` | Read-only | Moderate | Warnings treated as errors |
-| `just test` | `cargo nextest run --workspace --profile ci` (fallback: `cargo test --workspace`) | Read-only | Heavy | Runs workspace test suite |
-| `just doc` | `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps` | Read-only | Moderate | Builds rustdoc |
-| `just deny` | `cargo deny check` | Read-only | Fast | Requires `cargo-deny` |
-| `just ci` | Full local gate (policy + TS + fmt + clippy + test + doc + deny) | Read-only | Heavy | Sole gate inventory defined in `justfile`; use Git Bash on Windows |
-| `just ci-full` | `just ci` + forced container Mermaid rendering | Read-only | Heavy | Requires Docker-compatible engine |
-| `just llms` | `tools/llms_docs.rs generate .` | **File-mutating** | Fast | Regenerates `llms.txt` from sources |
-| `just product-status` | `tools/product_status.rs generate .` | **File-mutating** | Fast | Regenerates Markdown view from canonical TSV |
-| `just work-clean` | Worktree inspection (or cleanup with `--apply`) | **Mutating with `--apply`** | Fast | Safe inspection by default; `--apply` removes dead worktrees |
+| `just hello` | `cargo run -p keld-host --bin keld-host -- --hello` | Writes `target/` artifacts | Moderate | Diagnostic window only; not the app-session demo |
+| `just fmt-check` | `cargo fmt --all --check` | None (read-only) | Fast | Fails on unformatted code |
+| `just fmt` | `cargo fmt --all` | **Modifies tracked files** | Fast | Overwrites unformatted Rust files in place |
+| `just clippy` | `cargo clippy --workspace --all-targets -- -D warnings` | Writes `target/` artifacts | Moderate | Warnings treated as errors |
+| `just test` | `cargo nextest run --workspace --profile ci` (fallback: `cargo test --workspace`) | Writes `target/` artifacts | Heavy | Nextest enforces zero retries; raw `cargo test` is partial fallback |
+| `just doc` | `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps` | Writes `target/doc/` | Moderate | Builds rustdoc without dependencies |
+| `just deny` | `cargo deny check` | None | Fast | Requires `cargo-deny` |
+| `just ci` | None (runs full declared gate inventory) | Writes `target/` artifacts | Heavy | Sole gate inventory defined in `justfile`; use Git Bash on Windows |
+| `just ci-full` | `just ci` + container Mermaid render | Writes `target/` + assets | Heavy | Requires Docker-compatible engine |
+| `just llms` | `rustc ... tools/llms_docs.rs` | **Modifies tracked files** | Fast | Regenerates `llms.txt` and `llms-full.txt` from sources |
+| `just product-status` | `rustc ... tools/product_status.rs` | **Modifies tracked files** | Fast | Regenerates Markdown view from canonical TSV ledger |
+| `just work-clean` | `tools/workspace.py clean "$@"` | **Deletes scratch only with `--apply`** | Fast | Dry run by default; `--apply` removes session scratch, preserving worktree/branch |
 
 `just ci` is the local mirror of routed CI, minus the three-OS matrix and the manual Mermaid
 visual-inspection/report step. Its independent policy gates run in parallel. TypeScript
