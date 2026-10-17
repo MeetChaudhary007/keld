@@ -205,6 +205,24 @@ then runs, followed by the Rust gates one at a time, so load-sensitive tests do 
 the parallel policy load. Use `just ci-full` for an explicit whole-corpus Mermaid check. If it is green and you only touched
 cross-platform code, CI usually agrees.
 
+#### 3.3.4 Raw command reference
+
+If you develop without `just`, use the corresponding raw commands:
+
+| `just` target | Equivalent command |
+|---|---|
+| `just hello` | `cargo run -p keld-host --bin keld-host -- --hello` |
+| `just fmt` | `cargo fmt --all` |
+| `just fmt-check` | `cargo fmt --all --check` |
+| `just clippy` | `cargo clippy --workspace --all-targets -- -D warnings` |
+| `just test` | `cargo nextest run --workspace --profile ci` |
+| `just doc` | `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps` |
+| `just deny` | `cargo deny check` |
+| `just mermaid-test` / `just mermaid-check` / `just mermaid-render-check` | validator tests / tracked structural policy / isolated digest-pinned SVG render |
+| `just llms-test` / `just llms-check` | generated-corpus contract tests / freshness check |
+| `just ci` | Full local gate; the `justfile` `ci` recipe and the gate groups it names are the sole source of its inventory and order. |
+| `just ci-full` | `just ci` with full-corpus Mermaid validation and pinned rendering forced. |
+
 ---
 
 ## 4. Running tests
