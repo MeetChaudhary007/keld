@@ -3049,7 +3049,7 @@ impl WebView2Engine {
         self.navigation_diagnostic
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .entered_loop();
+            .loop_setup_started();
         let navigation_diagnostic = Arc::clone(&self.navigation_diagnostic);
         let terminal_intent_in_loop = Arc::clone(&terminal_intent);
         let mut views = std::mem::take(&mut self.views);
@@ -3397,7 +3397,7 @@ impl WebEngine for WebView2Engine {
             self.navigation_diagnostic
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .issued();
+                .dispatch_attempted();
         }
         navigate_initial(&guard, &spec.initial)?;
 

@@ -8,8 +8,8 @@ use windows::core::Result as ComResult;
 
 pub(super) struct FirstNavigationDiagnostic {
     created: Instant,
-    issued: Option<Instant>,
-    loop_entered: Option<Instant>,
+    dispatch_attempted: Option<Instant>,
+    loop_setup_started: Option<Instant>,
     phase: &'static str,
     phase_at: Instant,
     detail: Option<String>,
@@ -20,22 +20,22 @@ impl FirstNavigationDiagnostic {
         let now = Instant::now();
         Self {
             created: now,
-            issued: None,
-            loop_entered: None,
+            dispatch_attempted: None,
+            loop_setup_started: None,
             phase: "window-creation",
             phase_at: now,
             detail: None,
         }
     }
 
-    pub(super) fn issued(&mut self) {
-        self.issued = Some(Instant::now());
-        self.record("navigation-issued");
+    pub(super) fn dispatch_attempted(&mut self) {
+        self.dispatch_attempted = Some(Instant::now());
+        self.record("navigation-dispatch-attempted");
     }
 
-    pub(super) fn entered_loop(&mut self) {
-        self.loop_entered = Some(Instant::now());
-        self.record("message-loop-entered");
+    pub(super) fn loop_setup_started(&mut self) {
+        self.loop_setup_started = Some(Instant::now());
+        self.record("message-loop-setup-started");
     }
 
     pub(super) fn deadline_elapsed(&mut self) {
@@ -83,11 +83,11 @@ impl FirstNavigationDiagnostic {
     pub(super) fn snapshot(&self) -> String {
         let now = Instant::now();
         let since_created = now.saturating_duration_since(self.created).as_millis();
-        let issued_ms = self
-            .issued
+        let dispatch_attempt_ms = self
+            .dispatch_attempted
             .map(|at| at.saturating_duration_since(self.created).as_millis());
         let loop_ms = self
-            .loop_entered
+            .loop_setup_started
             .map(|at| at.saturating_duration_since(self.created).as_millis());
         let phase_ms = self
             .phase_at
@@ -95,8 +95,8 @@ impl FirstNavigationDiagnostic {
             .as_millis();
         let detail = self.detail.as_deref().unwrap_or("none");
         format!(
-            "first-navigation phase={} phase_at_ms={} total_ms={} issued_at_ms={:?} loop_at_ms={:?} detail={}",
-            self.phase, phase_ms, since_created, issued_ms, loop_ms, detail
+            "first-navigation phase={} phase_at_ms={} total_ms={} dispatch_attempt_at_ms={:?} loop_setup_at_ms={:?} detail={}",
+            self.phase, phase_ms, since_created, dispatch_attempt_ms, loop_ms, detail
         )
     }
 }
@@ -107,9 +107,24 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     #[test]
+    fn phase_names_distinguish_dispatch_attempt_from_loop_setup() {
+        let mut diag = FirstNavigationDiagnostic::new();
+        diag.dispatch_attempted();
+        let attempt = diag.snapshot();
+        assert!(attempt.contains("navigation-dispatch-attempted"));
+        assert!(attempt.contains("dispatch_attempt_at_ms=Some("));
+        assert!(!attempt.contains("navigation-completed"));
+        diag.loop_setup_started();
+        let setup = diag.snapshot();
+        assert!(setup.contains("message-loop-setup-started"));
+        assert!(setup.contains("loop_setup_at_ms=Some("));
+        assert!(!setup.contains("message-loop-entered"));
+    }
+
+    #[test]
     fn failed_is_success_com_hresult_is_immediately_fatal_and_recorded() {
         let mut diag = FirstNavigationDiagnostic::new();
-        diag.issued();
+        diag.dispatch_attempted();
         let ready = AtomicBool::new(false);
         let failed = AtomicBool::new(false);
         let com_error = windows::core::Error::from(windows::Win32::Foundation::E_POINTER);
