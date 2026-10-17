@@ -190,9 +190,9 @@ Recipes are grouped by developer task and lifecycle stage:
 | `just fmt-check` | `cargo fmt --all --check` | None (read-only) | Fast | Fails on unformatted code |
 | `just fmt` | `cargo fmt --all` | **Modifies tracked files** | Fast | Overwrites unformatted Rust files in place |
 | `just clippy` | `cargo clippy --workspace --all-targets -- -D warnings` | Writes `target/` artifacts | Moderate | Warnings treated as errors |
-| `just test` | `cargo nextest run --workspace --profile ci` (fallback: `cargo test --workspace`) | Writes `target/` artifacts | Heavy | Nextest enforces zero retries; raw `cargo test` is partial fallback |
+| `just test` | `cargo nextest run --workspace --profile ci` (Linux: `xvfb-run -a`; fallback: `cargo test --workspace`) | Writes `target/` artifacts | Heavy | Nextest enforces zero retries; Linux host suite requires virtual display (`xvfb-run -a`); raw `cargo test` is partial fallback |
 | `just doc` | `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps` | Writes `target/doc/` | Moderate | Builds rustdoc without dependencies |
-| `just deny` | `cargo deny check` | None | Fast | Requires `cargo-deny` |
+| `just deny` | `cargo deny check` and helper bans check | None | Fast | Workspace check plus `crates/keld-updater-helper/deny.toml check bans`; requires `cargo-deny` |
 | `just ci` | None (runs full declared gate inventory) | Writes `target/` artifacts | Heavy | Sole gate inventory defined in `justfile`; use Git Bash on Windows |
 | `just ci-full` | `just ci` + container Mermaid render | Writes `target/` + assets | Heavy | Requires Docker-compatible engine |
 | `just llms` | `rustc ... tools/llms_docs.rs` | **Modifies tracked files** | Fast | Regenerates `llms.txt` and `llms-full.txt` from sources |
@@ -207,7 +207,7 @@ cross-platform code, CI usually agrees.
 
 #### 3.3.4 Raw command reference
 
-If you develop without `just`, use the corresponding raw commands:
+If you develop without `just`, use the corresponding raw commands below. Note that multi-step recipes (such as `just deny`) and platform-specific wrappers (such as `just test` on Linux) require executing all listed steps or platform wrappers to match CI:
 
 | `just` target | Equivalent command |
 |---|---|
@@ -215,9 +215,9 @@ If you develop without `just`, use the corresponding raw commands:
 | `just fmt` | `cargo fmt --all` |
 | `just fmt-check` | `cargo fmt --all --check` |
 | `just clippy` | `cargo clippy --workspace --all-targets -- -D warnings` |
-| `just test` | `cargo nextest run --workspace --profile ci` |
+| `just test` | `cargo nextest run --workspace --profile ci` (Linux requires virtual display: `xvfb-run -a cargo nextest run --workspace --profile ci`) |
 | `just doc` | `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps` |
-| `just deny` | `cargo deny check` |
+| `just deny` | `cargo deny check && cargo deny --manifest-path crates/keld-updater-helper/Cargo.toml --all-features --config crates/keld-updater-helper/deny.toml check bans` |
 | `just mermaid-test` / `just mermaid-check` / `just mermaid-render-check` | validator tests / tracked structural policy / isolated digest-pinned SVG render |
 | `just llms-test` / `just llms-check` | generated-corpus contract tests / freshness check |
 | `just ci` | Full local gate; the `justfile` `ci` recipe and the gate groups it names are the sole source of its inventory and order. |
