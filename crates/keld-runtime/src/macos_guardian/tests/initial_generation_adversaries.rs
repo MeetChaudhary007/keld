@@ -31,6 +31,7 @@ fn zero_first_kgc1_guardian_role() {
     // slow writes. The parent must not infer a selected test from libtest's
     // exit status alone.
     std::fs::write(&receipt, kind.as_bytes()).expect("publish exact role selection");
+    let mut dripped = None;
     match kind.as_str() {
         "zero" => {}
         "partial" => control
@@ -41,9 +42,10 @@ fn zero_first_kgc1_guardian_role() {
             // so the old reader stayed *inside* one poll call until its
             // independent five-second frame deadline rather than honoring
             // the original two-second authenticated bootstrap deadline.
+            let mut delivered = 0_usize;
             for _ in 0..400 {
                 match control.write_all(b"K") {
-                    Ok(()) => {}
+                    Ok(()) => delivered += 1,
                     Err(source)
                         if matches!(
                             source.kind(),
@@ -56,8 +58,16 @@ fn zero_first_kgc1_guardian_role() {
                 }
                 thread::sleep(Duration::from_millis(10));
             }
+            dripped = Some(delivered);
         }
         other => panic!("unknown first-record adversary {other}"),
+    }
+    if let Some(delivered) = dripped {
+        // The parent reads this only after the role exits. It proves the
+        // adversary actually wrote individual bytes instead of passing on a
+        // zero-byte timeout or an early scheduling gap.
+        std::fs::write(&receipt, format!("drip:{delivered}"))
+            .expect("record actual adversarial byte-delivery progress");
     }
     // Hold control open without another byte while the host's existing
     // initial-authentication deadline expires. EOF must not be fabricated by
@@ -90,7 +100,7 @@ fn native_initial_record_denial(case: &str) {
     let mut primary = pending
         .register_guarded_primary_until(original_deadline)
         .expect("actual one-use authenticated Guardian stream");
-    let deadline = original_deadline + Duration::from_secs(2);
+    let deadline = original_deadline + Duration::from_secs(1);
     let error = loop {
         match primary.poll_fatal() {
             Ok(()) => {
@@ -103,6 +113,7 @@ fn native_initial_record_denial(case: &str) {
             Err(error) => break error,
         }
     };
+    let observed_failure = Instant::now();
     let no_group = primary.group_pid().is_none();
     primary.liveness_writer.take();
     let status = primary
@@ -110,7 +121,19 @@ fn native_initial_record_denial(case: &str) {
         .wait()
         .expect("reap exact authenticated Guardian after host denial");
     let selected = std::fs::read_to_string(marker).expect("exact libtest role executed");
-    assert_eq!(selected, case);
+    if case == "drip" {
+        let delivered: usize = selected
+            .strip_prefix("drip:")
+            .expect("exact selected role must publish drip progress")
+            .parse()
+            .expect("numeric successful single-byte writes");
+        assert!(
+            delivered >= 10,
+            "this adversary did not actually send enough single-byte records: {delivered}"
+        );
+    } else {
+        assert_eq!(selected, case);
+    }
     assert!(
         status.success(),
         "Guardian role's zero/partial assertions failed"
@@ -122,6 +145,10 @@ fn native_initial_record_denial(case: &str) {
     assert!(
         no_group,
         "zero/partial initial control cannot authorize a native process group"
+    );
+    assert!(
+        observed_failure <= deadline,
+        "authenticated KGC1 first record exceeded the original deadline's bounded I/O margin"
     );
 }
 

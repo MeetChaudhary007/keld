@@ -2,7 +2,7 @@
 //! Test-specific input readers live beside their only contract consumers.
 
 use std::io::{self, Read};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use super::super::{
     CONTROL_PREPARED, CONTROL_REGISTERED, CONTROL_REVOKE, CONTROL_SPAWNED,
@@ -76,6 +76,48 @@ fn generation_control_partial_record_has_one_overall_deadline() {
 }
 
 #[test]
+fn first_kgc1_deadline_stops_continuous_successful_one_byte_reads() {
+    // Unlike a scheduler-driven socket drip, this reader never yields
+    // WouldBlock. Without an absolute deadline inside the reader's loop, it
+    // would read every byte and attempt to decode a malformed 404-byte frame.
+    let mut source = AlwaysReadySlowByte { reads: 0 };
+    let mut reader = GenerationControlReader::new();
+    let began = Instant::now();
+    let error = reader
+        .poll_until(&mut source, Some(began + Duration::from_millis(15)))
+        .expect_err("constant-success byte drip must observe first-record deadline");
+    assert!(error.to_string().contains("first KGC1 record"), "{error}");
+    assert!(
+        source.reads > 0,
+        "the reader must actually consume hostile bytes"
+    );
+    assert!(
+        source.reads < GENERATION_CONTROL_RECORD_LEN,
+        "deadline enforcement cannot wait for the entire malformed frame"
+    );
+    assert!(
+        began.elapsed() < Duration::from_secs(2),
+        "single poll was not promptly interrupted at the original deadline"
+    );
+}
+
+#[test]
+fn initial_kgc1_reader_rejects_complete_frame_arriving_after_deadline() {
+    let mut encoded = Vec::new();
+    write_generation_control(
+        &mut encoded,
+        &GenerationControlRecord::new(CONTROL_REVOKE, 1),
+    )
+    .expect("encode full private record");
+    let mut source = DelayedCompleteFrame { encoded };
+    let deadline = Instant::now() + Duration::from_millis(10);
+    let error = GenerationControlReader::new()
+        .poll_until(&mut source, Some(deadline))
+        .expect_err("a fully buffered frame cannot become valid after its original deadline");
+    assert!(error.to_string().contains("first KGC1 record"), "{error}");
+}
+
+#[test]
 fn generation_control_response_fields_are_transition_exact() {
     let spawned = GenerationControlRecord::new(CONTROL_SPAWNED, 3).with_pid(91);
     let registered = GenerationControlRecord::new(CONTROL_REGISTERED, 3).with_pid(91);
@@ -111,6 +153,31 @@ impl Read for OneByteAtATime {
     fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
         output[0] = 0;
         Ok(1)
+    }
+}
+
+struct AlwaysReadySlowByte {
+    reads: usize,
+}
+
+impl Read for AlwaysReadySlowByte {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        std::thread::sleep(Duration::from_millis(1));
+        output[0] = b'K';
+        self.reads += 1;
+        Ok(1)
+    }
+}
+
+struct DelayedCompleteFrame {
+    encoded: Vec<u8>,
+}
+
+impl Read for DelayedCompleteFrame {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        std::thread::sleep(Duration::from_millis(25));
+        output[..self.encoded.len()].copy_from_slice(&self.encoded);
+        Ok(self.encoded.len())
     }
 }
 
