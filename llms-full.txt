@@ -640,15 +640,17 @@ proves nor claims default denial for those cases; they block full KEL-132
 closure until the approved [KEL-135 profile lifecycle](../specs/kel135-persistent-profile-identity.md)
 and oldest-supported-macOS evidence land.
 
-**The FS library is gated but not shipping-routed.** `FS_CHANNEL`
+**The guarded FS route is implemented on the app link.** `FS_CHANNEL`
 (`keld-native::fs`, KEL-130) runs every admitted `fs.read` / `fs.write` `Call`
 through `keld_ipc::guard_dispatch::dispatch_privileged`, borrows its first-match
 permit, and uses the matching retained `FsBroker` scope before touching disk.
 A deny or broker failure is a `FrameKind::Err` carrying a postcard
 `CallError { code, message }` (spec 02 §2) whose `code` is the guard's
 `KELD-GUARD*` or one of `KELD-NATIVE-001..008` — read as a field, never parsed
-out of the text. The no-flag host does not register this channel yet;
-KEL-102/T3 owns reachable routing and in-flight lifecycle. Echo remaining
+out of the text. The guarded app-link filesystem route is implemented
+(KEL-102/T3 landed); macOS project-policy verification and absent-policy broker-deny
+fallback are verified, while non-macOS policy producers, renderer forwarding, and
+full hostile/deadline/quiescence qualification remain incomplete. Echo remaining
 ungated does not mean privileged frames skip the guard.
 
 **Lifecycle is session control, not an OS grant.** `LIFECYCLE_CHANNEL` (KEL-72)
@@ -1829,8 +1831,10 @@ each absolute filesystem scope anchor, and resolves bounded per-call traversal
 relative to the guard-selected retained grant. It rejects unserviceable scopes,
 snapshot mismatches, final exact-scope aliases, escapes, mount/volume crossings,
 non-regular objects, and fixed path/content/component/link limits before exposing
-bytes. The shipping no-flag host still does not register `FS_CHANNEL`; KEL-102/T3
-owns that later route and in-flight lifecycle integration.
+bytes. The guarded app-link filesystem route is implemented (KEL-102/T3), with macOS
+project-policy verification and absent-policy broker-deny fallback; incomplete non-macOS
+policy producers, renderer forwarding, and full hostile/deadline/quiescence qualification
+remain bounded and open.
 Host-lifecycle `Quit` / `Ready` / `LastWindowClosed` (KEL-72,
 `LIFECYCLE_CHANNEL`) are session control on an already-minted app-link, not
 OS-authority handlers, and stay ungated like echo.
@@ -2598,9 +2602,14 @@ report any cancellation, deadline, or I/O failure after create/truncate as
 `KELD-NATIVE-007` with acknowledged content-byte counts. The five-second clock is a
 cooperative progress budget, not a promise to preempt a wedged kernel call. `FsBroker`
 alone owns the roots; calls and `serve_fs_session` borrow it, and dropping a wrapper is
-not broker destruction while another owner remains. The channel is library-tested but
-remains unreachable from the shipping no-flag host until KEL-102/T3 supplies admission,
-in-flight cancellation/drain, and ordered broker destruction.
+not broker destruction while another owner remains. The retained filesystem broker and
+guarded production host route are implemented (KEL-102/T3), exposing a public Bun
+`fs.read`/`write` slice on the canonical app link with macOS explicit project-policy
+capture and absent-policy all-denied fallback. This manifest guard applies strictly
+to brokered app-link calls; direct Bun `node:fs` calls do not pass through this broker
+and are not denied by it, as OS sandbox containment remains a separate, not-yet-fully-qualified
+guarantee. Renderer-action forwarding, non-macOS project-policy producers, and full
+hostile/deadline/quiescence qualification remain open.
 
 v0 is still a skeleton: its `MODULES` registry does not yet include the destination
 `process`, `pty`, or `auth` rows below, and none of them has implementation. KEL-76 must
