@@ -46,6 +46,9 @@
 
 #[cfg(all(feature = "media-acceptance", test))]
 pub(crate) mod media_acceptance;
+mod navigation_diagnostics;
+
+use navigation_diagnostics::FirstNavigationDiagnostic;
 
 use std::cell::Cell;
 use std::collections::BTreeMap;
@@ -58,9 +61,9 @@ use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
 use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -76,8 +79,9 @@ use tao::window::{Window, WindowBuilder};
 use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Profile4;
 use webview2_com::Microsoft::Web::WebView2::Win32::{
     COREWEBVIEW2_BROWSER_PROCESS_EXIT_KIND_NORMAL, COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC,
-    CreateCoreWebView2EnvironmentWithOptions, ICoreWebView2, ICoreWebView2Controller,
-    ICoreWebView2Environment, ICoreWebView2Environment5, ICoreWebView2EnvironmentOptions,
+    COREWEBVIEW2_WEB_ERROR_STATUS, CreateCoreWebView2EnvironmentWithOptions, ICoreWebView2,
+    ICoreWebView2Controller, ICoreWebView2Environment, ICoreWebView2Environment5,
+    ICoreWebView2EnvironmentOptions,
 };
 #[cfg(test)]
 use webview2_com::Microsoft::Web::WebView2::Win32::{
@@ -2100,24 +2104,43 @@ fn install_app_navigation_handler(
     events: Sender<AppWindowEvent>,
     ready: Arc<AtomicBool>,
     failed: Arc<AtomicBool>,
+    diagnostic: Arc<Mutex<FirstNavigationDiagnostic>>,
+    wake: EventLoopProxy<WindowsLoopEvent>,
 ) -> Result<(), WvError> {
     let handler = NavigationCompletedEventHandler::create(Box::new(move |_, args| {
-        let Some(args) = args else {
-            failed.store(true, Ordering::Release);
-            return Ok(());
+        let (completion, web_error) = if let Some(args) = args {
+            // SAFETY: WebView2 invokes the handler on the creating STA with live
+            // COM event args and writes IsSuccess into a local BOOL out-parameter.
+            let mut succeeded = BOOL::default();
+            let result =
+                unsafe { args.IsSuccess(&raw mut succeeded) }.map(|()| succeeded.as_bool());
+            let status = if matches!(result, Ok(false)) {
+                // SAFETY: The navigation event args remain alive through this callback.
+                let mut status = COREWEBVIEW2_WEB_ERROR_STATUS(0);
+                // SAFETY: `status` is a writable event-local COM out-parameter.
+                Some(match unsafe { args.WebErrorStatus(&raw mut status) } {
+                    Ok(()) => format!("{status:?}"),
+                    Err(error) => format!("status_hresult={:#010x}", error.code().0),
+                })
+            } else {
+                None
+            };
+            (result, status)
+        } else {
+            (Err(windows::core::Error::from(E_POINTER)), None)
         };
-        // SAFETY: WebView2 invokes this handler on the creating STA and keeps
-        // the event args alive for this call. `IsSuccess` writes no caller
-        // memory and returns its BOOL by value.
-        let mut succeeded = BOOL::default();
-        // SAFETY: `succeeded` is a live BOOL out-parameter for this call.
-        unsafe { args.IsSuccess(&raw mut succeeded)? };
-        if succeeded.as_bool() {
-            if !ready.swap(true, Ordering::AcqRel) {
-                let _ = events.send(AppWindowEvent::NavigationReady);
-            }
-        } else if initial_navigation_failure_is_fatal(ready.load(Ordering::Acquire)) {
-            failed.store(true, Ordering::Release);
+        let first_success = diagnostic
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .completed(completion, web_error, &ready, &failed);
+        if first_success {
+            let _ = events.send(AppWindowEvent::NavigationReady);
+        } else if failed.load(Ordering::Acquire)
+            && initial_navigation_failure_is_fatal(ready.load(Ordering::Acquire))
+        {
+            // Wake the loop immediately to return the existing typed Navigate
+            // failure. The event itself grants no authority or navigation.
+            let _ = wake.send_event(WindowsLoopEvent::ProfileReleaseWake);
         }
         Ok(())
     }));
@@ -2658,6 +2681,7 @@ pub struct WebView2Engine {
     pending_app_events: Option<Sender<AppWindowEvent>>,
     navigation_ready: Arc<AtomicBool>,
     navigation_failed: Arc<AtomicBool>,
+    navigation_diagnostic: Arc<Mutex<FirstNavigationDiagnostic>>,
     app_window_created: bool,
     saved_permissions_reconciled: bool,
     /// Present until the run loop starts; consumed by `run_until_closed`.
@@ -2785,6 +2809,7 @@ impl WebView2Engine {
             pending_app_events: None,
             navigation_ready: Arc::new(AtomicBool::new(false)),
             navigation_failed: Arc::new(AtomicBool::new(false)),
+            navigation_diagnostic: Arc::new(Mutex::new(FirstNavigationDiagnostic::new())),
             app_window_created: false,
             saved_permissions_reconciled: false,
         }
@@ -2969,6 +2994,10 @@ impl WebView2Engine {
         }
         self.navigation_ready.store(false, Ordering::Release);
         self.navigation_failed.store(false, Ordering::Release);
+        *self
+            .navigation_diagnostic
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = FirstNavigationDiagnostic::new();
         self.pending_app_events = Some(events);
         let result = self.create(spec);
         self.pending_app_events = None;
@@ -3017,6 +3046,11 @@ impl WebView2Engine {
         let navigation_ready = Arc::clone(&self.navigation_ready);
         let navigation_failed = Arc::clone(&self.navigation_failed);
         let navigation_deadline = Instant::now() + crate::INITIAL_NAVIGATION_DEADLINE;
+        self.navigation_diagnostic
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entered_loop();
+        let navigation_diagnostic = Arc::clone(&self.navigation_diagnostic);
         let terminal_intent_in_loop = Arc::clone(&terminal_intent);
         let mut views = std::mem::take(&mut self.views);
         let expected_browser_pid = Arc::clone(&self.expected_browser_pid);
@@ -3065,6 +3099,10 @@ impl WebView2Engine {
                 Instant::now(),
                 navigation_deadline,
             ) {
+                navigation_diagnostic
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .deadline_elapsed();
                 navigation_timed_out_in_loop.store(true, Ordering::Release);
                 commit_profile_stop(stop_in_loop.as_ref());
                 views.clear();
@@ -3160,12 +3198,23 @@ fn finish_app_run_flags(
     fatal: &AtomicBool,
     code: i32,
 ) -> Result<(), WvError> {
-    finish_app_run(
+    let result = finish_app_run(
         engine.navigation_failed.load(Ordering::Acquire),
         navigation_timed_out.load(Ordering::Acquire),
         fatal.load(Ordering::Acquire),
         code,
-    )
+    );
+    match result {
+        Err(WvError::Navigate(message)) => {
+            let evidence = engine
+                .navigation_diagnostic
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .snapshot();
+            Err(WvError::Navigate(format!("{message}; {evidence}")))
+        }
+        other => other,
+    }
 }
 
 fn finish_app_run(
@@ -3332,9 +3381,24 @@ impl WebEngine for WebView2Engine {
                 events.clone(),
                 Arc::clone(&self.navigation_ready),
                 Arc::clone(&self.navigation_failed),
+                Arc::clone(&self.navigation_diagnostic),
+                self.event_loop
+                    .as_ref()
+                    .ok_or_else(|| {
+                        WvError::EventLoop(String::from(
+                            "window UI loop unavailable during navigation",
+                        ))
+                    })?
+                    .create_proxy(),
             )?;
         }
 
+        if self.pending_app_events.is_some() {
+            self.navigation_diagnostic
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .issued();
+        }
         navigate_initial(&guard, &spec.initial)?;
 
         // Keyboard focus lands in the page, matching what wry's build did and
