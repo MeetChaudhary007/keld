@@ -1,4 +1,5 @@
 //! One owner for host-side primary generation control and recovery transitions.
+use super::process_group::validate_guardian_child_group;
 use super::{
     BoundRoleGeneration, CONTROL_CLEAR, CONTROL_CLEARED, CONTROL_PREPARE, CONTROL_PREPARED,
     CONTROL_REGISTERED, CONTROL_REVOKE, CONTROL_REVOKED, CONTROL_SPAWNED,
@@ -18,6 +19,13 @@ pub(super) struct GenerationProvisionFence {
     pub(super) release: Receiver<()>,
 }
 
+#[cfg(test)]
+pub(super) struct GenerationRegistrationFence {
+    pub(super) attempt: u32,
+    pub(super) entered: mpsc::SyncSender<u32>,
+    pub(super) release: Receiver<()>,
+}
+
 #[derive(Default)]
 pub(super) struct HostGenerationState {
     pub(super) lease: Option<RoleGenerationLease>,
@@ -29,11 +37,13 @@ pub(super) struct HostGenerationState {
 
 #[allow(clippy::too_many_lines)] // one owner keeps every private protocol transition contiguous
 pub(super) fn run_generation_host(
+    guardian_pid: u32,
     mut control: std::os::unix::net::UnixStream,
     updates_tx: &Sender<GuardedPrimaryUpdate>,
     current_generation: &Mutex<Option<RegisteredPrimaryGeneration>>,
     recovery_decision: &Mutex<RecoveryState>,
     #[cfg(test)] provision_fence: Option<&GenerationProvisionFence>,
+    #[cfg(test)] registration_fence: Option<&GenerationRegistrationFence>,
 ) -> Result<(), RuntimeError> {
     control
         .set_read_timeout(Some(GENERATION_CONTROL_POLL))
@@ -122,12 +132,39 @@ pub(super) fn run_generation_host(
                     let current = state.lease.as_mut().ok_or_else(|| {
                         invalid_control_transition("spawned", record.attempt, expected_attempt)
                     })?;
+                    // The authenticated Guardian is still untrusted input.
+                    // Before granting an app link or recording a killable PGID,
+                    // prove this leader is its actual direct OS child.
+                    validate_guardian_child_group(record.pid, guardian_pid)?;
                     current.child_spawned(record.pid, record.attempt)?;
                     *lock_generation(current_generation) = Some(RegisteredPrimaryGeneration {
                         attempt: record.attempt,
                         group_pid: record.pid,
                     });
                     forward_generation_updates(updates_tx, &bound_rx, &events_rx)?;
+                    #[cfg(test)]
+                    if let Some(fence) =
+                        registration_fence.filter(|fence| fence.attempt == record.attempt)
+                    {
+                        // The actual host retains the group, but must not yet
+                        // emit REGISTERED or authorize child exec. No shipping
+                        // control records, deadlines or extra owners change.
+                        fence.entered.send(record.pid).map_err(|_| {
+                            lifecycle_error(
+                                "test generation registration receipt",
+                                io::Error::other("test ACK controller ended"),
+                            )
+                        })?;
+                        fence
+                            .release
+                            .recv_timeout(GUARDIAN_SHUTDOWN_DEADLINE)
+                            .map_err(|source| {
+                                lifecycle_error(
+                                    "test generation REGISTERED ACK release",
+                                    io::Error::other(source),
+                                )
+                            })?;
+                    }
                     write_generation_control(
                         &mut control,
                         &GenerationControlRecord::new(CONTROL_REGISTERED, record.attempt)

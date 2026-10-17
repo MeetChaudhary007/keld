@@ -1,6 +1,6 @@
 // Real macOS processes, using the shipping GuardedPrimary registration path.
 // The separate Guardian dies from SIGKILL while Bun's pre-exec gate is held.
-use std::io::{self, Read as _, Write as _};
+use std::io::{self, Write as _};
 use std::os::unix::process::CommandExt as _;
 use std::process::{Command, Stdio};
 use std::thread;
@@ -12,6 +12,7 @@ use nix::unistd::{Pid, getpgid};
 use super::super::{
     GUARDIAN_SHUTDOWN_DEADLINE, GuardedPrimary, GuardianBootstrap, run_guarded_primary,
 };
+use super::test_support::{await_spawned_gate, verified_real_bun};
 
 const CRASH_ROLE_ENV: &str = "KELD_TEST_PREEXEC_GUARDIAN_ROLE";
 const CRASH_MARKER_ENV: &str = "KELD_TEST_PREEXEC_BUN_MARKER";
@@ -19,6 +20,8 @@ const CRASH_GATE_ENV: &str = "KELD_TEST_GUARDIAN_PREEXEC_GATE";
 const CRASH_BUN_ENV: &str = "KELD_TEST_GUARDIAN_BUN_BINARY";
 const CRASH_ROLE_TEST: &str =
     "macos_guardian::tests::guardian_crash_pre_registration::guarded_preexec_guardian_role";
+
+mod retained_ack;
 
 #[test]
 fn guarded_preexec_guardian_role() {
@@ -51,35 +54,10 @@ setInterval(() => {}, 1000);
     }
 }
 
-fn verified_real_bun() -> std::path::PathBuf {
-    let explicit = std::env::var_os("BUN_BIN").map(std::path::PathBuf::from);
-    let on_path = std::env::var_os("PATH").and_then(|paths| {
-        std::env::split_paths(&paths)
-            .map(|dir| dir.join("bun"))
-            .find(|candidate| candidate.is_file())
-    });
-    let installed = std::env::var_os("HOME")
-        .map(std::path::PathBuf::from)
-        .map(|home| home.join(".bun/bin/bun"))
-        .filter(|candidate| candidate.is_file());
-    let bun = explicit
-        .or(on_path)
-        .or(installed)
-        .expect("real Bun binary required for macOS guardian crash proof");
-    let version = Command::new(&bun)
-        .arg("--version")
-        .output()
-        .expect("execute real Bun preflight");
-    assert!(
-        version.status.success(),
-        "real Bun version preflight failed: {version:?}"
-    );
-    bun
-}
-
 struct GuardianCrashFixture {
     primary: GuardedPrimary,
     group_pid: Option<i32>,
+    descendant_pid: Option<i32>,
 }
 
 impl Drop for GuardianCrashFixture {
@@ -90,7 +68,13 @@ impl Drop for GuardianCrashFixture {
         let _ = self.primary.poll_fatal();
         if let Some(group) = self.group_pid {
             let pid = Pid::from_raw(group);
-            if getpgid(Some(pid)) == Ok(pid) {
+            // An already-reaped leader can leave its same-group descendant
+            // alive. Validate either *owned* member before emergency killpg.
+            let leader_member = getpgid(Some(pid)) == Ok(pid);
+            let descendant_member = self
+                .descendant_pid
+                .is_some_and(|child| getpgid(Some(Pid::from_raw(child))) == Ok(pid));
+            if (leader_member || descendant_member) && pid != nix::unistd::getpgrp() {
                 let _ = nix::sys::signal::killpg(pid, Signal::SIGKILL);
             }
         }
@@ -102,17 +86,7 @@ fn guard_crash_fixture(
     marker: &std::path::Path,
     bun: &std::path::Path,
 ) -> GuardianCrashFixture {
-    let mut command = Command::new(std::env::current_exe().expect("test executable"));
-    command
-        .args(["--exact", CRASH_ROLE_TEST, "--nocapture"])
-        .env(CRASH_ROLE_ENV, "guardian")
-        .env(CRASH_GATE_ENV, socket)
-        .env(CRASH_BUN_ENV, bun)
-        .env(CRASH_MARKER_ENV, marker)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
-        .process_group(0);
+    let command = guarded_role_command(Some(socket), marker, bun);
     let pending = GuardianBootstrap::spawn_supervised(command).expect("actual guardian bootstrap");
     let primary = pending
         .register_guarded_primary_until(Instant::now() + GUARDIAN_SHUTDOWN_DEADLINE)
@@ -120,43 +94,32 @@ fn guard_crash_fixture(
     GuardianCrashFixture {
         primary,
         group_pid: None,
+        descendant_pid: None,
     }
 }
 
-fn await_spawned_gate(
-    listener: &std::os::unix::net::UnixListener,
-) -> (std::os::unix::net::UnixStream, i32, u32) {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        match listener.accept() {
-            Ok((mut stream, _)) => {
-                stream
-                    .set_read_timeout(Some(GUARDIAN_SHUTDOWN_DEADLINE))
-                    .expect("bounded PID receipt");
-                let mut bytes = [0_u8; 80];
-                let count = stream.read(&mut bytes).expect("read gated PID");
-                let receipt = std::str::from_utf8(&bytes[..count]).expect("UTF-8 PID receipt");
-                let mut words = receipt.split_whitespace();
-                assert_eq!(words.next(), Some("SPAWNED"), "{receipt}");
-                let pid: i32 = words.next().expect("process group").parse().expect("PID");
-                let guardian: u32 = words.next().expect("Guardian PID").parse().expect("PID");
-                assert!(words.next().is_none(), "unexpected gate receipt: {receipt}");
-                assert!(pid > 1 && pid != nix::unistd::getpgrp().as_raw());
-                // Separate reporter authenticates its own PID; the controller
-                // checks Guardian identity and process-group membership below.
-                assert!(guardian > 1);
-                return (stream, pid, guardian);
-            }
-            Err(source) if source.kind() == io::ErrorKind::WouldBlock => {
-                assert!(
-                    Instant::now() < deadline,
-                    "Guardian never reached pre-exec gate"
-                );
-                thread::sleep(Duration::from_millis(3));
-            }
-            Err(source) => panic!("accept pre-exec PID: {source}"),
-        }
+/// Shared real-subprocess fixture. Omitting the pre-record gate intentionally
+/// reaches the later host-retained REGISTERED ACK seam instead.
+fn guarded_role_command(
+    pre_record_gate: Option<&std::path::Path>,
+    marker: &std::path::Path,
+    bun: &std::path::Path,
+) -> Command {
+    let mut command = Command::new(std::env::current_exe().expect("test executable"));
+    command
+        .args(["--exact", CRASH_ROLE_TEST, "--nocapture"])
+        .env(CRASH_ROLE_ENV, "guardian")
+        .env_remove(CRASH_GATE_ENV)
+        .env(CRASH_BUN_ENV, bun)
+        .env(CRASH_MARKER_ENV, marker)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .process_group(0);
+    if let Some(socket) = pre_record_gate {
+        command.env(CRASH_GATE_ENV, socket);
     }
+    command
 }
 
 fn group_and_child_gone(group: i32, descendant: Option<i32>) {
@@ -247,6 +210,7 @@ fn real_guardian_crash_at_gate(release_registration: bool) {
             Ok(Pid::from_raw(group))
         );
         descendant = Some(ids[1]);
+        fixture.descendant_pid = Some(ids[1]);
     }
     // SIGKILL is directed only at the independently spawned Guardian. Before
     // registration, the permit pipe must close promptly through EOF, rather

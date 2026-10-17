@@ -47,10 +47,12 @@ impl ControlPlane {
         let host_recovery = Arc::clone(&recovery);
         let host = thread::spawn(move || {
             run_generation_host(
+                std::process::id(), // actual child groups originate in this test process
                 host_control,
                 &updates_tx,
                 &host_current,
                 &host_recovery,
+                None,
                 None,
             )
         });

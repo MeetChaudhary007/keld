@@ -62,7 +62,15 @@ fn prepare_retired_owner(fence: Option<GenerationProvisionFence>) -> RetiredOwne
     lock_recovery(&recovery).arm();
     let state = Arc::clone(&recovery);
     let worker = thread::spawn(move || {
-        run_generation_host(host, &updates_tx, &current, &state, fence.as_ref())
+        run_generation_host(
+            std::process::id(),
+            host,
+            &updates_tx,
+            &current,
+            &state,
+            fence.as_ref(),
+            None,
+        )
     });
     let mut owner = RetiredOwner {
         guardian: Some(guardian),

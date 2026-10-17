@@ -1,7 +1,7 @@
 // Pre-registration custody also needs bounded guardian retirement: there is
 // no enrolled Bun group yet, so test only the owned guardian child here.
-use std::io::{self, Read as _};
-use std::os::unix::net::UnixStream;
+use std::io::{self, BufRead as _, Read as _, Write as _};
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt as _;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
@@ -14,9 +14,10 @@ use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 
 use super::super::{
-    GUARDIAN_SHUTDOWN_DEADLINE, GuardianBootstrap, HostGuardian, REGISTRATION_ENV,
-    handshake_client, lifecycle_error, parse_app_link, reject_host_registration,
-    terminate_registered_group, write_group_registration,
+    CONTROL_PREPARE, CONTROL_PREPARED, CONTROL_SPAWNED, GUARDIAN_SHUTDOWN_DEADLINE,
+    GenerationControlRecord, GuardianBootstrap, HostGuardian, REGISTRATION_ENV, handshake_client,
+    lifecycle_error, parse_app_link, read_generation_control, reject_host_registration,
+    terminate_registered_group, write_generation_control, write_group_registration,
 };
 
 const FORGED_GROUP_ENV: &str = "KELD_TEST_KGR1_FOREIGN_GROUP";
@@ -89,6 +90,182 @@ fn authenticated_kgr1_cannot_claim_an_unrelated_live_process_group() {
     assert!(
         survives,
         "host cleanup killed a separate test-owned process group"
+    );
+}
+
+// KGC1 has the same native lineage boundary as KGR1. An authenticated
+// Guardian is not authority to enroll an arbitrary same-user process group
+// into the host's later SIGKILL fail-safe.
+const FORGED_KGC1_ENV: &str = "KELD_TEST_KGC1_FOREIGN_GROUP";
+const FORGED_KGC1_WITNESS_ENV: &str = "KELD_TEST_KGC1_FOREIGN_WITNESS";
+const FORGED_KGC1_ROLE: &str =
+    "macos_guardian::tests::rejected_registration_deadline::forged_kgc1_guardian_role";
+
+#[test]
+fn forged_kgc1_guardian_role() {
+    let Some(group) = std::env::var_os(FORGED_KGC1_ENV) else {
+        return;
+    };
+    let group: u32 = group
+        .to_str()
+        .expect("group pid UTF-8")
+        .parse()
+        .expect("pid");
+    let link = std::env::var(REGISTRATION_ENV).expect("authenticated KGC1 link");
+    let (endpoint, token) = parse_app_link(&link).expect("one-use private link");
+    let mut control = UnixStream::connect(endpoint).expect("connect private control");
+    handshake_client(&mut control, &token).expect("authenticate genuine Guardian link");
+    control
+        .set_read_timeout(Some(GUARDIAN_SHUTDOWN_DEADLINE))
+        .expect("bound rejection observation");
+    write_generation_control(
+        &mut control,
+        &GenerationControlRecord::new(CONTROL_PREPARE, 1),
+    )
+    .expect("request genuine host generation");
+    let prepared = read_generation_control(&mut control).expect("actual host prepare");
+    assert_eq!((prepared.kind, prepared.attempt), (CONTROL_PREPARED, 1));
+    assert!(
+        !prepared.payload.is_empty(),
+        "host minted real provisional lease"
+    );
+    write_generation_control(
+        &mut control,
+        &GenerationControlRecord::new(CONTROL_SPAWNED, 1).with_pid(group),
+    )
+    .expect("submit deliberately foreign group");
+    let response = read_generation_control(&mut control);
+    assert!(
+        response.is_err(),
+        "host must not send REGISTERED for an unrelated group: {:?}",
+        response.map(|record| (record.kind, record.attempt))
+    );
+    let socket = std::env::var_os(FORGED_KGC1_WITNESS_ENV).expect("controller witness link");
+    let mut witness = UnixStream::connect(socket).expect("connect host rejection witness");
+    writeln!(witness, "DENIED {group}").expect("report actual failed REGISTERED read");
+    // Stay alive until the host observes its control worker's denial.
+    let mut byte = [0_u8; 1];
+    assert_eq!(
+        io::stdin().read(&mut byte).expect("read terminal host EOF"),
+        0,
+        "rejected KGC1 Guardian must never receive a release byte"
+    );
+}
+
+struct TestOwnedOutsider(std::process::Child);
+
+impl Drop for TestOwnedOutsider {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[test]
+fn authenticated_kgc1_cannot_enroll_or_kill_unrelated_live_process_group() {
+    let temp = tempfile::tempdir().expect("owned KGC1 witness fixture");
+    let witness_path = temp.path().join("denied.sock");
+    let listener = UnixListener::bind(&witness_path).expect("private KGC1 witness socket");
+    listener
+        .set_nonblocking(true)
+        .expect("bounded witness accept");
+    let mut outsider = TestOwnedOutsider(
+        Command::new("/bin/sleep")
+            .arg("30")
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn private test-owned outsider process group"),
+    );
+    let group = outsider.0.id();
+    assert_eq!(
+        nix::unistd::getpgid(Some(Pid::from_raw(i32::try_from(group).expect("pid fits")))),
+        Ok(Pid::from_raw(i32::try_from(group).expect("pid fits"))),
+        "native outsider must be its own group leader"
+    );
+    let mut command = Command::new(std::env::current_exe().expect("unit-test binary"));
+    command
+        .args(["--exact", FORGED_KGC1_ROLE, "--nocapture"])
+        .env(FORGED_KGC1_ENV, group.to_string())
+        .env(FORGED_KGC1_WITNESS_ENV, &witness_path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit());
+    let mut primary = GuardianBootstrap::spawn_supervised(command)
+        .expect("spawn authenticated adversarial Guardian")
+        .register_guarded_primary_until(Instant::now() + GUARDIAN_SHUTDOWN_DEADLINE)
+        .expect("retain genuine KGC1 Guardian before hostile SPAWNED");
+    let deadline = Instant::now() + GUARDIAN_SHUTDOWN_DEADLINE;
+    let refusal = loop {
+        match primary.poll_fatal() {
+            Ok(()) if Instant::now() < deadline => thread::yield_now(),
+            Ok(()) => panic!("host accepted foreign KGC1 group without terminating the worker"),
+            Err(error) => break error.to_string(),
+        }
+    };
+    // First observe the product's effect. The test-owned rescue runs only
+    // after this observation and cannot make a dead outsider count as alive.
+    let outsider_survived = outsider
+        .0
+        .try_wait()
+        .expect("inspect exactly owned outsider")
+        .is_none();
+    let no_registered_group = primary.group_pid().is_none();
+    // The independent Guardian role must have observed the actual missing
+    // REGISTERED wire response, not merely the host's own error string.
+    let witness = loop {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                let mut receipt = String::new();
+                std::io::BufReader::new(stream)
+                    .read_line(&mut receipt)
+                    .expect("read actual Guardian response witness");
+                break receipt;
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                assert!(Instant::now() < deadline, "real KGC1 denial witness absent");
+                thread::yield_now();
+            }
+            Err(error) => panic!("accept KGC1 denial witness: {error}"),
+        }
+    };
+    primary.liveness_writer.take();
+    let status = loop {
+        match primary
+            .child
+            .try_wait()
+            .expect("inspect authentic Guardian role")
+        {
+            Some(status) => break status,
+            None if Instant::now() < deadline => thread::yield_now(),
+            None => {
+                let _ = primary.child.kill();
+                let _ = primary.child.wait();
+                panic!("authentic Guardian role failed to exit on host EOF");
+            }
+        }
+    };
+    assert!(
+        refusal.contains("direct child"),
+        "untrusted KGC1 group must fail native lineage validation: {refusal}"
+    );
+    assert!(
+        no_registered_group,
+        "foreign group was retained as kill authority"
+    );
+    assert_eq!(
+        witness,
+        format!("DENIED {group}\n"),
+        "Guardian wire denial witness"
+    );
+    assert!(
+        status.success(),
+        "authentic Guardian role failed its exact --exact assertions"
+    );
+    assert!(
+        outsider_survived,
+        "fatal Guardian cleanup signaled an unrelated test-owned process group"
     );
 }
 use super::long_running_command;

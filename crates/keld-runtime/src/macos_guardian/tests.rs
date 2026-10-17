@@ -20,11 +20,13 @@ mod generation_host;
 
 mod supervised_bootstrap;
 
+mod generic_pre_registration_crash;
 mod guardian_crash_pre_registration;
 mod liveness_and_shutdown;
 mod pre_registration_host_death;
 mod process_group_failsafe;
 mod rejected_registration_deadline;
+pub(super) mod retained_ack;
 
 mod guarded_primary_shutdown;
 mod worker_outcome;

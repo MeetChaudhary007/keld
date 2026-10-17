@@ -202,7 +202,15 @@ impl GuardianBootstrap {
             self.quit_ack_reader.take(),
             group_pid,
         )?;
-        if let Err(source) = stream.write_all(&[HOST_GROUP_RETAINED_ACK]) {
+        // Only the test build can stop this shipping-path transition after
+        // the host has taken custody but before the Guardian can permit exec.
+        #[cfg(test)]
+        let ack =
+            super::tests::retained_ack::hold_before_group_ack(group_pid, guardian.guardian_pid())
+                .and_then(|()| stream.write_all(&[HOST_GROUP_RETAINED_ACK]));
+        #[cfg(not(test))]
+        let ack = stream.write_all(&[HOST_GROUP_RETAINED_ACK]);
+        if let Err(source) = ack {
             let primary = lifecycle_error("macOS guardian group-retention acknowledgment", source);
             return Err(match guardian.shutdown() {
                 Ok(_) => primary,
@@ -225,8 +233,31 @@ impl GuardianBootstrap {
     /// Returns a typed lifecycle failure if guardian authentication, handle
     /// extraction, control-channel setup, or host-worker creation fails.
     pub fn register_guarded_primary_until(
+        self,
+        deadline: Instant,
+    ) -> Result<GuardedPrimary, RuntimeError> {
+        self.register_guarded_primary_until_inner(
+            deadline,
+            #[cfg(test)]
+            None,
+        )
+    }
+
+    #[cfg(test)]
+    pub(super) fn register_guarded_primary_until_with_registration_fence(
+        self,
+        deadline: Instant,
+        fence: super::generation_host::GenerationRegistrationFence,
+    ) -> Result<GuardedPrimary, RuntimeError> {
+        self.register_guarded_primary_until_inner(deadline, Some(fence))
+    }
+
+    fn register_guarded_primary_until_inner(
         mut self,
         deadline: Instant,
+        #[cfg(test)] registration_fence: Option<
+            super::generation_host::GenerationRegistrationFence,
+        >,
     ) -> Result<GuardedPrimary, RuntimeError> {
         let admission = self
             .registration
@@ -282,7 +313,14 @@ impl GuardianBootstrap {
                 ),
             ));
         };
-        GuardedPrimary::start(child, liveness_writer, quit_ack_reader, control)
+        GuardedPrimary::start(
+            child,
+            liveness_writer,
+            quit_ack_reader,
+            control,
+            #[cfg(test)]
+            registration_fence,
+        )
     }
 
     fn reject_registration(&mut self, error: RuntimeError) -> RuntimeError {

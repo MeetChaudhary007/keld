@@ -34,6 +34,27 @@ fn guardian_exchange(
     response
 }
 
+// Native generation-host fixture: group leaders below are real direct children
+// of this test process, which is the deliberately retained host/Guardian owner.
+fn start_generation_host_fixture(
+    host: std::os::unix::net::UnixStream,
+    updates_tx: mpsc::Sender<GuardedPrimaryUpdate>,
+    current: Arc<Mutex<Option<super::super::RegisteredPrimaryGeneration>>>,
+    recovery: Arc<Mutex<RecoveryState>>,
+) -> std::thread::JoinHandle<Result<(), RuntimeError>> {
+    std::thread::spawn(move || {
+        run_generation_host(
+            std::process::id(),
+            host,
+            &updates_tx,
+            &current,
+            &recovery,
+            None,
+            None,
+        )
+    })
+}
+
 #[test]
 fn generation_host_rejects_out_of_order_revoke_before_prepare() {
     let (host, mut guardian) = std::os::unix::net::UnixStream::pair().expect("KGC1 pair");
@@ -45,10 +66,12 @@ fn generation_host_rejects_out_of_order_revoke_before_prepare() {
     )
     .expect("write out-of-order revoke");
     let error = run_generation_host(
+        std::process::id(), // unit peer: direct child groups belong to this harness
         host,
         &updates_tx,
         &current,
         &Mutex::new(RecoveryState::new()),
+        None,
         None,
     )
     .expect_err("revoke before prepare must fail");
@@ -72,9 +95,7 @@ fn generation_host_revokes_and_clears_before_preparing_successor() {
     lock_recovery(&recovery_armed).arm();
     let host_current = Arc::clone(&current);
     let host_recovery = Arc::clone(&recovery_armed);
-    let host_thread = std::thread::spawn(move || {
-        run_generation_host(host, &updates_tx, &host_current, &host_recovery, None)
-    });
+    let host_thread = start_generation_host_fixture(host, updates_tx, host_current, host_recovery);
 
     let prepared_one = guardian_exchange(
         &mut guardian,

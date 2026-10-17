@@ -46,6 +46,9 @@ impl GuardedPrimary {
         liveness_writer: ChildStdin,
         quit_ack_reader: ChildStdout,
         control: std::os::unix::net::UnixStream,
+        #[cfg(test)] registration_fence: Option<
+            super::generation_host::GenerationRegistrationFence,
+        >,
     ) -> Result<Self, RuntimeError> {
         match child.try_wait() {
             Ok(Some(status)) => {
@@ -70,16 +73,22 @@ impl GuardedPrimary {
         let (updates_tx, updates_rx) = mpsc::channel();
         let generation_for_worker = Arc::clone(&current_generation);
         let recovery_for_worker = Arc::clone(&recovery_decision);
+        // Bind every later KGC1 SPAWNED record to this retained OS child.
+        // A valid control token alone does not authorize an arbitrary PGID.
+        let guardian_pid = child.id();
         let worker = match thread::Builder::new()
             .name("keld-runtime-guardian-generation-host".to_owned())
             .spawn(move || {
                 run_generation_host(
+                    guardian_pid,
                     control,
                     &updates_tx,
                     &generation_for_worker,
                     &recovery_for_worker,
                     #[cfg(test)]
                     None,
+                    #[cfg(test)]
+                    registration_fence.as_ref(),
                 )
             }) {
             Ok(worker) => worker,
