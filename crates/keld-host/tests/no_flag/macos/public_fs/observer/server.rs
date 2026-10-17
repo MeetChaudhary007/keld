@@ -4,7 +4,7 @@ use super::recovery::{RecoveryCommand, RecoveryObserver};
 use super::respond;
 use crate::support::EVENT_DEADLINE;
 use serde_json::Value;
-use std::net::TcpListener;
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread::{self, JoinHandle};
@@ -49,11 +49,26 @@ impl Observation {
         Self::bind_with_recovery(true, false)
     }
 
-    pub(super) fn bind_with_accept_receipts() -> (Self, mpsc::Receiver<std::net::SocketAddr>) {
+    pub(in crate::public_fs) fn bind_with_accept_receipts()
+    -> (Self, mpsc::Receiver<std::net::SocketAddr>) {
         let (send, receives) = mpsc::channel();
         (
-            Self::bind_with_recovery_and_receipts(false, false, Some(send)),
+            Self::bind_with_recovery_and_receipts(false, false, Some(send), None),
             receives,
+        )
+    }
+
+    /// The real app awaits its observation POST response before sending /quit.
+    /// Withhold that response only in the adversarial native test until its
+    /// independent idle peer has been *accepted*, then release app execution.
+    pub(in crate::public_fs) fn bind_with_app_result_gate()
+    -> (Self, mpsc::Receiver<std::net::SocketAddr>, mpsc::Sender<()>) {
+        let (receipt_tx, receipt_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        (
+            Self::bind_with_recovery_and_receipts(false, false, Some(receipt_tx), Some(release_rx)),
+            receipt_rx,
+            release_tx,
         )
     }
 
@@ -71,13 +86,14 @@ impl Observation {
     }
 
     fn bind_with_recovery(recovery_mode: bool, retain_fixture_quits: bool) -> Self {
-        Self::bind_with_recovery_and_receipts(recovery_mode, retain_fixture_quits, None)
+        Self::bind_with_recovery_and_receipts(recovery_mode, retain_fixture_quits, None, None)
     }
 
     fn bind_with_recovery_and_receipts(
         recovery_mode: bool,
         retain_fixture_quits: bool,
         accept_receipts: Option<mpsc::Sender<std::net::SocketAddr>>,
+        app_result_ack_release: Option<mpsc::Receiver<()>>,
     ) -> Self {
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("prearm public FS observer");
         let port = listener.local_addr().expect("observer address").port();
@@ -86,94 +102,29 @@ impl Observation {
             .expect("responsive observer accept loop");
         let (send, reports) = mpsc::channel();
         let (quit, commands) = mpsc::channel();
-        let (recovery_commands, mut recovery) = if recovery_mode {
+        let (recovery_commands, recovery) = if recovery_mode {
             let (send, receive) = mpsc::channel();
             (Some(send), Some(RecoveryObserver::new(receive)))
         } else {
             (None, None)
         };
         let stop = Arc::new(AtomicBool::new(false));
-        let stopping = Arc::clone(&stop);
-        let thread = thread::spawn(move || {
-            let mut pending_quit = None;
-            let mut fixture_quits = Vec::new();
-            let mut released = false;
-            let mut peers: Vec<PendingHttpRequest> = Vec::new();
-            while !stopping.load(Ordering::Acquire) {
-                if let Some(recovery) = recovery.as_mut() {
-                    recovery.poll();
-                }
-                released |= commands.try_recv().is_ok();
-                if released && let Some(mut stream) = pending_quit.take() {
-                    respond(&mut stream, "quit");
-                }
-                // One silent keep-alive or split request must not prevent the
-                // owner from observing Quit, other reports, or recovery signals.
-                let mut index = 0;
-                while index < peers.len() {
-                    let (path, body) = match peers[index].poll() {
-                        RequestPoll::Pending => {
-                            index += 1;
-                            continue;
-                        }
-                        RequestPoll::Closed => {
-                            peers.remove(index);
-                            continue;
-                        }
-                        RequestPoll::Ready(path, body) => (path, body),
-                    };
-                    // Preserve accept order when several complete requests
-                    // become readable in the same pass.
-                    let mut stream = peers.remove(index).into_stream();
-                    match path.as_str() {
-                        "/observe" => {
-                            let report: Value =
-                                serde_json::from_slice(&body).expect("actual app/page JSON");
-                            respond(&mut stream, "recorded");
-                            send.send(report).expect("report observed data");
-                        }
-                        "/quit" if retain_fixture_quits => {
-                            assert!(fixture_quits.len() < 2, "only G1/G2 fixture Quit waits");
-                            fixture_quits.push(stream);
-                        }
-                        "/quit" => {
-                            assert!(pending_quit.is_none(), "one public app Quit barrier");
-                            if released {
-                                respond(&mut stream, "quit");
-                            } else {
-                                pending_quit = Some(stream);
-                            }
-                        }
-                        _ => match recovery.as_mut() {
-                            Some(recovery) => {
-                                if let Some(report) = recovery.accept_wait(&path, stream) {
-                                    send.send(report).expect("pending handler observation");
-                                }
-                            }
-                            None => panic!("unexpected public FS observation route {path}"),
-                        },
-                    }
-                }
-                match listener.accept() {
-                    Ok((stream, peer)) => {
-                        if let Some(receipt) = &accept_receipts {
-                            receipt
-                                .send(peer)
-                                .expect("native observer peer receipt owner");
-                        }
-                        assert!(
-                            peers.len() < 32,
-                            "native fixture cannot retain an unbounded number of HTTP peers"
-                        );
-                        peers.push(PendingHttpRequest::new(stream));
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        thread::yield_now();
-                    }
-                    Err(error) => panic!("public FS observer accept: {error}"),
-                }
-            }
-        });
+        let server = ObserverServer {
+            listener,
+            send,
+            commands,
+            recovery,
+            stopping: Arc::clone(&stop),
+            accept_receipts,
+            app_result_ack_release,
+            retain_fixture_quits,
+            pending_quit: None,
+            fixture_quits: Vec::new(),
+            released: false,
+            held_app_result_reply: None,
+            peers: Vec::new(),
+        };
+        let thread = thread::spawn(move || server.run());
         Self {
             port,
             reports,
@@ -201,5 +152,143 @@ impl Observation {
 impl Drop for Observation {
     fn drop(&mut self) {
         self.stop_and_join();
+    }
+}
+
+/// Sole mutable owner of the test HTTP socket set and control/recovery signals.
+/// Pending requests never block another socket or the release of a Quit barrier.
+struct ObserverServer {
+    listener: TcpListener,
+    send: mpsc::Sender<Value>,
+    commands: mpsc::Receiver<()>,
+    recovery: Option<RecoveryObserver>,
+    stopping: Arc<AtomicBool>,
+    accept_receipts: Option<mpsc::Sender<SocketAddr>>,
+    app_result_ack_release: Option<mpsc::Receiver<()>>,
+    retain_fixture_quits: bool,
+    pending_quit: Option<TcpStream>,
+    fixture_quits: Vec<TcpStream>,
+    released: bool,
+    held_app_result_reply: Option<TcpStream>,
+    peers: Vec<PendingHttpRequest>,
+}
+
+impl ObserverServer {
+    fn run(mut self) {
+        while !self.stopping.load(Ordering::Acquire) {
+            self.poll_controls();
+            self.poll_peers();
+            self.accept_one();
+        }
+    }
+
+    fn poll_controls(&mut self) {
+        if let Some(recovery) = self.recovery.as_mut() {
+            recovery.poll();
+        }
+        self.released |= self.commands.try_recv().is_ok();
+        if self
+            .app_result_ack_release
+            .as_ref()
+            .is_some_and(|release| release.try_recv().is_ok())
+        {
+            let mut stream = self
+                .held_app_result_reply
+                .take()
+                .expect("only a held app-result HTTP response can be released");
+            respond(&mut stream, "recorded");
+        }
+        if self.released
+            && let Some(mut stream) = self.pending_quit.take()
+        {
+            respond(&mut stream, "quit");
+        }
+    }
+
+    fn poll_peers(&mut self) {
+        // One silent keep-alive or split request must not prevent Quit,
+        // another report, or the independent recovery command lane.
+        let mut index = 0;
+        while index < self.peers.len() {
+            let (path, body) = match self.peers[index].poll() {
+                RequestPoll::Pending => {
+                    index += 1;
+                    continue;
+                }
+                RequestPoll::Closed => {
+                    self.peers.remove(index);
+                    continue;
+                }
+                RequestPoll::Ready(path, body) => (path, body),
+            };
+            // Preserve accept order among peers that complete in this pass.
+            let stream = self.peers.remove(index).into_stream();
+            self.route_request(&path, &body, stream);
+        }
+    }
+
+    fn route_request(&mut self, path: &str, body: &[u8], mut stream: TcpStream) {
+        match path {
+            "/observe" => {
+                let report: Value = serde_json::from_slice(body).expect("actual app/page JSON");
+                if self.app_result_ack_release.is_some() && report["phase"] == "app-result" {
+                    assert!(
+                        self.held_app_result_reply.is_none(),
+                        "one gated app-result acknowledgement"
+                    );
+                    self.held_app_result_reply = Some(stream);
+                    self.send
+                        .send(report)
+                        .expect("gated result reached independent test");
+                } else {
+                    respond(&mut stream, "recorded");
+                    self.send.send(report).expect("report observed data");
+                }
+            }
+            "/quit" if self.retain_fixture_quits => {
+                assert!(
+                    self.fixture_quits.len() < 2,
+                    "only G1/G2 fixture Quit waits"
+                );
+                self.fixture_quits.push(stream);
+            }
+            "/quit" => {
+                assert!(self.pending_quit.is_none(), "one public app Quit barrier");
+                if self.released {
+                    respond(&mut stream, "quit");
+                } else {
+                    self.pending_quit = Some(stream);
+                }
+            }
+            _ => match self.recovery.as_mut() {
+                Some(recovery) => {
+                    if let Some(report) = recovery.accept_wait(path, stream) {
+                        self.send.send(report).expect("pending handler observation");
+                    }
+                }
+                None => panic!("unexpected public FS observation route {path}"),
+            },
+        }
+    }
+
+    fn accept_one(&mut self) {
+        match self.listener.accept() {
+            Ok((stream, peer)) => {
+                if let Some(receipt) = &self.accept_receipts {
+                    receipt
+                        .send(peer)
+                        .expect("native observer peer receipt owner");
+                }
+                assert!(
+                    self.peers.len() < 32,
+                    "native fixture cannot retain an unbounded number of HTTP peers"
+                );
+                self.peers.push(PendingHttpRequest::new(stream));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::yield_now();
+            }
+            Err(error) => panic!("public FS observer accept: {error}"),
+        }
     }
 }

@@ -85,11 +85,11 @@ fn run_launch_without_window_census(
     exercise: Exercise,
     hold_silent_observer_peer: bool,
 ) -> LaunchEvidence {
-    let (observer, accept_receipts) = if hold_silent_observer_peer {
-        let (observer, receipts) = Observation::bind_with_accept_receipts();
-        (observer, Some(receipts))
+    let (observer, accept_receipts, app_result_ack_release) = if hold_silent_observer_peer {
+        let (observer, receipts, release) = Observation::bind_with_app_result_gate();
+        (observer, Some(receipts), Some(release))
     } else {
-        (Observation::bind(), None)
+        (Observation::bind(), None, None)
     };
     let prepared = match exercise {
         Exercise::PublicAppRetirement => fixture.prepare_retirement(launch, observer.port),
@@ -123,10 +123,11 @@ fn run_launch_without_window_census(
         &fixture.scope,
         evidence.family.expect("independent native Bun census").bun,
     );
-    // Park only an independently accepted, byte-silent peer *after* the
-    // complete app-result. The original fixture blocked in a synchronous
-    // read from this peer and never served Bun's subsequent /quit request.
-    let idle = accept_receipts.map(|receipts| {
+    // The opted-in fixture has reported app-result but withheld its HTTP
+    // response. Bun still awaits that response and cannot issue /quit yet.
+    // Park an independently accepted byte-silent peer first, then release the
+    // response so /quit is necessarily queued behind that silent connection.
+    let idle = accept_receipts.as_ref().map(|receipts| {
         let stream = TcpStream::connect(("127.0.0.1", observer.port))
             .expect("test-owned silent observer connection");
         let expected = stream.local_addr().expect("test-owned peer address");
@@ -141,6 +142,11 @@ fn run_launch_without_window_census(
         }
         stream
     });
+    if let Some(release) = app_result_ack_release {
+        release
+            .send(())
+            .expect("release real Bun app-result acknowledgement");
+    }
     observer.quit.send(()).expect("release real public Quit");
     let output = wait_child_output(
         cleanup.cli.take().expect("retained real shipping host"),
