@@ -11,8 +11,8 @@ use nix::sys::signal::{Signal, kill, killpg};
 use nix::unistd::{Pid, getpgid};
 
 use super::{
-    BUN_ENV, CUT_ENV, MARKER_ENV, RetainedCut, process_role, read_marker, receive_event,
-    validate_guardian_child_group, verified_real_bun,
+    BUN_ENV, CUT_ENV, MARKER_ENV, RetainedCut, observe_group_identity, process_role, read_marker,
+    receive_event, validate_guardian_child_group, verified_real_bun,
 };
 
 #[test]
@@ -32,19 +32,24 @@ fn simultaneous_host_guardian_sigkill_after_bun_exec_requires_external_os_custod
         .stderr(Stdio::inherit());
     let host = command.spawn().expect("real host for independent Guardian");
     let host_group = i32::try_from(host.id()).expect("native host group");
+    let mut owners = RetainedCut {
+        host: Some(host),
+        host_group,
+        host_birth: None,
+        group: None,
+        group_birth: None,
+        descendant: None,
+    };
+    owners.host_birth = Some(
+        observe_group_identity(u32::try_from(host_group).expect("positive host PID"))
+            .expect("capture original host-group kernel birth"),
+    );
     assert_ne!(Pid::from_raw(host_group), nix::unistd::getpgrp());
     assert_eq!(
         getpgid(Some(Pid::from_raw(host_group))),
         Ok(Pid::from_raw(host_group)),
         "actual test host must lead its isolated group"
     );
-    let mut owners = RetainedCut {
-        host: Some(host),
-        host_group,
-        guardian: None,
-        group: None,
-        descendant: None,
-    };
     let deadline = Instant::now() + Duration::from_secs(10);
     let (mut held, receipt) = receive_event(&listener, deadline);
     let parts: Vec<&str> = receipt.split_whitespace().collect();
@@ -57,9 +62,10 @@ fn simultaneous_host_guardian_sigkill_after_bun_exec_requires_external_os_custod
     let raw_group = i32::try_from(group).expect("Bun group fits");
     let raw_guardian = i32::try_from(guardian).expect("Guardian PID fits");
     owners.group = Some(raw_group);
-    owners.guardian = Some(raw_guardian);
-    validate_guardian_child_group(group, guardian)
-        .expect("real Bun is the retained Guardian's direct OS child");
+    owners.group_birth = Some(
+        validate_guardian_child_group(group, guardian)
+            .expect("real Bun is the retained Guardian's direct OS child"),
+    );
     assert_eq!(
         getpgid(Some(Pid::from_raw(raw_guardian))),
         Ok(Pid::from_raw(host_group)),
@@ -83,8 +89,11 @@ fn simultaneous_host_guardian_sigkill_after_bun_exec_requires_external_os_custod
     // would leave the Guardian able to terminate Bun and give false confidence.
     killpg(Pid::from_raw(host_group), Signal::SIGKILL)
         .expect("terminate the exact test-owned host plus Guardian group");
-    let mut host = owners.host.take().expect("sole host child owner");
+    // Preserve the owned Child in the cleanup guard across a failed wait.
+    let host = owners.host.as_mut().expect("sole host child owner");
     assert_eq!(host.wait().expect("reap host").signal(), Some(9));
+    owners.host_birth = None;
+    let _ = owners.host.take(); // original host is now reaped
 
     // This is an intentionally RED product-security boundary. Observe both
     // real Bun and descendant still live BEFORE the fixture's Drop rescues
@@ -97,5 +106,16 @@ fn simultaneous_host_guardian_sigkill_after_bun_exec_requires_external_os_custod
         bun_alive && descendant_alive && descendant_still_enrolled,
         "without a surviving external OS custodian, the raw-stage Guardian cannot guarantee cleanup after simultaneous owner SIGKILL"
     );
-    // Test-only RetainedCut Drop will now retire that still-live native group.
+    // The negative product oracle precedes this test-only rescue. Check the
+    // original birth and actual kernel absence rather than letting a fallible
+    // Drop silently leak a live Bun/descendant after reporting test success.
+    let birth = owners
+        .group_birth
+        .expect("the original enrolled Bun group remains in test custody");
+    super::terminate_attested_group(birth)
+        .expect("test-only dual-death group rescue must retire the original birth");
+    super::group_gone(raw_group, Some(descendant), raw_guardian);
+    owners.group_birth = None;
+    owners.group = None;
+    owners.descendant = None;
 }

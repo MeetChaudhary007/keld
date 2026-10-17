@@ -3,15 +3,16 @@
 use std::io::{self, Read as _, Write as _};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use nix::sys::signal::{Signal, killpg};
 use nix::unistd::{Pid, getpgid};
 
-use super::super::process_group::validate_guardian_child_group;
+use super::super::process_group::{
+    GroupIdentity, observe_group_identity, terminate_attested_group, validate_guardian_child_group,
+};
 use super::super::{GUARDIAN_SHUTDOWN_DEADLINE, GuardianBootstrap, run};
 use super::test_support::{kernel_process_image, verified_real_bun};
 
@@ -150,43 +151,75 @@ fn process_role(role: &str) -> Command {
     command
 }
 
-// Own test-created PIDs from their birth. Rescue never proves product success.
+// Only retained original kernel births, not raw test-reported PIDs, can
+// authorize rescue. Even a private marker or live getpgid membership cannot
+// attest who originally owned a possibly recycled numeric process group.
 struct RetainedCut {
     host: Option<Child>,
     host_group: i32,
-    guardian: Option<i32>,
+    host_birth: Option<GroupIdentity>,
     group: Option<i32>,
+    group_birth: Option<GroupIdentity>,
     descendant: Option<i32>,
 }
 
 impl Drop for RetainedCut {
     fn drop(&mut self) {
+        // When possible, signal the original host group while its owned Child
+        // is still retained and unreaped. A stale bare Guardian PID is never
+        // a substitute for a retained original group birth.
+        if let Some(birth) = self.host_birth.take()
+            && i32::try_from(birth.pid).ok() == Some(self.host_group)
+            && Pid::from_raw(self.host_group) != nix::unistd::getpgrp()
+        {
+            let _ = terminate_attested_group(birth);
+        }
         if let Some(host) = self.host.as_mut() {
             let _ = host.kill();
             let _ = host.wait();
         }
-        // The test host is the leader of its *own* isolated process group.
-        // Its Guardian stays in that group, whereas Bun runs in a separate
-        // group. Never SIGKILL a bare saved Guardian PID after its host died:
-        // that numeric PID might have been recycled.
-        let host_group = Pid::from_raw(self.host_group);
-        if let Some(guardian) = self.guardian
-            && host_group != nix::unistd::getpgrp()
-            && getpgid(Some(Pid::from_raw(guardian))) == Ok(host_group)
+        if let Some(birth) = self.group_birth.take()
+            && let Ok(raw) = i32::try_from(birth.pid)
+            && self.group == Some(raw)
+            && Pid::from_raw(raw) != nix::unistd::getpgrp()
         {
-            let _ = killpg(host_group, Signal::SIGKILL);
-        }
-        if let Some(group) = self.group {
-            let pid = Pid::from_raw(group);
-            let actual_leader = getpgid(Some(pid)) == Ok(pid);
-            let actual_descendant = self
-                .descendant
-                .is_some_and(|child| getpgid(Some(Pid::from_raw(child))) == Ok(pid));
-            if (actual_leader || actual_descendant) && pid != nix::unistd::getpgrp() {
-                let _ = killpg(pid, Signal::SIGKILL);
-            }
+            let _ = terminate_attested_group(birth);
         }
     }
+}
+
+/// Spawn the exact retained host and install panic cleanup before any later
+/// kernel or Guardian assertions can fail. The original OS birth is retained.
+fn spawn_retained_host(socket: &Path, marker: &Path, bun: &Path) -> RetainedCut {
+    let mut host_command = process_role("host");
+    host_command
+        .env(CUT_ENV, socket)
+        .env(MARKER_ENV, marker)
+        .env(BUN_ENV, bun)
+        .stderr(Stdio::inherit())
+        .process_group(0);
+    let host = host_command
+        .spawn()
+        .expect("start isolated real host subprocess");
+    let host_group = i32::try_from(host.id()).expect("real host PGID fits");
+    let mut cut = RetainedCut {
+        host: Some(host),
+        host_group,
+        host_birth: None,
+        group: None,
+        group_birth: None,
+        descendant: None,
+    };
+    cut.host_birth = Some(
+        observe_group_identity(u32::try_from(host_group).expect("positive host PID"))
+            .expect("retain original test host group birth"),
+    );
+    assert_eq!(
+        getpgid(Some(Pid::from_raw(host_group))),
+        Ok(Pid::from_raw(host_group)),
+        "test host must own a separate cleanup process group"
+    );
+    cut
 }
 
 fn native_retained_ack_cut(release_ack: bool) {
@@ -196,29 +229,7 @@ fn native_retained_ack_cut(release_ack: bool) {
     let marker: PathBuf = temp.path().join("bun-and-descendant.pid");
     let listener = UnixListener::bind(&socket).expect("owned test control socket");
     listener.set_nonblocking(true).expect("bounded accept loop");
-    let mut host_command = process_role("host");
-    host_command
-        .env(CUT_ENV, &socket)
-        .env(MARKER_ENV, &marker)
-        .env(BUN_ENV, bun)
-        .stderr(Stdio::inherit())
-        .process_group(0);
-    let host = host_command
-        .spawn()
-        .expect("start isolated real host subprocess");
-    let host_group = i32::try_from(host.id()).expect("real host PGID fits");
-    assert_eq!(
-        getpgid(Some(Pid::from_raw(host_group))),
-        Ok(Pid::from_raw(host_group)),
-        "test host must own a separate cleanup process group"
-    );
-    let mut cut = RetainedCut {
-        host: Some(host),
-        host_group,
-        guardian: None,
-        group: None,
-        descendant: None,
-    };
+    let mut cut = spawn_retained_host(&socket, &marker, &bun);
     let deadline = Instant::now() + Duration::from_secs(10);
     let (mut ack_fence, receipt) = receive_event(&listener, deadline);
     let parts: Vec<&str> = receipt.split_whitespace().collect();
@@ -231,10 +242,11 @@ fn native_retained_ack_cut(release_ack: bool) {
     let group_i32 = i32::try_from(group).expect("native group PID");
     let guardian_i32 = i32::try_from(guardian).expect("native Guardian PID");
     cut.group = Some(group_i32);
-    cut.guardian = Some(guardian_i32);
     assert_ne!(Pid::from_raw(group_i32), nix::unistd::getpgrp());
-    validate_guardian_child_group(group, guardian)
-        .expect("host-retained group is truly Guardian's live direct child");
+    cut.group_birth = Some(
+        validate_guardian_child_group(group, guardian)
+            .expect("host-retained group is truly Guardian's live direct child"),
+    );
     let original_image = observe_pre_ack_image(group_i32, &marker);
 
     if release_ack {
@@ -256,9 +268,11 @@ fn native_retained_ack_cut(release_ack: bool) {
         );
     }
     let killed_at = Instant::now();
-    let mut host = cut.host.take().expect("sole host subprocess owner");
+    // Keep the original owned Child and its unreaped PID (the host PGID
+    // leader) in the guard until Guardian completion and group retirement.
+    // This also keeps the exact original PGID reserved across failure cuts.
+    let host = cut.host.as_mut().expect("sole host subprocess owner");
     host.kill().expect("SIGKILL real host during held-ACK cut");
-    assert_eq!(host.wait().expect("reap host child").signal(), Some(9));
     // Host death closes both its liveness writer and KGR1 stream. Before
     // ACK, the pre-exec child must deny and exit without any Bun code.
     let (_finished, witness) = receive_event(&listener, Instant::now() + Duration::from_secs(10));
@@ -278,8 +292,19 @@ fn native_retained_ack_cut(release_ack: bool) {
         );
         assert!(!marker.exists(), "host died before ACK yet Bun executed");
     }
-    cut.guardian = None;
+    assert_eq!(
+        cut.host
+            .as_mut()
+            .expect("original retained host")
+            .wait()
+            .expect("reap host child after Guardian/group retirement")
+            .signal(),
+        Some(9)
+    );
+    cut.host_birth = None;
+    let _ = cut.host.take(); // original live birth is disarmed only after reap
     cut.group = None;
+    cut.group_birth = None;
     cut.descendant = None;
 }
 

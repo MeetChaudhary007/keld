@@ -19,6 +19,13 @@ fn idle_accepted_http_peer_cannot_block_a_released_public_quit() {
     // Observe the fixture's actual accept event, not merely a successful
     // connect: the regression requires an accepted but byte-silent peer.
     let (observer, accepts) = Observation::bind_with_accept_receipts();
+    assert_eq!(
+        observer
+            .quit_progress
+            .load(std::sync::atomic::Ordering::Acquire),
+        0,
+        "an idle accepted HTTP peer must not fabricate a public Quit receipt"
+    );
     let address = ("127.0.0.1", observer.port);
     let idle = TcpStream::connect(address).expect("first real idle peer");
     assert_eq!(
@@ -57,12 +64,70 @@ fn idle_accepted_http_peer_cannot_block_a_released_public_quit() {
     drop(idle);
     quit_client.join().expect("Quit request client cleanup");
     let (completed, response) = result.expect("bounded independent Quit response");
+    assert_eq!(
+        observer
+            .quit_progress
+            .load(std::sync::atomic::Ordering::Acquire),
+        2,
+        "the fixed redacted receipt must require a real replied HTTP Quit"
+    );
     assert!(completed, "idle peer starved released Quit");
     assert!(
         response.ends_with(b"\r\n\r\nquit"),
         "actual released HTTP Quit response was not delivered"
     );
     drop(observer);
+}
+
+#[test]
+fn received_public_quit_has_no_reply_until_the_independent_release() {
+    let observer = Observation::bind();
+    let mut stream = TcpStream::connect(("127.0.0.1", observer.port))
+        .expect("real independent public Quit peer");
+    stream
+        .write_all(b"GET /quit HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .expect("complete native HTTP Quit request");
+    let deadline = std::time::Instant::now() + EVENT_DEADLINE / 4;
+    loop {
+        let stage = observer
+            .quit_progress
+            .load(std::sync::atomic::Ordering::Acquire);
+        if stage == 1 {
+            break;
+        }
+        assert_eq!(stage, 0, "an unreleased HTTP Quit must not be answered");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "observer never recorded the real pending HTTP Quit request"
+        );
+        thread::yield_now();
+    }
+    stream
+        .set_nonblocking(true)
+        .expect("nonblocking check before independent release");
+    let mut one = [0_u8; 1];
+    assert!(
+        matches!(stream.read(&mut one), Err(error)
+            if error.kind() == std::io::ErrorKind::WouldBlock),
+        "receipt 1 means request seen, not an HTTP response received"
+    );
+    prepare_stream(&stream);
+    observer.quit.send(()).expect("release native Quit");
+    let mut response = Vec::new();
+    stream
+        .read_to_end(&mut response)
+        .expect("bounded HTTP response after release");
+    assert!(
+        response.ends_with(b"\r\n\r\nquit"),
+        "observer must reply with its exact public Quit body"
+    );
+    assert_eq!(
+        observer
+            .quit_progress
+            .load(std::sync::atomic::Ordering::Acquire),
+        2,
+        "the final receipt requires the actual written HTTP Quit response"
+    );
 }
 
 #[test]

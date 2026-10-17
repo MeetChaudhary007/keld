@@ -5,7 +5,7 @@ use super::respond;
 use crate::support::EVENT_DEADLINE;
 use serde_json::Value;
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread::{self, JoinHandle};
 
@@ -14,6 +14,9 @@ pub(in crate::public_fs) struct Observation {
     pub(in crate::public_fs) port: u16,
     pub(in crate::public_fs) reports: mpsc::Receiver<Value>,
     pub(in crate::public_fs) quit: mpsc::Sender<()>,
+    /// Fixed test-only receipt: 0=no HTTP /quit, 1=received, 2=replied.
+    /// No address, token, body, or real runtime protocol crosses this flag.
+    pub(in crate::public_fs) quit_progress: Arc<AtomicU8>,
     recovery_commands: Option<mpsc::Sender<RecoveryCommand>>,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
@@ -109,12 +112,14 @@ impl Observation {
             (None, None)
         };
         let stop = Arc::new(AtomicBool::new(false));
+        let quit_progress = Arc::new(AtomicU8::new(0));
         let server = ObserverServer {
             listener,
             send,
             commands,
             recovery,
             stopping: Arc::clone(&stop),
+            quit_progress: Arc::clone(&quit_progress),
             accept_receipts,
             app_result_ack_release,
             retain_fixture_quits,
@@ -129,6 +134,7 @@ impl Observation {
             port,
             reports,
             quit,
+            quit_progress,
             recovery_commands,
             stop,
             thread: Some(thread),
@@ -163,6 +169,7 @@ struct ObserverServer {
     commands: mpsc::Receiver<()>,
     recovery: Option<RecoveryObserver>,
     stopping: Arc<AtomicBool>,
+    quit_progress: Arc<AtomicU8>,
     accept_receipts: Option<mpsc::Sender<SocketAddr>>,
     app_result_ack_release: Option<mpsc::Receiver<()>>,
     retain_fixture_quits: bool,
@@ -202,6 +209,7 @@ impl ObserverServer {
             && let Some(mut stream) = self.pending_quit.take()
         {
             respond(&mut stream, "quit");
+            self.quit_progress.store(2, Ordering::Release);
         }
     }
 
@@ -246,6 +254,7 @@ impl ObserverServer {
                 }
             }
             "/quit" if self.retain_fixture_quits => {
+                self.quit_progress.store(1, Ordering::Release);
                 assert!(
                     self.fixture_quits.len() < 2,
                     "only G1/G2 fixture Quit waits"
@@ -253,9 +262,11 @@ impl ObserverServer {
                 self.fixture_quits.push(stream);
             }
             "/quit" => {
+                self.quit_progress.store(1, Ordering::Release);
                 assert!(self.pending_quit.is_none(), "one public app Quit barrier");
                 if self.released {
                     respond(&mut stream, "quit");
+                    self.quit_progress.store(2, Ordering::Release);
                 } else {
                     self.pending_quit = Some(stream);
                 }
