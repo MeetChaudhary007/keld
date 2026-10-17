@@ -12,7 +12,7 @@ use nix::sys::signal::{Signal, kill};
 use nix::unistd::{Pid, getpgid};
 
 use super::super::{GUARDIAN_SHUTDOWN_DEADLINE, GuardianBootstrap, run};
-use super::test_support::{await_spawned_gate, verified_real_bun};
+use super::test_support::{await_spawned_gate, kernel_process_image, verified_real_bun};
 
 const ROLE_ENV: &str = "KELD_TEST_GENERIC_PRE_REGISTER_ROLE";
 const MARKER_ENV: &str = "KELD_TEST_GENERIC_PRE_REGISTER_MARKER";
@@ -88,10 +88,23 @@ fn real_generic_guardian_sigkill_before_kgr1_registration_denies_bun_exec() {
             Ok(group_pid),
             "real pre-exec child owns its isolated group"
         );
-        assert!(
-            !marker.exists(),
-            "unregistered KGR1 Bun/descendant executed before Guardian crash"
-        );
+        let test_image = kernel_process_image(i32::try_from(std::process::id()).expect("PID"));
+        let held_until = Instant::now() + Duration::from_millis(100);
+        loop {
+            assert_eq!(
+                kernel_process_image(group),
+                test_image,
+                "generic KGR1 child exec'd Bun before host enrolled its group"
+            );
+            assert!(
+                !marker.exists(),
+                "unregistered KGR1 Bun/descendant executed before Guardian crash"
+            );
+            if Instant::now() >= held_until {
+                break;
+            }
+            thread::yield_now();
+        }
         let killed_at = Instant::now();
         kill(
             Pid::from_raw(i32::try_from(guardian_pid).expect("Guardian pid fits")),

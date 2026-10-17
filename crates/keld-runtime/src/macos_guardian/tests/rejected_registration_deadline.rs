@@ -1,6 +1,6 @@
 // Pre-registration custody also needs bounded guardian retirement: there is
 // no enrolled Bun group yet, so test only the owned guardian child here.
-use std::io::{self, BufRead as _, Read as _, Write as _};
+use std::io::{self, Read as _, Write as _};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt as _;
 use std::process::{Command, Stdio};
@@ -19,6 +19,9 @@ use super::super::{
     lifecycle_error, parse_app_link, read_generation_control, reject_host_registration,
     terminate_registered_group, write_generation_control, write_group_registration,
 };
+
+mod witness;
+use self::witness::await_denial_witness;
 
 const FORGED_GROUP_ENV: &str = "KELD_TEST_KGR1_FOREIGN_GROUP";
 const FORGED_GROUP_ROLE: &str =
@@ -214,22 +217,7 @@ fn authenticated_kgc1_cannot_enroll_or_kill_unrelated_live_process_group() {
     let no_registered_group = primary.group_pid().is_none();
     // The independent Guardian role must have observed the actual missing
     // REGISTERED wire response, not merely the host's own error string.
-    let witness = loop {
-        match listener.accept() {
-            Ok((stream, _)) => {
-                let mut receipt = String::new();
-                std::io::BufReader::new(stream)
-                    .read_line(&mut receipt)
-                    .expect("read actual Guardian response witness");
-                break receipt;
-            }
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                assert!(Instant::now() < deadline, "real KGC1 denial witness absent");
-                thread::yield_now();
-            }
-            Err(error) => panic!("accept KGC1 denial witness: {error}"),
-        }
-    };
+    let witness = await_denial_witness(&listener, deadline);
     primary.liveness_writer.take();
     let status = loop {
         match primary

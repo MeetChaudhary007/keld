@@ -72,11 +72,34 @@ pub(super) fn await_spawned_gate(listener: &UnixListener) -> (UnixStream, i32, u
         match listener.accept() {
             Ok((mut stream, _)) => {
                 stream
-                    .set_read_timeout(Some(Duration::from_secs(5)))
-                    .expect("bounded PID receipt");
-                let mut bytes = [0_u8; 80];
-                let count = stream.read(&mut bytes).expect("read gated PID");
-                let receipt = std::str::from_utf8(&bytes[..count]).expect("UTF-8 PID receipt");
+                    .set_nonblocking(true)
+                    .expect("bounded record observer");
+                let record_deadline = Instant::now() + Duration::from_secs(5);
+                let mut bytes = Vec::with_capacity(80);
+                loop {
+                    let mut byte = [0_u8; 1];
+                    match stream.read(&mut byte) {
+                        Ok(1) if byte[0] == b'\n' => break,
+                        Ok(1) => {
+                            bytes.push(byte[0]);
+                            assert!(bytes.len() <= 80, "bounded native PID record");
+                        }
+                        Ok(0) => panic!("truncated native pre-exec PID record"),
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                            ) => {}
+                        Err(error) => panic!("read pre-exec PID receipt: {error}"),
+                        Ok(_) => unreachable!("one-byte receipt read"),
+                    }
+                    assert!(
+                        Instant::now() < record_deadline,
+                        "pre-exec PID receipt exceeded its total deadline"
+                    );
+                    thread::yield_now();
+                }
+                let receipt = std::str::from_utf8(&bytes).expect("UTF-8 PID receipt");
                 let mut words = receipt.split_whitespace();
                 assert_eq!(words.next(), Some("SPAWNED"), "{receipt}");
                 let pid: i32 = words.next().expect("process group").parse().expect("PID");
