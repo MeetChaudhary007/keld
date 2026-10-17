@@ -216,6 +216,7 @@ fn denied_recovery_cannot_be_rearmed_by_late_ready() {
         updates_rx,
         worker: None,
         shutdown_attributed: false,
+        shutdown_sent: None,
     };
     primary.deny_recovery();
     primary.arm_recovery();

@@ -1,8 +1,9 @@
 //! Single-group supervised preparation and resource revocation.
+use super::process_group::{LocalGroupWitness, terminate_attested_group};
 use super::{
     ChildPreparer, Command, CommandExt, GenerationLease, PreparedChild, REGISTRATION_ENV,
     RevocationCause, RuntimeError, SpawnAdmission, Stdio, Write, collapse_failures, io,
-    lifecycle_error, terminate_registered_group, validate_group_leader, write_group_registration,
+    lifecycle_error, write_group_registration,
 };
 
 pub(super) struct SupervisedGuardianPreparer<C, W, S, F: FnOnce() -> io::Result<()>> {
@@ -30,6 +31,7 @@ pub(super) struct SupervisedGuardianLease<S, F> {
     revoke_registered_resources: Option<F>,
     pid_tx: std::sync::mpsc::SyncSender<u32>,
     group_pid: Option<u32>,
+    group_witness: LocalGroupWitness,
 }
 
 impl<C, W, S, F> ChildPreparer for SupervisedGuardianPreparer<C, W, S, F>
@@ -79,8 +81,10 @@ where
                 io::Error::other("authenticated registration writer is missing"),
             )
         })?;
+        let group_witness = LocalGroupWitness::default();
+        let reporter_group_witness = group_witness.clone();
         let admission = SpawnAdmission::install(&mut command, move |pid| {
-            validate_group_leader(pid)?;
+            reporter_group_witness.register_child(pid)?;
             write_group_registration(&mut registration, pid)
         })?;
         Ok(PreparedChild {
@@ -91,6 +95,7 @@ where
                 revoke_registered_resources: self.revoke_registered_resources.take(),
                 pid_tx: self.pid_tx.clone(),
                 group_pid: None,
+                group_witness,
             },
         })
     }
@@ -146,10 +151,20 @@ where
                 source,
             ));
         }
-        if let Some(group_pid) = self.group_pid.take()
-            && let Err(error) = terminate_registered_group(group_pid)
+        let verified_group = self.group_witness.take();
+        if let Some(group) = verified_group
+            && let Err(error) = terminate_attested_group(group)
         {
             failures.push(error);
+        }
+        if verified_group.is_none() && self.group_pid.is_some() {
+            failures.push(lifecycle_error(
+                "macOS Guardian supervised local group custody",
+                io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "discovered process group has no verified original kernel child birth",
+                ),
+            ));
         }
         if failures.is_empty() {
             Ok(())

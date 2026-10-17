@@ -1,6 +1,6 @@
 //! One owner for host-side primary generation control and recovery transitions.
 use super::generation_wire::initial_generation_record_timeout;
-use super::process_group::validate_guardian_child_group;
+use super::process_group::{terminate_attested_group, validate_guardian_child_group};
 use super::{
     BoundRoleGeneration, CONTROL_CLEAR, CONTROL_CLEARED, CONTROL_PREPARE, CONTROL_PREPARED,
     CONTROL_REGISTERED, CONTROL_REVOKE, CONTROL_REVOKED, CONTROL_SPAWNED,
@@ -9,8 +9,7 @@ use super::{
     Instant, Mutex, Receiver, RecoveryState, RegisteredPrimaryGeneration, RevocationCause,
     RoleEvent, RoleGenerationLease, RoleGenerationOwner, RoleOwner, RuntimeError,
     SUPERVISED_QUIT_ACK_DEADLINE, Sender, collapse_failures, decode_revocation_cause, io,
-    lifecycle_error, lock_generation, lock_recovery, mpsc, take_generation, thread,
-    write_generation_control,
+    lifecycle_error, lock_generation, lock_recovery, mpsc, thread, write_generation_control,
 };
 
 #[cfg(test)]
@@ -237,8 +236,14 @@ pub(super) fn run_generation_host(
                     )?;
                 }
                 CONTROL_CLEAR => {
-                    let registered = lock_generation(current_generation)
-                        .map_or(0, |generation| generation.group_pid);
+                    // Serialize the native CLEAR fail-safe with host-triggered
+                    // fail_current_generation. Without this one lock owner,
+                    // an old failure callback could retain a copy of the
+                    // retired PGID and signal it after a successor was minted.
+                    let mut current_generation_owner = lock_generation(current_generation);
+                    let registered_generation = *current_generation_owner;
+                    let registered =
+                        registered_generation.map_or(0, |generation| generation.group_pid);
                     if state.current_attempt != Some(record.attempt)
                         || state.revoked_attempt != Some(record.attempt)
                         || record.cause != 0
@@ -251,7 +256,32 @@ pub(super) fn run_generation_host(
                             expected_attempt,
                         ));
                     }
-                    take_generation(current_generation);
+                    // CONTROL_REVOKED only proves that app-link capability was
+                    // revoked. The authenticated Guardian's CLEAR record is
+                    // not evidence that it actually killed its Bun group:
+                    // independently signal the same attested native group
+                    // before relinquishing the host's last fail-safe owner or
+                    // admitting a successor. A forged/early CLEAR must never
+                    // make a still-running descendant invisible to the host.
+                    if let Some(generation) = registered_generation {
+                        match generation.group_identity {
+                            Some(group) => terminate_attested_group(group)?,
+                            #[cfg(test)]
+                            None => {} // Synthetic EOF/transition-only fixtures.
+                            #[cfg(not(test))]
+                            None => {
+                                return Err(lifecycle_error(
+                                    "macOS guardian generation clear authority",
+                                    io::Error::new(
+                                        io::ErrorKind::PermissionDenied,
+                                        "registered Bun group has no native birth witness",
+                                    ),
+                                ));
+                            }
+                        }
+                    }
+                    current_generation_owner.take();
+                    drop(current_generation_owner);
                     write_generation_control(
                         &mut control,
                         &GenerationControlRecord::new(CONTROL_CLEARED, record.attempt)

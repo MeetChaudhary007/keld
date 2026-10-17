@@ -40,6 +40,7 @@ while (!(await input.read()).done) {}
         updates_rx,
         worker: None,
         shutdown_attributed: false,
+        shutdown_sent: None,
     }
 }
 

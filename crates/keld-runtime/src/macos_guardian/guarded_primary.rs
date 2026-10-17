@@ -36,6 +36,8 @@ pub struct GuardedPrimary {
     pub(super) updates_rx: Receiver<GuardedPrimaryUpdate>,
     pub(super) worker: Option<JoinHandle<Result<(), RuntimeError>>>,
     pub(super) shutdown_attributed: bool,
+    #[cfg(test)]
+    pub(super) shutdown_sent: Option<mpsc::SyncSender<()>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -144,6 +146,8 @@ impl GuardedPrimary {
             updates_rx,
             worker: Some(worker),
             shutdown_attributed: false,
+            #[cfg(test)]
+            shutdown_sent: None,
         })
     }
 
@@ -397,6 +401,15 @@ impl GuardedPrimary {
             .write_all(&[SUPERVISED_ORDERLY_SHUTDOWN])
             .and_then(|()| writer.flush())
             .map_err(|source| lifecycle_error("macOS guardian orderly-shutdown control", source))?;
+        #[cfg(test)]
+        if let Some(sent) = &self.shutdown_sent {
+            sent.send(()).map_err(|_| {
+                lifecycle_error(
+                    "macOS guardian test-only shutdown receipt",
+                    io::Error::other("native controller stopped before observing S"),
+                )
+            })?;
+        }
         read_supervised_orderly_ack(ack_reader)?;
         self.shutdown_attributed = true;
         lock_recovery(&self.recovery_decision).shutdown_acknowledged = true;

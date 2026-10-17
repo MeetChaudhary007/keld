@@ -1,6 +1,7 @@
 //! Private macOS process-group validation and rejected-registration cleanup.
 use std::io;
 use std::process::{Child, ChildStdin, ExitStatus};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use nix::errno::Errno;
@@ -24,6 +25,39 @@ pub(super) struct GroupIdentity {
     real_uid: libc::uid_t,
     started_sec: u64,
     started_usec: u64,
+}
+
+/// One locally observed Guardian-child group, shared only with the pre-exec
+/// reporter until its join. The reporter proves the kernel lineage/birth
+/// *before* sending any registration record or receiving an exec permit.
+/// Later revocation consumes precisely this identity, not an untrusted PID.
+#[derive(Clone, Default)]
+pub(super) struct LocalGroupWitness(Arc<Mutex<Option<GroupIdentity>>>);
+
+impl LocalGroupWitness {
+    pub(super) fn register_child(&self, pid: u32) -> Result<(), RuntimeError> {
+        let identity = validate_guardian_child_group(pid, std::process::id())?;
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(identity);
+        Ok(())
+    }
+
+    pub(super) fn take(&self) -> Option<GroupIdentity> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+
+    #[cfg(test)]
+    pub(super) fn seed_for_test(&self, identity: GroupIdentity) {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(identity);
+    }
 }
 
 #[cfg(test)]

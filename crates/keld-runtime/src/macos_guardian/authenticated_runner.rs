@@ -1,10 +1,10 @@
 //! Legacy one-group Guardian execution with crash-closed authenticated custody.
 //! No Bun image executes before the host has accepted and retained its group.
+use super::process_group::{GroupIdentity, LocalGroupWitness, terminate_attested_group};
 use super::{
     AwaitHostGroupRetention, Command, CommandExt, GuardianReport, Read, RuntimeError,
     SpawnAdmission, Stdio, await_host_death, collapse_failures, fail_before_child, io,
-    lifecycle_error, terminate_registered_group, validate_group_pid, validate_liveness_bootstrap,
-    write_group_registration,
+    lifecycle_error, validate_group_pid, validate_liveness_bootstrap, write_group_registration,
 };
 use std::os::fd::AsFd;
 use std::process::Child;
@@ -36,8 +36,11 @@ where
         .process_group(0)
         .stdin(Stdio::null());
     let mut registration = registration;
+    let group_witness = LocalGroupWitness::default();
+    let reporter_group_witness = group_witness.clone();
     let admission = match SpawnAdmission::install(&mut command, move |pid| {
         validate_group_pid(pid).map(|_| ())?;
+        reporter_group_witness.register_child(pid)?;
         write_group_registration(&mut registration, pid)
     }) {
         Ok(admission) => admission,
@@ -61,12 +64,13 @@ where
         }
     };
     let (group_pid, registration_result) = admission.finish();
+    let verified_group = group_witness.take();
     let group_pid = group_pid.unwrap_or(child.id());
     if let Err(error) = registration_result {
         return Err(reject_spawn(
             error,
             None,
-            Some(group_pid),
+            verified_group,
             Some(child),
             revoke_registered_resources,
         ));
@@ -78,18 +82,33 @@ where
                 io::Error::new(io::ErrorKind::InvalidData, "registered child PID mismatch"),
             ),
             None,
-            Some(group_pid),
+            verified_group,
             Some(child),
             revoke_registered_resources,
         ));
     }
-    run_live_group(child, group_pid, liveness, revoke_registered_resources)
+    let Some(verified_group) = verified_group else {
+        return Err(reject_spawn(
+            lifecycle_error(
+                "macOS guardian local group registration witness",
+                io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "authenticated registration lost the original kernel child identity",
+                ),
+            ),
+            None,
+            None,
+            Some(child),
+            revoke_registered_resources,
+        ));
+    };
+    run_live_group(child, verified_group, liveness, revoke_registered_resources)
 }
 
 fn reject_spawn(
     primary: RuntimeError,
     admission_error: Option<RuntimeError>,
-    group_pid: Option<u32>,
+    group: Option<GroupIdentity>,
     mut child: Option<Child>,
     revoke: impl FnOnce() -> io::Result<()>,
 ) -> RuntimeError {
@@ -103,8 +122,8 @@ fn reject_spawn(
             source,
         ));
     }
-    if let Some(pid) = group_pid
-        && let Err(error) = terminate_registered_group(pid)
+    if let Some(group) = group
+        && let Err(error) = terminate_attested_group(group)
     {
         failures.push(error);
     }
@@ -118,7 +137,7 @@ fn reject_spawn(
 
 fn run_live_group<R: Read + AsFd>(
     mut child: Child,
-    group_pid: u32,
+    group: GroupIdentity,
     mut liveness: R,
     revoke: impl FnOnce() -> io::Result<()>,
 ) -> Result<GuardianReport, RuntimeError> {
@@ -133,7 +152,7 @@ fn run_live_group<R: Read + AsFd>(
             source,
         ));
     }
-    if let Err(error) = terminate_registered_group(group_pid) {
+    if let Err(error) = terminate_attested_group(group) {
         failures.push(error);
     }
     let leader_status = match child.wait() {
@@ -145,7 +164,7 @@ fn run_live_group<R: Read + AsFd>(
     };
     if failures.is_empty() {
         Ok(GuardianReport {
-            leader_pid: group_pid,
+            leader_pid: group.pid,
             leader_status,
         })
     } else {

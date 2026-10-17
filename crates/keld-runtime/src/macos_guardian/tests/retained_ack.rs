@@ -15,6 +15,8 @@ use super::super::process_group::validate_guardian_child_group;
 use super::super::{GUARDIAN_SHUTDOWN_DEADLINE, GuardianBootstrap, run};
 use super::test_support::{kernel_process_image, verified_real_bun};
 
+mod dual_death;
+mod escaped_descendant;
 mod observers;
 use self::observers::{group_gone, observe_pre_ack_image, read_marker, receive_event};
 
@@ -22,6 +24,7 @@ const ROLE_ENV: &str = "KELD_TEST_KGR1_RETAINED_ACK_ROLE";
 const CUT_ENV: &str = "KELD_TEST_KGR1_RETAINED_ACK_SOCKET";
 const MARKER_ENV: &str = "KELD_TEST_KGR1_RETAINED_ACK_MARKER";
 const BUN_ENV: &str = "KELD_TEST_KGR1_RETAINED_ACK_BUN";
+const ESCAPE_ENV: &str = "KELD_TEST_KGR1_DETACHED_DESCENDANT";
 const ROLE_TEST: &str = "macos_guardian::tests::retained_ack::kgr1_retained_ack_process_role";
 
 // Invoked ONLY in the Rust test build at bootstrap::register_until's real
@@ -99,8 +102,25 @@ if (!descendant.pid) process.exit(70);
 writeFileSync(process.env.KELD_TEST_KGR1_RETAINED_ACK_MARKER, `${process.pid} ${descendant.pid}`);
 setInterval(() => {}, 1000);
 "#;
+            let escaped_script = r#"
+const { spawn } = require("node:child_process");
+const { writeFileSync } = require("node:fs");
+const descendant = spawn("/bin/sleep", ["60"], { stdio: "ignore", detached: true });
+if (!descendant.pid) process.exit(70);
+writeFileSync(process.env.KELD_TEST_KGR1_RETAINED_ACK_MARKER, `${process.pid} ${descendant.pid}`);
+setInterval(() => {}, 1000);
+"#;
             let mut command = Command::new(bun);
-            command.args(["-e", script]).env(MARKER_ENV, marker);
+            command
+                .args([
+                    "-e",
+                    if std::env::var_os(ESCAPE_ENV).is_some() {
+                        escaped_script
+                    } else {
+                        script
+                    },
+                ])
+                .env(MARKER_ENV, marker);
             let result = run(command, io::stdin().lock(), || Ok(()));
             // A direct, native Guardian witness: success after a real ACK and
             // host EOF; rejection before ACK (no child image ever executed).

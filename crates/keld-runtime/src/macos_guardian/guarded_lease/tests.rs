@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use nix::sys::signal::{Signal, killpg};
 use nix::unistd::{Pid, getpgid, getpgrp};
 
+use super::super::process_group::{LocalGroupWitness, observe_group_identity};
 use super::super::{
     CONTROL_REGISTERED, CONTROL_SPAWNED, GenerationControlPeer, GenerationControlReader,
     GenerationControlRecord, GenerationLease, RevocationCause, read_generation_control,
@@ -239,6 +240,7 @@ fn failed_exchange_keeps_cleanup(reply: Reply) {
         })),
         host_unavailable: Arc::new(AtomicBool::new(false)),
         group_pid: None,
+        group_witness: LocalGroupWitness::default(),
         admission: None,
     };
     let admission = lease.child_spawned(pid, 1);
@@ -274,4 +276,60 @@ fn invalid_registration_ack_still_retires_native_group() {
 #[test]
 fn valid_registration_ack_retirement_control() {
     failed_exchange_keeps_cleanup(Reply::Valid);
+}
+
+/// Local Guardian cleanup uses the reporter's original kernel birth, even
+/// with no usable host-control peer. The fallback may not trust `group_pid`.
+fn locally_enrolled_lease(pid: u32, witness: LocalGroupWitness) -> GuardedPrimaryLease {
+    let (stream, host) = UnixStream::pair().expect("private offline control pair");
+    drop(host);
+    GuardedPrimaryLease {
+        attempt: 1,
+        control: Arc::new(Mutex::new(GenerationControlPeer {
+            stream,
+            reader: GenerationControlReader::new(),
+        })),
+        host_unavailable: Arc::new(AtomicBool::new(true)),
+        group_pid: Some(pid),
+        group_witness: witness,
+        admission: None,
+    }
+}
+
+#[test]
+fn local_guardian_revocation_reaps_attested_native_descendant_group() {
+    let group = NativeGroup::start();
+    let pid = group.leader.id();
+    let witness = LocalGroupWitness::default();
+    witness
+        .register_child(pid)
+        .expect("kernel proves owned direct leader before registration");
+    locally_enrolled_lease(pid, witness)
+        .revoke(RevocationCause::Shutdown)
+        .expect("Guardian-side birth-attested revocation succeeds without host");
+    group.assert_stopped(); // Product gone before fixture Drop rescue.
+}
+
+#[test]
+fn local_guardian_revocation_cannot_kill_foreign_group_after_birth_change() {
+    let group = NativeGroup::start();
+    let pid = group.leader.id();
+    let witness = LocalGroupWitness::default();
+    let true_birth = observe_group_identity(pid).expect("test-owned group leader live");
+    witness.seed_for_test(true_birth.altered_birth_for_test());
+    let error = locally_enrolled_lease(pid, witness)
+        .revoke(RevocationCause::AdmissionFailed)
+        .expect_err("different-birth Guardian group may not be signaled");
+    // Independent native activity from both original leader and its child,
+    // observed BEFORE the owned fixture's Drop invokes emergency cleanup.
+    let leader_alive = fresh_response(&group.socket("leader")).is_ok();
+    let descendant_alive = fresh_response(&group.socket("descendant")).is_ok();
+    assert!(
+        error.to_string().contains("identity changed"),
+        "wrong reason for refusal: {error}"
+    );
+    assert!(
+        leader_alive && descendant_alive,
+        "refused Guardian revocation signaled an unrelated live process group"
+    );
 }

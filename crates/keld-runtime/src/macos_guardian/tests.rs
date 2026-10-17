@@ -33,6 +33,7 @@ pub(super) mod retained_ack;
 mod guarded_primary_shutdown;
 mod worker_outcome;
 
+pub(super) mod bootstrap_shutdown_race;
 mod control_acknowledgement;
 
 mod terminal_liveness;

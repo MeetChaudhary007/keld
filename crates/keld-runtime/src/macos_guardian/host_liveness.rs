@@ -265,6 +265,67 @@ pub(super) fn observe_guarded_liveness(
     }
 }
 
+/// A host may authenticate KGC1 and immediately request orderly shutdown
+/// before the Guardian has created its first Supervisor. Consume that exact
+/// host-only S byte before calling `start_prepared`: otherwise an intentional
+/// recovery denial can abort PREPARE and suppress KSA. No Bun generation
+/// exists on this path; no app-link or group authority is minted.
+pub(super) fn observe_pre_generation_shutdown(
+    liveness: &mut (impl Read + AsFd),
+    acknowledgment: &mut impl Write,
+) -> Result<bool, RuntimeError> {
+    set_liveness_nonblocking(liveness, true)?;
+    match poll_host_liveness(liveness)? {
+        HostLiveness::Live => Ok(false),
+        HostLiveness::Dead => Ok(true),
+        HostLiveness::OrderlyShutdown => {
+            acknowledgment
+                .write_all(&SUPERVISED_ORDERLY_ACK)
+                .and_then(|()| acknowledgment.flush())
+                .map_err(|source| {
+                    lifecycle_error(
+                        "macOS guardian pre-generation orderly acknowledgment",
+                        source,
+                    )
+                })?;
+            let deadline = std::time::Instant::now() + super::GUARDIAN_SHUTDOWN_DEADLINE;
+            loop {
+                match poll_host_liveness(liveness)? {
+                    HostLiveness::Dead => return Ok(true),
+                    HostLiveness::Live if std::time::Instant::now() < deadline => {
+                        thread::yield_now();
+                    }
+                    HostLiveness::Live => {
+                        return Err(lifecycle_error(
+                            "macOS guardian pre-generation host EOF deadline",
+                            io::Error::new(
+                                io::ErrorKind::TimedOut,
+                                "host retained liveness after acknowledged initial shutdown",
+                            ),
+                        ));
+                    }
+                    _ => {
+                        return Err(lifecycle_error(
+                            "macOS guardian pre-generation shutdown protocol",
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "duplicate or conflicting host shutdown control",
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+        HostLiveness::QuitAccepted => Err(lifecycle_error(
+            "macOS guardian pre-generation shutdown protocol",
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "accepted Quit before the first authorized role generation",
+            ),
+        )),
+    }
+}
+
 pub(super) fn await_guarded_primary_liveness(
     liveness: &mut (impl Read + AsFd),
     supervisor: &Supervisor,

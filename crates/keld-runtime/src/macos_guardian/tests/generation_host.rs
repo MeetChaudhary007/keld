@@ -15,6 +15,8 @@ use super::super::{
 use super::preparation_fixture::GatedUnmarkedFailurePreparer;
 use super::test_support::long_running_command;
 
+mod clear_authority;
+
 #[derive(Debug, Clone, Copy)]
 enum PreparationAttribution {
     Accepted,

@@ -9,7 +9,7 @@
 
 mod guarded_primary;
 pub use self::guarded_primary::{GuardedPrimary, GuardedPrimaryUpdate};
-use self::guarded_primary::{RegisteredPrimaryGeneration, lock_generation, take_generation};
+use self::guarded_primary::{RegisteredPrimaryGeneration, lock_generation};
 
 mod error;
 use self::error::{collapse_failures, lifecycle_error, nix_io_error};
@@ -26,9 +26,10 @@ mod generation_wire;
 mod host_control;
 
 mod process_group;
+#[cfg(test)]
+use self::process_group::terminate_registered_group;
 use self::process_group::{
-    reap_pending_guardian, reject_host_registration, terminate_registered_group,
-    validate_group_leader, validate_group_pid,
+    reap_pending_guardian, reject_host_registration, validate_group_leader, validate_group_pid,
 };
 
 mod spawn_admission;

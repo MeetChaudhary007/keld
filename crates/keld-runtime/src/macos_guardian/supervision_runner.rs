@@ -1,4 +1,5 @@
 //! Supervised child execution and authenticated private group registration.
+use super::host_liveness::observe_pre_generation_shutdown;
 use super::{
     AsFd, CapturedOutput, Command, CrashLedger, Duration, GENERATION_CONTROL_POLL,
     GenerationControlPeer, GenerationControlReader, GuardedPrimaryPreparer, REGISTRATION_ENV,
@@ -307,14 +308,26 @@ where
     C: FnMut(&str) -> Result<Command, RuntimeError> + Send + 'static,
     A: Write,
 {
+    // Validate the host-exclusive liveness pipe BEFORE authenticating the
+    // Guardian registration stream. Once authentication completes, the host
+    // is allowed to send Q/S and close its writer at any moment. The old
+    // ordering treated a legitimate early Q/S as malformed bootstrap data
+    // and could turn concurrent startup/shutdown into a spurious failure.
+    validate_liveness_bootstrap(&mut liveness)?;
     let control = connect_guardian_registration()?;
+    #[cfg(test)]
+    super::tests::bootstrap_shutdown_race::hold_guardian_after_authenticated_control()?;
     control
         .set_read_timeout(Some(GENERATION_CONTROL_POLL))
         .map_err(|source| lifecycle_error("macOS guardian generation control deadline", source))?;
     control
         .set_write_timeout(Some(GENERATION_CONTROL_POLL))
         .map_err(|source| lifecycle_error("macOS guardian generation control deadline", source))?;
-    validate_liveness_bootstrap(&mut liveness)?;
+    if observe_pre_generation_shutdown(&mut liveness, &mut quit_ack)? {
+        // The authenticated Host requested shutdown before any generation
+        // could execute Bun. KSA and actual host EOF are already observed.
+        return Ok(CapturedOutput::default());
+    }
     let host_unavailable = Arc::new(AtomicBool::new(false));
     let preparation_cancelled = Arc::new(AtomicBool::new(false));
     let supervisor = Supervisor::start_prepared(

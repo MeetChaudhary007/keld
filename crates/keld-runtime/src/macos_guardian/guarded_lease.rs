@@ -1,4 +1,5 @@
 //! Fresh-generation child preparation and the exact revocation lease.
+use super::process_group::{LocalGroupWitness, terminate_attested_group};
 #[cfg(test)]
 use super::validate_group_leader;
 use super::{
@@ -7,7 +8,6 @@ use super::{
     CommandExt, GenerationControlPeer, GenerationControlRecord, GenerationLease, Mutex, Ordering,
     PreparedChild, REGISTRATION_ENV, RevocationCause, RuntimeError, SpawnAdmission, Stdio,
     collapse_failures, control_exchange, control_exchange_with_cancellation, io, lifecycle_error,
-    terminate_registered_group,
 };
 
 pub(super) struct GuardedPrimaryPreparer<C> {
@@ -71,7 +71,10 @@ where
             .process_group(0)
             .stdin(Stdio::null());
         let registration_control = Arc::clone(&self.control);
+        let group_witness = LocalGroupWitness::default();
+        let reporter_group_witness = group_witness.clone();
         let admission = SpawnAdmission::install(&mut command, move |pid| {
+            reporter_group_witness.register_child(pid)?;
             control_exchange(
                 &registration_control,
                 &GenerationControlRecord::new(CONTROL_SPAWNED, attempt).with_pid(pid),
@@ -87,6 +90,7 @@ where
                 control: Arc::clone(&self.control),
                 host_unavailable: Arc::clone(&self.host_unavailable),
                 group_pid: None,
+                group_witness,
                 admission: Some(admission),
             },
         })
@@ -124,6 +128,7 @@ pub(super) struct GuardedPrimaryLease {
     control: Arc<Mutex<GenerationControlPeer>>,
     host_unavailable: Arc<AtomicBool>,
     group_pid: Option<u32>,
+    group_witness: LocalGroupWitness,
     admission: Option<SpawnAdmission>,
 }
 
@@ -195,10 +200,38 @@ impl GenerationLease for GuardedPrimaryLease {
         {
             failures.push(error);
         }
-        if let Some(pid) = group_pid
-            && let Err(error) = terminate_registered_group(pid)
+        // The trusted local pre-exec reporter sampled the original kernel
+        // birth before host registration. Never grant raw-PGID kill authority
+        // to a stale lease after its leader has been recycled.
+        let verified_group = self.group_witness.take();
+        if let Some(identity) = verified_group
+            && let Err(error) = terminate_attested_group(identity)
         {
             failures.push(error);
+        }
+        #[cfg(not(test))]
+        if verified_group.is_none() && group_pid.is_some() {
+            failures.push(lifecycle_error(
+                "macOS Guardian generation local group custody",
+                io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "discovered process group has no verified original kernel child birth",
+                ),
+            ));
+        }
+        #[cfg(test)]
+        if verified_group.is_none()
+            && let Some(pid) = group_pid
+        {
+            // The legacy ACK-only native fixture omits SpawnAdmission.
+            // Even there, never grant an arbitrary numeric PGID authority:
+            // the test runner must remain the leader's actual OS parent.
+            let cleanup =
+                super::process_group::validate_guardian_child_group(pid, std::process::id())
+                    .and_then(terminate_attested_group);
+            if let Err(error) = cleanup {
+                failures.push(error);
+            }
         }
         if host_available
             && failures.is_empty()
