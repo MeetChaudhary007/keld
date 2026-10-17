@@ -255,8 +255,11 @@ alone owns the roots; calls and `serve_fs_session` borrow it, and dropping a wra
 not broker destruction while another owner remains. The retained filesystem broker and
 guarded production host route are implemented (KEL-102/T3), exposing a public Bun
 `fs.read`/`write` slice on the canonical app link with macOS explicit project-policy
-capture and absent-policy all-denied fallback; renderer-action forwarding, non-macOS
-project-policy producers, and full hostile/deadline/quiescence qualification remain open.
+capture and absent-policy all-denied fallback. This manifest guard applies strictly
+to brokered app-link calls; direct Bun `node:fs` calls do not pass through this broker
+and are not denied by it, as OS sandbox containment remains a separate, not-yet-fully-qualified
+guarantee. Renderer-action forwarding, non-macOS project-policy producers, and full
+hostile/deadline/quiescence qualification remain open.
 
 v0 is still a skeleton: its `MODULES` registry does not yet include the destination
 `process`, `pty`, or `auth` rows below, and none of them has implementation. KEL-76 must
