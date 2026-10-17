@@ -139,12 +139,12 @@ def main() -> None:
     destination = root / args.output
     summary_path = destination.with_suffix(".summary.json")
     if args.check:
-        assert destination.read_text(encoding="utf-8") == content, "Windows ledger drift"
+        assert destination.read_bytes() == content.encode("utf-8"), "Windows ledger byte drift"
         assert json.loads(summary_path.read_text(encoding="utf-8")) == summary, "summary drift"
     else:
         destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_text(content, encoding="utf-8")
-        summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        destination.write_bytes(content.encode("utf-8"))
+        summary_path.write_bytes((json.dumps(summary, indent=2, sort_keys=True) + "\n").encode("utf-8"))
     print(json.dumps(summary, sort_keys=True))
 
 
