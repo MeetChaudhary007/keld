@@ -121,7 +121,9 @@ just fmt-check       # fast, non-mutating formatting check
 ```
 
 When optional tools are missing, specific fallbacks apply to individual components
-(e.g., `cargo test --workspace` can run unit tests when `cargo-nextest` is not installed),
+(e.g., `cargo test --workspace` can run a partial workspace test suite when
+`cargo-nextest` is unavailable; headless Linux needs `xvfb-run -a cargo test --workspace`
+for GTK/WebKit host tests),
 but raw Cargo commands cannot replace the complete pinned `just ci` gate (which runs
 independent policy gates, TypeScript compilation, formatting, clippy, docs, and dependency
 verification). Similarly, Mermaid diagram rendering in `just ci-full` and
@@ -190,7 +192,7 @@ Recipes are grouped by developer task and lifecycle stage:
 | `just fmt-check` | `cargo fmt --all --check` | None (read-only) | Fast | Fails on unformatted code |
 | `just fmt` | `cargo fmt --all` | **Modifies tracked files** | Fast | Overwrites unformatted Rust files in place |
 | `just clippy` | `cargo clippy --workspace --all-targets -- -D warnings` | Writes `target/` artifacts | Moderate | Warnings treated as errors |
-| `just test` | `cargo nextest run --workspace --profile ci` (Linux: `xvfb-run -a`; fallback: `cargo test --workspace`) | Writes `target/` artifacts | Heavy | Nextest enforces zero retries; Linux host suite requires virtual display (`xvfb-run -a`); raw `cargo test` is partial fallback |
+| `just test` | `cargo nextest run --workspace --profile ci` (Linux: `xvfb-run -a`; partial fallback: `cargo test --workspace`, on headless Linux `xvfb-run -a cargo test --workspace`) | Writes `target/` artifacts | Heavy | Nextest enforces zero retries; Linux host suite requires virtual display (`xvfb-run -a`); raw `cargo test` is partial fallback |
 | `just doc` | `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps` | Writes `target/doc/` | Moderate | Builds rustdoc without dependencies |
 | `just deny` | `cargo deny check` and helper bans check | None | Fast | Workspace check plus `crates/keld-updater-helper/deny.toml check bans`; requires `cargo-deny` |
 | `just ci` | None (runs full declared gate inventory) | Writes `target/` artifacts | Heavy | Sole gate inventory defined in `justfile`; use Git Bash on Windows |
@@ -207,9 +209,14 @@ cross-platform code, CI usually agrees.
 
 #### 3.3.4 Raw command reference
 
-If you develop without `just`, use the corresponding raw commands below. Note that multi-step recipes (such as `just deny`) and platform-specific wrappers (such as `just test` on Linux) require executing all listed steps or platform wrappers to match CI:
+If you develop without `just`, use an executable raw alternative only where one is
+listed. **No maintained raw equivalent** means the full recipe is not available as a
+supported standalone command; use `just` rather than treating a partial command as
+a passing gate. Multi-step recipes (such as `just deny`) and Linux display
+wrappers require every listed step. The `just ci` row below is a canonical
+policy statement, **not** an executable raw substitute:
 
-| `just` target | Equivalent command |
+| `just` target | Raw alternative or availability |
 |---|---|
 | `just hello` | `cargo run -p keld-host --bin keld-host -- --hello` |
 | `just fmt` | `cargo fmt --all` |
@@ -218,10 +225,10 @@ If you develop without `just`, use the corresponding raw commands below. Note th
 | `just test` | `cargo nextest run --workspace --profile ci` (Linux requires virtual display: `xvfb-run -a cargo nextest run --workspace --profile ci`) |
 | `just doc` | `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps` |
 | `just deny` | `cargo deny check && cargo deny --manifest-path crates/keld-updater-helper/Cargo.toml --all-features --config crates/keld-updater-helper/deny.toml check bans` |
-| `just mermaid-test` / `just mermaid-check` / `just mermaid-render-check` | validator tests / tracked structural policy / isolated digest-pinned SVG render |
-| `just llms-test` / `just llms-check` | generated-corpus contract tests / freshness check |
+| `just mermaid-test` / `just mermaid-check` / `just mermaid-render-check` | **No maintained raw equivalent** — use the `just` recipes; rendering also requires a Docker-compatible engine. |
+| `just llms-test` / `just llms-check` | **No maintained raw equivalent** — use the `just` recipes for generated-corpus tests and freshness. |
 | `just ci` | Full local gate; the `justfile` `ci` recipe and the gate groups it names are the sole source of its inventory and order. |
-| `just ci-full` | `just ci` with full-corpus Mermaid validation and pinned rendering forced. |
+| `just ci-full` | **No maintained raw equivalent** — use `just ci-full` for the full-corpus Mermaid check and pinned rendering. |
 
 ---
 
@@ -231,7 +238,7 @@ If you develop without `just`, use the corresponding raw commands below. Note th
 cargo nextest run --workspace --profile ci     # the gate; no retries, a flake fails here
 cargo nextest run -p keld-ipc                  # one crate
 cargo nextest run -p keld-ipc -- frame         # one crate, substring filter
-cargo test --workspace                         # fallback if nextest is unavailable
+cargo test --workspace                         # partial fallback; on headless Linux use xvfb-run -a cargo test --workspace
 ```
 
 The `ci` profile declares no retries, so a test that fails once fails the gate. That is
