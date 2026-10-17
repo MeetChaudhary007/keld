@@ -30,6 +30,7 @@ mod registration_record_adversaries;
 mod rejected_registration_deadline;
 pub(super) mod retained_ack;
 
+mod active_generation_shutdown;
 mod guarded_primary_shutdown;
 mod worker_outcome;
 

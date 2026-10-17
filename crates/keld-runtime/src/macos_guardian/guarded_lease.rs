@@ -4,10 +4,11 @@ use super::process_group::{LocalGroupWitness, terminate_attested_group};
 use super::validate_group_leader;
 use super::{
     Arc, AtomicBool, CONTROL_CLEAR, CONTROL_CLEARED, CONTROL_PREPARE, CONTROL_PREPARED,
-    CONTROL_REGISTERED, CONTROL_REVOKE, CONTROL_REVOKED, CONTROL_SPAWNED, ChildPreparer, Command,
-    CommandExt, GenerationControlPeer, GenerationControlRecord, GenerationLease, Mutex, Ordering,
-    PreparedChild, REGISTRATION_ENV, RevocationCause, RuntimeError, SpawnAdmission, Stdio,
-    collapse_failures, control_exchange, control_exchange_with_cancellation, io, lifecycle_error,
+    CONTROL_REGISTERED, CONTROL_REVOKE, CONTROL_REVOKED, CONTROL_SPAWNED, Child, ChildPreparer,
+    Command, CommandExt, GUARDIAN_SHUTDOWN_DEADLINE, GenerationControlPeer,
+    GenerationControlRecord, GenerationLease, Instant, Mutex, Ordering, PreparedChild,
+    REGISTRATION_ENV, RevocationCause, RuntimeError, SpawnAdmission, Stdio, collapse_failures,
+    control_exchange, control_exchange_with_cancellation, io, lifecycle_error,
 };
 
 pub(super) struct GuardedPrimaryPreparer<C> {
@@ -138,6 +139,37 @@ pub(super) struct GuardedPrimaryLease {
     admission: Option<SpawnAdmission>,
 }
 
+// A successful SIGKILL can leave the Guardian's *direct* Bun leader as a
+// zombie until its retained Child owner reaps it. Darwin can then return
+// EPERM (not ESRCH) for killpg(group, 0); that ambiguous result must never
+// turn into an unverified host CLEAR. Reap this exact Child before asking the
+// host to independently prove the group gone. Do not wait before revoking
+// role/IPC authority or issuing the original birth-attested group signal.
+fn reap_guarded_child_before_clear(child: &mut Child) -> Result<(), RuntimeError> {
+    let deadline = Instant::now() + GUARDIAN_SHUTDOWN_DEADLINE;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return Ok(()),
+            Ok(None) if Instant::now() < deadline => std::thread::yield_now(),
+            Ok(None) => {
+                return Err(lifecycle_error(
+                    "macOS Guardian original leader reap before CLEAR",
+                    io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "registered child was not reaped before the native CLEAR deadline",
+                    ),
+                ));
+            }
+            Err(source) => {
+                return Err(lifecycle_error(
+                    "macOS Guardian original leader reap before CLEAR",
+                    source,
+                ));
+            }
+        }
+    }
+}
+
 impl GenerationLease for GuardedPrimaryLease {
     fn child_spawned(&mut self, pid: u32, attempt: u32) -> Result<(), RuntimeError> {
         if attempt != self.attempt {
@@ -185,7 +217,27 @@ impl GenerationLease for GuardedPrimaryLease {
         ))
     }
 
-    fn revoke(mut self, cause: RevocationCause) -> Result<(), RuntimeError> {
+    fn revoke(self, cause: RevocationCause) -> Result<(), RuntimeError> {
+        // A synthetic wire-only fixture may not own a direct Child. Shipping
+        // supervisor callers use revoke_with_child below for its OS custody.
+        self.revoke_with_post_signal(cause, || Ok(()))
+    }
+
+    fn revoke_with_child(
+        self,
+        cause: RevocationCause,
+        child: &mut Child,
+    ) -> Result<(), RuntimeError> {
+        self.revoke_with_post_signal(cause, || reap_guarded_child_before_clear(child))
+    }
+}
+
+impl GuardedPrimaryLease {
+    fn revoke_with_post_signal(
+        mut self,
+        cause: RevocationCause,
+        reap_after_group_signal: impl FnOnce() -> Result<(), RuntimeError>,
+    ) -> Result<(), RuntimeError> {
         if let Some(admission) = self.admission.take() {
             let (group_pid, result) = admission.finish();
             self.group_pid = group_pid;
@@ -238,6 +290,11 @@ impl GenerationLease for GuardedPrimaryLease {
             if let Err(error) = cleanup {
                 failures.push(error);
             }
+        }
+        if let Err(error) = reap_after_group_signal() {
+            // The retained supervisor Child has not proved retirement. Do
+            // not send CLEAR and let the host forget a potentially live group.
+            failures.push(error);
         }
         if host_available
             && failures.is_empty()
