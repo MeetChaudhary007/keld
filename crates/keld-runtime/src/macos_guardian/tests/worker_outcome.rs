@@ -57,6 +57,8 @@ fn premature_successful_generation_worker_exit_reaps_unattributed_group() {
         worker: Some(thread::spawn(|| Ok(()))),
         shutdown_attributed: false,
         shutdown_sent: None,
+        #[cfg(test)]
+        shutdown_denial_fence: None,
     };
     let deadline = Instant::now() + GUARDIAN_SHUTDOWN_DEADLINE;
     while !primary.worker.as_ref().is_some_and(JoinHandle::is_finished) {
@@ -152,6 +154,8 @@ fn zero_guardian_exit_with_successful_worker_reaps_registered_group() {
         worker: Some(thread::spawn(|| Ok(()))),
         shutdown_attributed: true,
         shutdown_sent: None,
+        #[cfg(test)]
+        shutdown_denial_fence: None,
     };
 
     let result = primary.shutdown();
@@ -231,6 +235,8 @@ fn poll_fatal_inspection_error_reaps_registered_group() {
         worker: None,
         shutdown_attributed: false,
         shutdown_sent: None,
+        #[cfg(test)]
+        shutdown_denial_fence: None,
     };
     let result = primary.poll_fatal();
     let deadline = Instant::now() + GUARDIAN_SHUTDOWN_DEADLINE;

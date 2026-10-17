@@ -29,6 +29,8 @@ fn held_registered_ack(release_ack: bool) {
                 attempt: 1,
                 entered: entered_tx,
                 release: release_rx,
+                received_prepare: None,
+                received_spawned: None,
             },
         )
         .expect("real authenticated persistent Guardian");

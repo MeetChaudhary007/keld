@@ -95,6 +95,7 @@ impl CutFixture {
                     })),
                     host_unavailable: Arc::new(AtomicBool::new(false)),
                     preparation_cancelled: Arc::clone(&cancelled),
+                    initial_prepared: Arc::new(AtomicBool::new(false)),
                 },
                 gate: lease_gate,
             },

@@ -217,6 +217,8 @@ fn denied_recovery_cannot_be_rearmed_by_late_ready() {
         worker: None,
         shutdown_attributed: false,
         shutdown_sent: None,
+        #[cfg(test)]
+        shutdown_denial_fence: None,
     };
     primary.deny_recovery();
     primary.arm_recovery();

@@ -24,6 +24,13 @@ pub(super) struct GenerationRegistrationFence {
     pub(super) attempt: u32,
     pub(super) entered: mpsc::SyncSender<u32>,
     pub(super) release: Receiver<()>,
+    // A complete fixed PREPARE has arrived on the actual authenticated
+    // generation-control stream, before the worker acquires recovery state.
+    pub(super) received_prepare: Option<mpsc::SyncSender<()>>,
+    // Independent test-only receipt after a complete authentic SPAWNED
+    // record was decoded and its real OS parent/birth validated, but before
+    // the host decides whether shutdown permits REGISTERED.
+    pub(super) received_spawned: Option<mpsc::SyncSender<u32>>,
 }
 
 /// The retained Guardian PID and the original authenticated-bootstrap deadline
@@ -122,6 +129,25 @@ pub(super) fn run_generation_host(
                 first_record_pending = false;
             }
         }
+        #[cfg(test)]
+        if record
+            .as_ref()
+            .is_some_and(|record| record.kind == CONTROL_PREPARE)
+            && let Some(received) = registration_fence
+                .filter(|fence| {
+                    record
+                        .as_ref()
+                        .is_some_and(|record| record.attempt == fence.attempt)
+                })
+                .and_then(|fence| fence.received_prepare.as_ref())
+        {
+            received.send(()).map_err(|_| {
+                lifecycle_error(
+                    "test verified KGC1 PREPARE receipt",
+                    io::Error::other("native PREPARE observer ended"),
+                )
+            })?;
+        }
         let expected_attempt = lock_recovery(recovery_decision).expected_attempt;
         if let Some(record) = record {
             if state.pending_prepare.is_some() {
@@ -167,14 +193,70 @@ pub(super) fn run_generation_host(
                             expected_attempt,
                         ));
                     }
+                    // A PREPARED locator is not authority to execute a
+                    // not-yet-registered process. Serialize the *actual*
+                    // REGISTERED ACK (the Guardian's pre-exec permit) with
+                    // the host's permanent denial and S write. Otherwise a
+                    // delayed SPAWNED could authorize Bun after S had already
+                    // been flushed, despite the denied recovery decision.
+                    let recovery = lock_recovery(recovery_decision);
+                    if state.lease.is_none() {
+                        return Err(invalid_control_transition(
+                            "spawned",
+                            record.attempt,
+                            expected_attempt,
+                        ));
+                    }
+                    let group_identity =
+                        validate_guardian_child_group(record.pid, admission.guardian_pid)?;
+                    #[cfg(test)]
+                    if let Some(received) = registration_fence
+                        .filter(|fence| fence.attempt == record.attempt)
+                        .and_then(|fence| fence.received_spawned.as_ref())
+                    {
+                        received.send(record.pid).map_err(|_| {
+                            lifecycle_error(
+                                "test verified KGC1 SPAWNED receipt",
+                                io::Error::other("native SPAWNED observer ended"),
+                            )
+                        })?;
+                    }
+                    if recovery.denied {
+                        // This is still a real, host-attested Guardian child.
+                        // Take temporary host custody BEFORE signaling so a
+                        // fail-safe retains its original birth on an OS fault.
+                        // Never trust the caller's raw numeric group alone.
+                        let mut retained = lock_generation(current_generation);
+                        *retained = Some(RegisteredPrimaryGeneration::authenticated(
+                            record.attempt,
+                            group_identity,
+                        ));
+                        let native_cleanup = terminate_attested_group(group_identity);
+                        if native_cleanup.is_ok() {
+                            retained.take();
+                        }
+                        drop(retained);
+                        drop(recovery);
+                        let lease_cleanup = state
+                            .lease
+                            .take()
+                            .map(|lease| lease.revoke(RevocationCause::Shutdown))
+                            .transpose();
+                        if let Err(cleanup) = native_cleanup {
+                            return Err(match lease_cleanup {
+                                Ok(_) => cleanup,
+                                Err(other) => collapse_failures(vec![cleanup, other]),
+                            });
+                        }
+                        lease_cleanup?;
+                        return Err(refused_post_shutdown_spawn());
+                    }
                     let current = state.lease.as_mut().ok_or_else(|| {
                         invalid_control_transition("spawned", record.attempt, expected_attempt)
                     })?;
                     // The authenticated Guardian is still untrusted input.
                     // Before granting an app link or recording a killable PGID,
                     // prove this leader is its actual direct OS child.
-                    let group_identity =
-                        validate_guardian_child_group(record.pid, admission.guardian_pid)?;
                     current.child_spawned(record.pid, record.attempt)?;
                     *lock_generation(current_generation) = Some(
                         RegisteredPrimaryGeneration::authenticated(record.attempt, group_identity),
@@ -208,6 +290,10 @@ pub(super) fn run_generation_host(
                         &GenerationControlRecord::new(CONTROL_REGISTERED, record.attempt)
                             .with_pid(record.pid),
                     )?;
+                    // Release only AFTER the complete fixed KGC1 REGISTERED
+                    // record was published. Any later S is ordered after
+                    // native group retention and authorization.
+                    drop(recovery);
                 }
                 CONTROL_REVOKE => {
                     if state.current_attempt != Some(record.attempt)
@@ -372,14 +458,42 @@ pub(super) fn run_generation_host(
     }
 }
 
+/// Typed, private evidence that initial preparation was rejected by the
+/// host's own permanent recovery denial before a generation existed. It is
+/// not a general KGC1 I/O, parser or OS-cleanup error.
+#[derive(Debug)]
+struct InitialRecoveryDenied;
+
+impl std::fmt::Display for InitialRecoveryDenied {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("successor preparation was rejected before initial Ready")
+    }
+}
+
+impl std::error::Error for InitialRecoveryDenied {}
+
 fn rejected_recovery() -> RuntimeError {
     lifecycle_error(
         "macOS guardian generation host transition",
+        io::Error::new(io::ErrorKind::InvalidData, InitialRecoveryDenied),
+    )
+}
+
+fn refused_post_shutdown_spawn() -> RuntimeError {
+    lifecycle_error(
+        "macOS guardian post-shutdown registration refusal",
         io::Error::new(
-            io::ErrorKind::InvalidData,
-            "successor preparation was rejected before initial Ready",
+            io::ErrorKind::PermissionDenied,
+            "SPAWNED refused after host S; no CONTROL_REGISTERED permit was granted",
         ),
     )
+}
+
+pub(super) fn is_initial_recovery_denied(error: &RuntimeError) -> bool {
+    matches!(error, RuntimeError::Lifecycle { source, .. }
+        if source.get_ref()
+            .and_then(|source| source.downcast_ref::<InitialRecoveryDenied>())
+            .is_some())
 }
 
 pub(super) fn check_initial_recovery_decision(

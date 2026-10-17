@@ -15,6 +15,9 @@ pub(super) struct GuardedPrimaryPreparer<C> {
     pub(super) control: Arc<Mutex<GenerationControlPeer>>,
     pub(super) host_unavailable: Arc<AtomicBool>,
     pub(super) preparation_cancelled: Arc<AtomicBool>,
+    /// First genuine KGC1 PREPARED was validated. A later local factory or
+    /// admission fault must not be mistaken for host-rejected first PREPARE.
+    pub(super) initial_prepared: Arc<AtomicBool>,
 }
 
 impl<C> ChildPreparer for GuardedPrimaryPreparer<C>
@@ -31,6 +34,9 @@ where
             attempt,
             Some((&self.preparation_cancelled, &self.host_unavailable)),
         )?;
+        if attempt == 1 {
+            self.initial_prepared.store(true, Ordering::Release);
+        }
         let app_link = match String::from_utf8(response.payload) {
             Ok(app_link) if !app_link.is_empty() => app_link,
             Ok(_) => {

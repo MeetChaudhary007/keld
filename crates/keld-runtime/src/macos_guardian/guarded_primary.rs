@@ -1,5 +1,5 @@
 //! Host-owned persistent guardian and exact registered-generation lifecycle.
-use super::generation_host::GenerationHostAdmission;
+use super::generation_host::{GenerationHostAdmission, is_initial_recovery_denied};
 use super::process_group::{GroupIdentity, terminate_attested_group};
 #[cfg(test)]
 use super::terminate_registered_group;
@@ -38,6 +38,10 @@ pub struct GuardedPrimary {
     pub(super) shutdown_attributed: bool,
     #[cfg(test)]
     pub(super) shutdown_sent: Option<mpsc::SyncSender<()>>,
+    /// Scoped native test proof: denial lock must remain held until S is
+    /// physically written. Never present in the shipping Guardian owner.
+    #[cfg(test)]
+    pub(super) shutdown_denial_fence: Option<(mpsc::SyncSender<()>, mpsc::Receiver<()>)>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -148,6 +152,8 @@ impl GuardedPrimary {
             shutdown_attributed: false,
             #[cfg(test)]
             shutdown_sent: None,
+            #[cfg(test)]
+            shutdown_denial_fence: None,
         })
     }
 
@@ -385,9 +391,33 @@ impl GuardedPrimary {
     }
 
     fn prepare_orderly_shutdown(&mut self) -> Result<(), RuntimeError> {
-        self.deny_recovery();
         if self.shutdown_attributed {
+            self.deny_recovery();
             return Ok(());
+        }
+        // Denial is visible to the generation worker only after S has been
+        // queued on the existing host-exclusive liveness pipe. Without this
+        // one lock, a scheduled gap between deny() and write(S) lets the
+        // worker reject initial PREPARE, then the Guardian exits without KSA.
+        // Never retain this lock while awaiting KSA or host/Guardian reap.
+        let mut recovery = lock_recovery(&self.recovery_decision);
+        recovery.deny();
+        #[cfg(test)]
+        if let Some((arrived, release)) = &self.shutdown_denial_fence {
+            arrived.send(()).map_err(|_| {
+                lifecycle_error(
+                    "test host recovery-denial receipt",
+                    io::Error::other("native shutdown observer ended"),
+                )
+            })?;
+            release
+                .recv_timeout(GUARDIAN_SHUTDOWN_DEADLINE)
+                .map_err(|source| {
+                    lifecycle_error(
+                        "test host recovery-denial release",
+                        io::Error::other(source),
+                    )
+                })?;
         }
         let writer = self.liveness_writer.as_mut().ok_or_else(|| {
             lifecycle_error(
@@ -401,6 +431,7 @@ impl GuardedPrimary {
             .write_all(&[SUPERVISED_ORDERLY_SHUTDOWN])
             .and_then(|()| writer.flush())
             .map_err(|source| lifecycle_error("macOS guardian orderly-shutdown control", source))?;
+        drop(recovery);
         #[cfg(test)]
         if let Some(sent) = &self.shutdown_sent {
             sent.send(()).map_err(|_| {
@@ -421,11 +452,31 @@ impl GuardedPrimary {
     // Missing either fact is a fatal owner-state mismatch, not a clean EOF.
     fn join_worker_with_shutdown_proof(&mut self) -> Result<(), RuntimeError> {
         let was_running = self.worker.is_some();
-        self.join_worker()?;
+        let worker_result = self.join_worker();
         if !was_running {
-            return Ok(());
+            return worker_result;
         }
-        if !lock_recovery(&self.recovery_decision).shutdown_acknowledged {
+        let (acknowledged, denied_before_initial_ready) = {
+            let recovery = lock_recovery(&self.recovery_decision);
+            (
+                recovery.shutdown_acknowledged,
+                recovery.denied && !recovery.initial_ready && recovery.expected_attempt == 1,
+            )
+        };
+        // This is the ONE expected failed-first-PREPARE outcome if the host
+        // raced its own authenticated S after the Guardian's idle probe.
+        // Only an actual KSA, zero registered group and the private typed
+        // denial may reconcile it; never downgrade another worker failure.
+        let shutdown_won_before_first_spawn = self.shutdown_attributed
+            && acknowledged
+            && denied_before_initial_ready
+            && lock_generation(&self.current_generation).is_none();
+        if let Err(error) = worker_result
+            && !(shutdown_won_before_first_spawn && is_initial_recovery_denied(&error))
+        {
+            return Err(error);
+        }
+        if !acknowledged {
             return Err(lifecycle_error(
                 "macOS guardian generation host worker",
                 io::Error::other("worker ended before acknowledged shutdown"),

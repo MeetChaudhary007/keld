@@ -285,6 +285,8 @@ fn poll_fatal_rejects_owned_guardian_zero_even_after_shutdown_attribution() {
         worker: None,
         shutdown_attributed: true,
         shutdown_sent: None,
+        #[cfg(test)]
+        shutdown_denial_fence: None,
     };
     let deadline = Instant::now() + GUARDIAN_SHUTDOWN_DEADLINE;
     let error = loop {
@@ -366,6 +368,8 @@ fn shutdown_worker_error_reaps_registered_group_after_zero_guardian_exit() {
         })),
         shutdown_attributed: true,
         shutdown_sent: None,
+        #[cfg(test)]
+        shutdown_denial_fence: None,
     };
 
     let error = primary.shutdown().expect_err("worker failure stays fatal");
