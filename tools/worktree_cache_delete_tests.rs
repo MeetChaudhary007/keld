@@ -25,15 +25,21 @@ impl Fixture {
         );
     }
     fn new(ignored: bool) -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
         let tick = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root =
-            std::env::temp_dir().join(format!("keld-cache-native-{}-{tick}", std::process::id()));
+        let serial = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "keld-cache-native-{}-{tick}-{serial}",
+            std::process::id()
+        ));
+        fs::create_dir(&root).unwrap(); // atomic uniqueness check
         let repo = root.join("primary repo");
         let secondary = root.join("secondary worktree");
-        fs::create_dir_all(&repo).unwrap();
+        fs::create_dir(&repo).unwrap();
         Self::git(&repo, &["init", "-q"]);
         Self::git(&repo, &["config", "user.name", "KELD test"]);
         Self::git(&repo, &["config", "user.email", "example@test.invalid"]);
@@ -183,6 +189,43 @@ fn refuses_nested_git_repository_inside_build_cache() {
     assert!(f.target().exists());
 }
 #[test]
+fn refuses_casefolded_nested_git_marker_and_preserves_unregistered_source() {
+    let f = Fixture::new(true);
+    let nested = f.target().join("debug").join("unregistered repo");
+    fs::create_dir_all(&nested).unwrap();
+    Fixture::git(&nested, &["init", "-q"]);
+    fs::write(nested.join("source"), "PRESERVE").unwrap();
+    fs::rename(nested.join(".git"), nested.join(".GiT")).unwrap();
+    let mut args = f.args();
+    args.push("--yes".into());
+    let error = f.run(&args).unwrap_err();
+    assert!(error.contains("nested Git"), "{error}");
+    assert_eq!(
+        fs::read_to_string(nested.join("source")).unwrap(),
+        "PRESERVE"
+    );
+}
+
+#[test]
+fn refuses_casefolded_held_cargo_lock() {
+    let f = Fixture::new(true);
+    let path = f.target().join("debug").join(".CARGO-LOCK");
+    fs::write(&path, "").unwrap();
+    let handle = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    handle.try_lock().unwrap();
+    let mut args = f.args();
+    args.push("--dry-run".into());
+    let error = f.run(&args).unwrap_err();
+    assert!(error.contains("Cargo lock"), "{error}");
+    handle.unlock().unwrap();
+    assert!(f.target().exists());
+}
+
+#[test]
 fn refuses_other_registered_worktree_inside_selected_cache() {
     let f = Fixture::new(true);
     let path = f.repo.join("target").join("nested-source");
@@ -216,6 +259,41 @@ fn refuses_other_registered_worktree_inside_selected_cache() {
         "PRESERVE SOURCE"
     );
 }
+#[test]
+fn concurrent_new_worktree_registration_refuses_before_deletion() {
+    use super::run_with_guard;
+    use std::cell::Cell;
+    let f = Fixture::new(true);
+    let nested = f.target().join("late registered");
+    let calls = Cell::new(0u8);
+    let mut args = f.args();
+    args.push("--yes".into());
+    let err = run_with_guard(&f.repo, &args, || {
+        if calls.get() == 0 {
+            let result = Command::new("git")
+                .arg("-C")
+                .arg(&f.repo)
+                .args(["worktree", "add", "-q", "--no-checkout", "-b", "late"])
+                .arg(&nested)
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            // Independent of the marker guard and stable logical byte count.
+            fs::remove_file(nested.join(".git")).unwrap();
+        }
+        calls.set(calls.get() + 1);
+        Ok(())
+    })
+    .unwrap_err();
+    assert!(err.contains("registration changed"), "{err}");
+    assert!(nested.is_dir());
+    assert!(f.target().join("debug").join("cache.bin").exists());
+}
+
 #[cfg(unix)]
 #[test]
 fn symlink_cache_entry_never_touches_outside_files() {

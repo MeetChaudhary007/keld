@@ -148,12 +148,16 @@ cache-tool-exec mode *args:
     set -euo pipefail
     repo_root=$(git rev-parse --show-toplevel)
     cd "$repo_root"
-    stamp=$( {
-        git hash-object tools/worktree_cache.rs
-        git hash-object tools/worktree_cache_delete.rs
-        git hash-object tools/worktree_cache_delete_tests.rs
-        rustc -vV
-    } | git hash-object --stdin )
+    source_stamp() {
+        local dir="$1"
+        {
+            git hash-object "$dir/worktree_cache.rs"
+            git hash-object "$dir/worktree_cache_delete.rs"
+            git hash-object "$dir/worktree_cache_delete_tests.rs"
+            rustc -vV
+        } | git hash-object --stdin
+    }
+    stamp=$(source_stamp tools)
     base="$HOME/.cache/keld/worktree-tool/$stamp"
     mkdir -p "$base"
     name="worktree-cache"
@@ -162,11 +166,19 @@ cache-tool-exec mode *args:
     if [[ ! -x "$binary" ]]; then
         scratch=$(mktemp -d "$base/.build.XXXXXXXX")
         trap 'rm -rf "$scratch"' EXIT
-        rustc --edition=2024 -D warnings -C opt-level=s -C strip=symbols tools/worktree_cache.rs -o "$scratch/$name"
+        # Compile a verified immutable source snapshot, never mutable checkout bytes.
+        cp tools/worktree_cache.rs tools/worktree_cache_delete.rs tools/worktree_cache_delete_tests.rs "$scratch/"
+        [[ "$(source_stamp "$scratch")" == "$stamp" ]] || {
+            echo "cache source changed during snapshot; refusing compilation" >&2; exit 1;
+        }
+        rustc --edition=2024 -D warnings -C opt-level=s -C strip=symbols "$scratch/worktree_cache.rs" -o "$scratch/$name"
         if ! ln "$scratch/$name" "$binary" 2>/dev/null; then
             [[ -x "$binary" ]] || { echo "cache binary publication failed" >&2; exit 1; }
         fi
     fi
+    [[ "$(source_stamp tools)" == "$stamp" ]] || {
+        echo "cache source changed during lookup; refusing stale executable" >&2; exit 1;
+    }
     # set positional-arguments includes the named mode as $1.
     shift
     "$binary" "{{mode}}" . "$@"

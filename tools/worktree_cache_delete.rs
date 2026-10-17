@@ -297,7 +297,11 @@ fn ensure_cargo_locks_free(target: &Path) -> Result<(), String> {
                     path.display()
                 ));
             }
-            if entry.file_name() == ".git" {
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .eq_ignore_ascii_case(".git")
+            {
                 return Err(format!(
                     "nested Git source inside target: {}",
                     path.display()
@@ -307,7 +311,11 @@ fn ensure_cargo_locks_free(target: &Path) -> Result<(), String> {
                 pending.push(path);
             } else if !meta.is_file() {
                 return Err(format!("non-regular cache entry: {}", path.display()));
-            } else if entry.file_name() == ".cargo-lock" {
+            } else if entry
+                .file_name()
+                .to_string_lossy()
+                .eq_ignore_ascii_case(".cargo-lock")
+            {
                 let file = OpenOptions::new()
                     .read(true)
                     .write(true)
@@ -404,7 +412,8 @@ fn run_with_guard(
     build_guard: impl Fn() -> Result<(), String>,
 ) -> Result<(), String> {
     let options = Options::parse(args)?;
-    let listed = worktree_paths(&git(repo, &["worktree", "list", "--porcelain", "-z"])?)?;
+    let original_registry = git(repo, &["worktree", "list", "--porcelain", "-z"])?;
+    let listed = worktree_paths(&original_registry)?;
     let canonical = listed
         .iter()
         .map(|path| {
@@ -473,6 +482,13 @@ fn run_with_guard(
     let mut removed = 0usize;
     for target in &targets {
         build_guard()?;
+        // A nested worktree may be registered after the first inventory.
+        // All registered roots are source, even if their .git marker vanished.
+        if git(repo, &["worktree", "list", "--porcelain", "-z"])? != original_registry {
+            return Err(format!(
+                "Git worktree registration changed during cleanup; stopped after {removed} removals"
+            ));
+        }
         let tree = target.dir.parent().ok_or("cache target missing parent")?;
         let refreshed =
             preflight(tree)?.ok_or_else(|| format!("target vanished: {}", target.dir.display()))?;
