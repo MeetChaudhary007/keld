@@ -1,7 +1,8 @@
 use std::fs::File;
 use std::io::{self, Read as _};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::process::Command;
+use std::os::unix::process::CommandExt as _;
+use std::process::{Child, Command};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -14,6 +15,50 @@ use nix::unistd::{Pid, pipe};
 /// Tests construct a real owned native group before installing a host owner.
 pub(super) fn test_group_identity(pid: u32) -> GroupIdentity {
     observe_group_identity(pid).expect("live native group leader has a kernel birth identity")
+}
+
+/// Own one actual direct OS child from the instant spawn returns. Tests that
+/// exercise fail-closed shutdown may panic before they can install a product
+/// owner; their emergency cleanup must not send a stale numeric PID/PGID.
+pub(super) struct NativeChildOwner(Option<Child>);
+
+impl NativeChildOwner {
+    pub(super) fn new(child: Child) -> Self {
+        Self(Some(child))
+    }
+
+    /// Transfer to the product owner exactly once, leaving Drop disarmed.
+    pub(super) fn take(&mut self) -> Child {
+        self.0.take().expect("transfer the original owned Child")
+    }
+}
+
+impl std::ops::Deref for NativeChildOwner {
+    type Target = Child;
+
+    fn deref(&self) -> &Child {
+        self.0.as_ref().expect("borrow original owned native Child")
+    }
+}
+
+impl std::ops::DerefMut for NativeChildOwner {
+    fn deref_mut(&mut self) -> &mut Child {
+        self.0.as_mut().expect("borrow original owned native Child")
+    }
+}
+
+impl Drop for NativeChildOwner {
+    fn drop(&mut self) {
+        let Some(child) = self.0.as_mut() else {
+            return;
+        };
+        // No other owner may wait this retained Child. After it has been
+        // reaped, avoid a late numeric kill of a potentially recycled PID.
+        if matches!(child.try_wait(), Ok(None)) {
+            let _ = child.kill();
+        }
+        let _ = child.wait();
+    }
 }
 
 pub(super) fn long_running_command() -> Command {
@@ -144,4 +189,41 @@ pub(super) fn kernel_process_image(pid: i32) -> String {
         "owned PID {pid} has no process image"
     );
     image.trim().to_owned()
+}
+
+#[test]
+fn early_native_fixture_panic_reaps_original_owned_child() {
+    struct Rescue(GroupIdentity);
+    impl Drop for Rescue {
+        fn drop(&mut self) {
+            let _ = super::super::process_group::terminate_attested_group(self.0);
+            let _ = nix::sys::wait::waitpid(
+                Pid::from_raw(i32::try_from(self.0.pid).expect("positive original PID")),
+                None,
+            );
+        }
+    }
+    // A test that panics after spawning its native group must not leave it
+    // executing. The independent attested rescue below runs only AFTER this
+    // absence oracle, so it cannot conceal a broken fixture Drop.
+    let child = Command::new("/bin/sleep")
+        .arg("30")
+        .process_group(0)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("disposable independent native group");
+    let original_birth = test_group_identity(child.id());
+    let _failure_only_rescue = Rescue(original_birth);
+    let cut = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _owned = NativeChildOwner::new(child);
+        panic!("deterministic fixture failure before product ownership");
+    }));
+    assert!(cut.is_err(), "early native fixture cut must execute");
+    assert_ne!(
+        observe_group_identity(original_birth.pid).ok(),
+        Some(original_birth),
+        "a panic before registered custody must reap the exact original native child"
+    );
 }

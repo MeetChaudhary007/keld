@@ -1,18 +1,21 @@
 //! A forged/early authenticated KGC1 CLEAR cannot discard a live Bun group.
 //! The host must exercise its own attested native fail-safe before CLEARED.
+use std::io::Write as _;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use nix::errno::Errno;
-use nix::sys::signal::{Signal, kill, killpg};
+use nix::sys::signal::kill;
 use nix::unistd::{Pid, getpgid};
 
-use super::super::super::process_group::observe_group_identity;
+use super::super::super::process_group::{
+    GroupIdentity, observe_group_identity, terminate_attested_group,
+};
 use super::super::super::{handshake_client, parse_app_link};
-use super::super::test_support::verified_real_bun;
+use super::super::test_support::{NativeChildOwner, verified_real_bun};
 use super::{
     CONTROL_CLEAR, CONTROL_CLEARED, CONTROL_PREPARE, CONTROL_PREPARED, CONTROL_REGISTERED,
     CONTROL_REVOKE, CONTROL_REVOKED, CONTROL_SPAWNED, GenerationControlRecord,
@@ -21,24 +24,24 @@ use super::{
 };
 
 struct NativeBunGroup {
-    leader: Child,
-    descendant: Option<i32>,
+    leader: NativeChildOwner,
+    original_birth: Option<GroupIdentity>,
 }
 
 impl Drop for NativeBunGroup {
     fn drop(&mut self) {
-        let group = Pid::from_raw(i32::try_from(self.leader.id()).expect("native group ID"));
-        let live_leader = getpgid(Some(group)) == Ok(group);
-        let live_descendant = self
-            .descendant
-            .is_some_and(|pid| getpgid(Some(Pid::from_raw(pid))) == Ok(group));
-        if group != nix::unistd::getpgrp() && (live_leader || live_descendant) {
-            let _ = killpg(group, Signal::SIGKILL);
+        // The real Bun leader may already have been reaped by the success
+        // oracle. A saved numeric PGID and a descendant marker do not prove
+        // ownership of any future process assigned that number.
+        if let Some(original_birth) = self.original_birth.take() {
+            let _ = terminate_attested_group(original_birth);
         }
-        let _ = self.leader.kill();
-        let _ = self.leader.wait();
+        // NativeChildOwner follows this Drop and reaps only its original
+        // direct Child, including a panic before group-birth observation.
     }
 }
+
+mod cleanup_authority;
 
 fn await_bun_descendant(marker: &std::path::Path) -> i32 {
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -66,18 +69,45 @@ if (!child.pid) process.exit(72);
 writeFileSync(process.env.KELD_CLEAR_TEST_DESCENDANT, String(child.pid));
 setInterval(() => {}, 1000);
 "#;
-    let mut command = Command::new(bun);
+    // The test's native rescue must own this group BEFORE any Bun child can
+    // fork its same-group descendant. An initial /bin/sh becomes the same PID
+    // after exec and does not change the original kernel group birth.
+    let mut command = Command::new("/bin/sh");
     command
+        .args([
+            "-c",
+            "IFS= read -r permit || exit 73; [ \"$permit\" = R ] || exit 74; exec \"$@\"",
+            "keld-clear-preexec-gate",
+        ])
+        .arg(&bun)
         .args(["-e", script])
         .env("KELD_CLEAR_TEST_DESCENDANT", marker)
         .process_group(0)
-        .stdin(Stdio::null())
+        .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::inherit());
-    NativeBunGroup {
-        leader: command.spawn().expect("spawn real isolated Bun leader"),
-        descendant: None,
-    }
+    let leader = NativeChildOwner::new(
+        command
+            .spawn()
+            .expect("spawn held isolated Bun group leader"),
+    );
+    let mut group = NativeBunGroup {
+        leader,
+        original_birth: None,
+    };
+    group.original_birth = Some(
+        observe_group_identity(group.leader.id())
+            .expect("retain original group birth while Bun's pre-exec gate is still closed"),
+    );
+    group
+        .leader
+        .stdin
+        .as_mut()
+        .expect("sole test-owned Bun pre-exec gate")
+        .write_all(b"R\n")
+        .expect("release Bun only after group birth is retained");
+    group.leader.stdin.take();
+    group
 }
 
 fn descendant_gone(pid: i32) {
@@ -99,7 +129,6 @@ fn early_kgc1_clear_reaps_live_bun_and_same_group_descendant_before_cleared() {
     let group_pid = owned.leader.id();
     let group = Pid::from_raw(i32::try_from(group_pid).expect("group pid fits"));
     let descendant = await_bun_descendant(&marker);
-    owned.descendant = Some(descendant);
     assert_eq!(
         getpgid(Some(Pid::from_raw(descendant))),
         Ok(group),

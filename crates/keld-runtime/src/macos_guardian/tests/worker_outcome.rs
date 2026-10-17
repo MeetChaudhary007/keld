@@ -10,19 +10,22 @@ use nix::unistd::Pid;
 
 use super::super::{
     GUARDIAN_SHUTDOWN_DEADLINE, GuardedPrimary, JoinHandle, RecoveryState,
-    RegisteredPrimaryGeneration, lock_generation, lock_recovery, terminate_registered_group,
+    RegisteredPrimaryGeneration, lock_generation, lock_recovery,
 };
+use super::test_support::NativeChildOwner;
 
 #[test]
 fn premature_successful_generation_worker_exit_reaps_unattributed_group() {
-    let mut group = Command::new("/bin/sleep")
-        .arg("30")
-        .process_group(0)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("isolated native Bun-group stand-in");
+    let mut group = NativeChildOwner::new(
+        Command::new("/bin/sleep")
+            .arg("30")
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("isolated native Bun-group stand-in"),
+    );
     let group_pid = group.id();
     let raw_pid = i32::try_from(group_pid).expect("PID fits c_int");
     assert_eq!(
@@ -84,9 +87,9 @@ fn premature_successful_generation_worker_exit_reaps_unattributed_group() {
     }
     let group_retired = group_status.is_some();
     if !group_retired {
-        // A failing red-phase test must still reap its isolated OS child.
-        terminate_registered_group(group_pid).expect("test fallback group kill");
-        group.wait().expect("test fallback reap");
+        // This fixture has one native group member and retains its Child.
+        group.kill().expect("kill exact unreaped native test child");
+        group.wait().expect("reap exact native test child");
     }
     primary.shutdown_attributed = true; // Avoid stand-in Q/S ACK I/O.
     let guardian_shutdown = primary.shutdown();
@@ -111,14 +114,16 @@ fn premature_successful_generation_worker_exit_reaps_unattributed_group() {
 // worker/guardian left an enrolled process group on the host side.
 #[test]
 fn zero_guardian_exit_with_successful_worker_reaps_registered_group() {
-    let mut group = Command::new("/bin/sleep")
-        .arg("30")
-        .process_group(0)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("native owned group fixture");
+    let mut group = NativeChildOwner::new(
+        Command::new("/bin/sleep")
+            .arg("30")
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("native owned group fixture"),
+    );
     let group_pid = group.id();
     let raw_pid = i32::try_from(group_pid).expect("group PID fits c_int");
     assert_eq!(
@@ -169,8 +174,8 @@ fn zero_guardian_exit_with_successful_worker_reaps_registered_group() {
     }
     let group_retired = group_status.is_some();
     if !group_retired {
-        terminate_registered_group(group_pid).expect("test fallback kill");
-        group.wait().expect("test fallback reap");
+        group.kill().expect("kill exact unreaped native test child");
+        group.wait().expect("reap exact native test child");
     }
     let error = result.expect_err("registered group cannot survive successful shutdown");
     assert!(
@@ -188,14 +193,16 @@ fn zero_guardian_exit_with_successful_worker_reaps_registered_group() {
 // return ECHILD. Inspection failure must not strand the enrolled group.
 #[test]
 fn poll_fatal_inspection_error_reaps_registered_group() {
-    let mut group = Command::new("/bin/sleep")
-        .arg("30")
-        .process_group(0)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("isolated native process group");
+    let mut group = NativeChildOwner::new(
+        Command::new("/bin/sleep")
+            .arg("30")
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("isolated native process group"),
+    );
     let group_pid = group.id();
     let raw_group = i32::try_from(group_pid).expect("group id fits c_int");
     assert_eq!(
@@ -251,8 +258,8 @@ fn poll_fatal_inspection_error_reaps_registered_group() {
     let group_retired = group_status.is_some();
     if !group_retired {
         // A red-phase regression must never leave its own group alive.
-        terminate_registered_group(group_pid).expect("owned group fallback kill");
-        group.wait().expect("owned group fallback reap");
+        group.kill().expect("kill exact unreaped native test child");
+        group.wait().expect("reap exact native test child");
     }
     // The guardian was already externally reaped, so avoid Drop's Q/S I/O.
     primary.liveness_writer.take();

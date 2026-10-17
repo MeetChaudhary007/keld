@@ -8,20 +8,23 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use nix::errno::Errno;
 use nix::fcntl::{FcntlArg, FdFlag, fcntl};
-use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 
+use super::super::process_group::{
+    GroupIdentity, observe_group_identity, terminate_attested_group,
+};
 use super::super::{
     CONTROL_PREPARE, CONTROL_PREPARED, CONTROL_SPAWNED, GUARDIAN_SHUTDOWN_DEADLINE,
     GenerationControlRecord, GuardianBootstrap, HostGuardian, REGISTRATION_ENV, handshake_client,
     lifecycle_error, parse_app_link, read_generation_control, reject_host_registration,
-    terminate_registered_group, write_generation_control, write_group_registration,
+    write_generation_control, write_group_registration,
 };
+use super::test_support::NativeChildOwner;
 
 mod witness;
 use self::witness::await_denial_witness;
+mod cleanup_authority;
 
 const FORGED_GROUP_ENV: &str = "KELD_TEST_KGR1_FOREIGN_GROUP";
 const FORGED_GROUP_ROLE: &str =
@@ -58,14 +61,16 @@ fn forged_kgr1_guardian_role() {
 fn authenticated_kgr1_cannot_claim_an_unrelated_live_process_group() {
     // A disposable, exactly owned outsider group. The test never probes or
     // signals an arbitrary OS process ID, including on unexpected acceptance.
-    let mut outsider = Command::new("/bin/sleep")
-        .arg("30")
-        .process_group(0)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("start independent test-owned process group");
+    let mut outsider = NativeChildOwner::new(
+        Command::new("/bin/sleep")
+            .arg("30")
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("start independent test-owned process group"),
+    );
     let group = outsider.id();
     let mut command = Command::new(std::env::current_exe().expect("test binary"));
     command
@@ -258,7 +263,13 @@ fn authenticated_kgc1_cannot_enroll_or_kill_unrelated_live_process_group() {
 }
 use super::long_running_command;
 
-fn assert_guardian_cleanup_bounded<F>(guardian_pid: u32, operation: F) -> Option<String>
+// The timeout worker owns/reaps the actual Guardian Child. A numeric PID
+// captured before that worker starts is NOT signal authority after its wait().
+fn rescue_wedged_guardian(original_birth: GroupIdentity) -> Result<(), String> {
+    terminate_attested_group(original_birth).map_err(|error| error.to_string())
+}
+
+fn assert_guardian_cleanup_bounded<F>(guardian_birth: GroupIdentity, operation: F) -> Option<String>
 where
     F: FnOnce() -> Option<String> + Send + 'static,
 {
@@ -267,25 +278,22 @@ where
         let _ = tx.send(operation());
     });
     let completed = rx.recv_timeout(GUARDIAN_SHUTDOWN_DEADLINE + Duration::from_secs(2));
-    if completed.is_err() {
-        // Safe red-phase kill switch for this exact test-owned guardian.
-        let _ = kill(
-            Pid::from_raw(i32::try_from(guardian_pid).expect("guardian pid fits")),
-            Signal::SIGKILL,
-        );
-    }
+    // The owner thread may have reaped the original Child and released its
+    // PID just before this timeout; only its earlier kernel birth is trusted.
+    let rescue_error = if completed.is_err() {
+        rescue_wedged_guardian(guardian_birth).err()
+    } else {
+        None
+    };
     owner.join().expect("guardian cleanup worker joins");
     assert!(
         completed.is_ok(),
-        "rejected/bootstrap guardian cleanup exceeded the five-second shutdown deadline"
+        "rejected/bootstrap guardian cleanup exceeded the five-second shutdown deadline; original-birth rescue={rescue_error:?}"
     );
-    assert_eq!(
-        kill(
-            Pid::from_raw(i32::try_from(guardian_pid).expect("guardian pid fits")),
-            None,
-        ),
-        Err(Errno::ESRCH),
-        "cleanup must reap the guardian, not merely signal it"
+    assert_ne!(
+        observe_group_identity(guardian_birth.pid).ok(),
+        Some(guardian_birth),
+        "cleanup must reap the original Guardian, not merely signal it"
     );
     completed.expect("bounded worker result")
 }
@@ -293,15 +301,19 @@ where
 #[test]
 fn rejected_registration_reaps_wedged_guardian_within_shutdown_deadline() {
     let mut command = long_running_command();
-    command.stdin(Stdio::piped());
-    let mut child = command.spawn().expect("isolated uncooperative guardian");
+    command.stdin(Stdio::piped()).process_group(0);
+    let mut child =
+        NativeChildOwner::new(command.spawn().expect("isolated uncooperative guardian"));
     let guardian_pid = child.id();
+    let guardian_birth = observe_group_identity(guardian_pid)
+        .expect("retain original isolated Guardian birth before handing Child to timeout worker");
     let writer = child.stdin.take().expect("sole owned guardian writer");
     let error = lifecycle_error(
         "macOS guardian synthetic registration rejection",
         io::Error::new(io::ErrorKind::PermissionDenied, "refused registration"),
     );
-    let rendered = assert_guardian_cleanup_bounded(guardian_pid, move || {
+    let child = child.take();
+    let rendered = assert_guardian_cleanup_bounded(guardian_birth, move || {
         Some(reject_host_registration(child, writer, error).to_string())
     })
     .expect("rejection is retained");
@@ -314,10 +326,13 @@ fn rejected_registration_reaps_wedged_guardian_within_shutdown_deadline() {
 
 #[test]
 fn dropping_unregistered_bootstrap_reaps_wedged_guardian_within_shutdown_deadline() {
-    let guardian =
-        GuardianBootstrap::spawn(long_running_command()).expect("spawn owned bootstrap guardian");
+    let mut command = long_running_command();
+    command.process_group(0);
+    let guardian = GuardianBootstrap::spawn(command).expect("spawn owned bootstrap guardian");
     let guardian_pid = guardian.guardian_pid().expect("bootstrap owns child");
-    assert_guardian_cleanup_bounded(guardian_pid, move || {
+    let guardian_birth = observe_group_identity(guardian_pid)
+        .expect("retain original bootstrap Guardian birth before transferring ownership");
+    assert_guardian_cleanup_bounded(guardian_birth, move || {
         drop(guardian);
         None
     });
@@ -330,7 +345,8 @@ fn dropping_unregistered_bootstrap_reaps_wedged_guardian_within_shutdown_deadlin
 fn rejected_writer_with_clean_guardian_exit_reaps_enrolled_group() {
     let mut group_command = long_running_command();
     group_command.process_group(0);
-    let mut group = group_command.spawn().expect("isolated registered group");
+    let mut group =
+        NativeChildOwner::new(group_command.spawn().expect("isolated registered group"));
     let group_pid = group.id();
     let raw_group = i32::try_from(group_pid).expect("group id fits i32");
     assert_eq!(
@@ -368,8 +384,8 @@ fn rejected_writer_with_clean_guardian_exit_reaps_enrolled_group() {
     }
     let retired = observed.is_some();
     if !retired {
-        terminate_registered_group(group_pid).expect("test-owned red-phase group kill");
-        group.wait().expect("test-owned red-phase group reap");
+        group.kill().expect("kill exact unreaped test-owned child");
+        group.wait().expect("reap exact test-owned child");
     }
     assert!(
         retired,

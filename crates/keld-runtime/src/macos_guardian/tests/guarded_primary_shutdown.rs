@@ -8,14 +8,12 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use nix::unistd::Pid;
-
 use super::super::{
     GENERATION_CONTROL_POLL, GUARDIAN_SHUTDOWN_DEADLINE, GuardedPrimary, GuardedPrimaryUpdate,
     GuardianBootstrap, RecoveryState, RegisteredPrimaryGeneration, RoleEvent, RuntimeError,
     SUPERVISED_GUARDIAN_ARG, lifecycle_error, lock_generation, lock_recovery,
-    terminate_registered_group,
 };
+use super::test_support::NativeChildOwner;
 
 struct PersistentPrimaryFixture {
     primary: GuardedPrimary,
@@ -322,18 +320,20 @@ fn poll_fatal_rejects_owned_guardian_zero_even_after_shutdown_attribution() {
 
 #[test]
 fn shutdown_worker_error_reaps_registered_group_after_zero_guardian_exit() {
-    let mut group = Command::new("/bin/sleep")
-        .arg("30")
-        .process_group(0)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("own isolated process group");
+    let mut group = NativeChildOwner::new(
+        Command::new("/bin/sleep")
+            .arg("30")
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("own isolated process group"),
+    );
     let group_pid = group.id();
     let raw_pid = i32::try_from(group_pid).expect("group PID fits c_int");
     assert_eq!(
-        nix::unistd::getpgid(Some(Pid::from_raw(raw_pid)))
+        nix::unistd::getpgid(Some(nix::unistd::Pid::from_raw(raw_pid)))
             .expect("registered group leader exists")
             .as_raw(),
         raw_pid,
@@ -388,9 +388,10 @@ fn shutdown_worker_error_reaps_registered_group_after_zero_guardian_exit() {
     }
     let fail_safe_reaped = group_status.is_some();
     if !fail_safe_reaped {
-        // Keep even a failing regression from leaving a process behind.
-        terminate_registered_group(group_pid).expect("test-owned group fallback");
-        group.wait().expect("reap test-owned group");
+        // This fixture has only one test-owned /bin/sleep group member.
+        // Rescue the exact unreaped Child, never a possibly recycled PGID.
+        group.kill().expect("kill exact retained test-owned child");
+        group.wait().expect("reap exact retained test-owned child");
     }
     assert!(
         guardian_status.success(),
