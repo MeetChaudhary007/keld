@@ -309,7 +309,7 @@ and limited lifecycle compatibility are implemented. KELD is ready for
 
 | Area | Current boundary |
 |---|---|
-| Permissions | Manifest parsing and guard-before-handler checks exist. The scoped filesystem broker is wire-tested but not connected to the production host; the broader native-service surface is unfinished. |
+| Permissions | Manifest parsing and guard-before-handler checks exist. The retained filesystem broker and guarded host route are implemented, providing a public Bun `fs.read`/`write` slice on the app link (macOS-verified project-policy capture; absent-policy all-denied fallback); non-macOS project-policy producers, renderer-action forwarding, and the broader native-service surface remain unfinished. |
 | Process isolation | Linux strict launch is implemented for the current primary process. Full strict-profile admission across platforms remains incomplete; authenticated IPC alone is not a complete sandbox. |
 | Building and shipping apps | `keld build`, packaged releases, installers, signing, and signed updates are not available yet. |
 
