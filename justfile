@@ -12,7 +12,7 @@ set positional-arguments
 # Windows installs expose python; Unix hosts need not provide that alias.
 python_command := if os() == "windows" { "python" } else { "python3" }
 
-# Open the current platform hello backend (Phase 1 slice).
+# Diagnostic test: open the platform hello backend window (not the keld create/dev app demo).
 hello:
     cargo run -p keld-host --bin keld-host -- --hello
 
@@ -112,27 +112,31 @@ agent-context-test:
     {{python_command}} -B tools/test_session_closeout_hook.py
     {{python_command}} -B tools/test_workspace.py
 
-# KEL-245: local-only allocation and execution; all roots derive from Git identity.
+# Create an isolated worktree branch for a task or single concern.
 work-start *args:
     #!/usr/bin/env bash
     set -euo pipefail
     {{python_command}} -B tools/workspace.py start "$@"
 
+# Inspect status of managed worktrees and task branches (read-only).
 work-status *args:
     #!/usr/bin/env bash
     set -euo pipefail
     {{python_command}} -B tools/workspace.py status "$@"
 
+# Run a command inside an isolated worktree directory.
 work-run *args:
     #!/usr/bin/env bash
     set -euo pipefail
     {{python_command}} -B tools/workspace.py run "$@"
 
+# Check and conclude an active worktree.
 work-finish *args:
     #!/usr/bin/env bash
     set -euo pipefail
     {{python_command}} -B tools/workspace.py finish "$@"
 
+# Inspect or prune stale worktrees (read-only by default; pass --apply to mutate).
 work-clean *args:
     #!/usr/bin/env bash
     set -euo pipefail

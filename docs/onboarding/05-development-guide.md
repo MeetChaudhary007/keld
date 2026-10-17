@@ -102,21 +102,87 @@ not a drive-by lockfile bump.
 `bans` and `sources` pass. `deny.toml`'s `[graph] targets` includes Darwin triples, so
 CI's Ubuntu `deny` job evaluates the same macOS dependency set.
 
-### 3.3 `just` targets, and the raw commands if you skip `just`
+### 3.3 Discovering and running `just` commands
 
-| `just` target | Equivalent command |
-|---|---|
-| `just hello` | `cargo run -p keld-host --bin keld-host -- --hello` |
-| `just fmt` | `cargo fmt --all` |
-| `just fmt-check` | `cargo fmt --all --check` |
-| `just clippy` | `cargo clippy --workspace --all-targets -- -D warnings` |
-| `just test` | `cargo nextest run --workspace --profile ci` |
-| `just doc` | `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps` |
-| `just deny` | `cargo deny check` |
-| `just mermaid-test` / `just mermaid-check` / `just mermaid-render-check` | validator tests / tracked structural policy / isolated digest-pinned SVG render |
-| `just llms-test` / `just llms-check` | generated-corpus contract tests / freshness check |
-| `just ci` | Full local gate; the `justfile` `ci` recipe and the gate groups it names are the sole source of its inventory and order. |
-| `just ci-full` | `just ci` with full-corpus Mermaid validation and pinned rendering forced. |
+[`just`](https://github.com/casey/just) is KELD's canonical command runner, executing
+recipes defined in the root [`justfile`](../../justfile). It requires minimum version
+**1.55.0** (`cargo install just --locked`).
+
+#### 3.3.1 Minimal first-run discovery workflow
+
+Newcomers can inspect and discover available recipes safely without executing unintended
+actions:
+
+```bash
+just --version       # verify minimum version (1.55.0+)
+just --list          # discover all public recipes with descriptions
+just --show ci       # safely inspect recipe definition and dependencies without executing
+just fmt-check       # fast, non-mutating formatting check
+```
+
+If optional tools (like `cargo-nextest` or Docker) are not installed, raw `cargo` commands
+serve as fallbacks (listed in the reference table below).
+
+#### 3.3.2 Task-oriented command guide
+
+Recipes are grouped by developer task and lifecycle stage:
+
+- **Diagnostic backend vs. product demo:**
+  - `just hello`: opens the diagnostic backend window (Phase 1 slice) to verify native
+    host webview initialization.
+  - *Note:* `just hello` is **not** the application demo. To experience the real app session,
+    follow [Run the current demo](README.md#run-the-current-demo) using
+    `keld create → doctor → dev`.
+- **Fast edit loop (rapid local feedback):**
+  - `just fmt-check`: verifies Rust code formatting without touching files (read-only, fast).
+  - `just fmt`: formats Rust files in place (**file-mutating**).
+  - `just clippy`: runs workspace lints with warnings treated as errors (`-D warnings`).
+  - Scoped tests: `cargo nextest run -p <crate> -- <filter>` runs focused tests without the
+    full suite overhead.
+- **Pre-PR verification gates:**
+  - `just ci`: standard local pre-PR gate. Runs independent policy gates in parallel,
+    followed by TypeScript compilation, formatting checks, clippy, workspace tests,
+    documentation builds, and supply-chain checks. On Windows, execute within Git Bash
+    for shell-based recipe compatibility.
+  - `just ci-full`: full assurance mode. Runs `just ci` with full-corpus Mermaid validation
+    and digest-pinned container rendering (requires a Docker-compatible engine).
+- **Docs, architecture, and generated sources:**
+  - `just llms` (**file-mutating** generator) · `just llms-check` · `just llms-test`:
+    maintains the agent-readable `llms.txt` corpus.
+  - `just product-status` (**file-mutating** generator) · `just product-status-check` ·
+    `just product-status-test`: renders the Markdown view from the canonical TSV ledger.
+  - `just doc-placeholders-check` · `just doc-placeholders-test`: enforces that no template
+    placeholders reach checked-in prose.
+  - `just mermaid-check` · `just mermaid-test` · `just mermaid-render-check`: validates
+    Mermaid diagrams and renders SVG assets via container.
+- **Managed worktrees & session helpers:**
+  - `just work-start <task-id>`: provisions an isolated worktree branch for a single concern.
+  - `just work-status`: inspects active worktrees and task branches (read-only).
+  - `just work-run <task-id> <cmd>`: executes a command inside a managed worktree.
+  - `just work-finish <task-id>`: checks and concludes an active worktree.
+  - `just work-clean`: inspects stale worktrees (read-only by default; pass `--apply` for
+    **mutating cleanup**).
+- **Optional maintainer-only / network workflows:**
+  - `just research-sync` · `just hooks-install`: maintainer research synchronization and
+    checkout hook installation. These recipes are **strictly optional** and not required
+    for public external contributions.
+
+#### 3.3.3 Command properties & safety reference
+
+| Recipe | Equivalent command / fallback | Side effect | Cost | Notes |
+|---|---|---|---|---|
+| `just hello` | `cargo run -p keld-host --bin keld-host -- --hello` | Read-only | Moderate | Diagnostic window only; not the app-session demo |
+| `just fmt-check` | `cargo fmt --all --check` | Read-only | Fast | Non-mutating format gate |
+| `just fmt` | `cargo fmt --all` | **File-mutating** | Fast | Overwrites unformatted Rust files |
+| `just clippy` | `cargo clippy --workspace --all-targets -- -D warnings` | Read-only | Moderate | Warnings treated as errors |
+| `just test` | `cargo nextest run --workspace --profile ci` (fallback: `cargo test --workspace`) | Read-only | Heavy | Runs workspace test suite |
+| `just doc` | `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps` | Read-only | Moderate | Builds rustdoc |
+| `just deny` | `cargo deny check` | Read-only | Fast | Requires `cargo-deny` |
+| `just ci` | Full local gate (policy + TS + fmt + clippy + test + doc + deny) | Read-only | Heavy | Sole gate inventory defined in `justfile`; use Git Bash on Windows |
+| `just ci-full` | `just ci` + forced container Mermaid rendering | Read-only | Heavy | Requires Docker-compatible engine |
+| `just llms` | `tools/llms_docs.rs generate .` | **File-mutating** | Fast | Regenerates `llms.txt` from sources |
+| `just product-status` | `tools/product_status.rs generate .` | **File-mutating** | Fast | Regenerates Markdown view from canonical TSV |
+| `just work-clean` | Worktree inspection (or cleanup with `--apply`) | **Mutating with `--apply`** | Fast | Safe inspection by default; `--apply` removes dead worktrees |
 
 `just ci` is the local mirror of routed CI, minus the three-OS matrix and the manual Mermaid
 visual-inspection/report step. Its independent policy gates run in parallel. TypeScript

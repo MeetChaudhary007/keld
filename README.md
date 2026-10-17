@@ -327,6 +327,7 @@ Built by [GYLDLAB](https://github.com/gyldlab), in the open.
 | Explore performance | [KELD Benches](https://github.com/gyldlab/keld-benches) |
 | Review technical audits | [Public audit registry](docs/audits/README.md) |
 | Work with a coding agent | [llms.txt](llms.txt) · [Local read-only MCP server setup](docs/onboarding/07-mcp-server.md) |
+| Discover and use Just commands | [Task runner & command guide](docs/onboarding/05-development-guide.md#33-discovering-and-running-just-commands) |
 | Make a contribution | [Contributing](CONTRIBUTING.md) · [Open issues](https://github.com/gyldlab/keld/issues) |
 
 A useful first contribution is a real run report: OS, source revision, Bun
