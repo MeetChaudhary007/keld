@@ -4,10 +4,14 @@
 use std::io::{self, Read as _, Write as _};
 use std::os::unix::net::UnixStream;
 use std::process::{Command, Stdio};
+use std::sync::{Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use super::super::{GuardianBootstrap, REGISTRATION_ENV, handshake_client, parse_app_link};
+use super::super::{
+    CONTROL_PREPARE, GenerationControlRecord, GuardianBootstrap, REGISTRATION_ENV, RecoveryState,
+    handshake_client, parse_app_link, run_generation_host, write_generation_control,
+};
 
 const ROLE_ENV: &str = "KELD_TEST_ZERO_KGC1_ROLE";
 const CASE_ENV: &str = "KELD_TEST_ZERO_KGC1_CASE";
@@ -165,4 +169,45 @@ fn authenticated_partial_first_kgc1_cannot_extend_original_deadline() {
 #[test]
 fn authenticated_byte_drip_first_kgc1_cannot_extend_original_deadline() {
     native_initial_record_denial("drip");
+}
+
+#[test]
+fn generation_host_cannot_accept_buffered_first_record_after_original_deadline() {
+    let (host, mut guardian) = std::os::unix::net::UnixStream::pair().expect("actual KGC1 pair");
+    write_generation_control(
+        &mut guardian,
+        &GenerationControlRecord::new(CONTROL_PREPARE, 1),
+    )
+    .expect("complete KGC1 Prepare already buffered");
+    let (updates_tx, _updates_rx) = mpsc::channel();
+    let current = Mutex::new(None);
+    let recovery = Mutex::new(RecoveryState::new());
+    let error = run_generation_host(
+        super::super::generation_host::GenerationHostAdmission::new(
+            std::process::id(),
+            Instant::now()
+                .checked_sub(Duration::from_millis(1))
+                .expect("monotonic clock has at least one millisecond of history"),
+        ),
+        host,
+        &updates_tx,
+        &current,
+        &recovery,
+        None,
+        None,
+    )
+    .expect_err("a fully buffered late PREPARE cannot extend original authentication");
+    assert!(error.to_string().contains("first KGC1 record"), "{error}");
+    let mut reply = [0_u8; 1];
+    assert_eq!(
+        guardian.read(&mut reply).expect("observe host control EOF"),
+        0,
+        "expired first KGC1 deadline must not publish PREPARED authority"
+    );
+    assert!(
+        current
+            .lock()
+            .expect("no generation was registered")
+            .is_none()
+    );
 }
