@@ -110,6 +110,15 @@ fn known_process_names_are_detected_without_resident_ide_false_positives() {
     }
 }
 #[test]
+fn empty_or_incomplete_process_inventory_refuses_cleanup() {
+    use super::validate_process_inventory;
+    assert!(validate_process_inventory(b"").is_err());
+    assert!(validate_process_inventory(b" \n  \t\n").is_err());
+    assert!(validate_process_inventory(b"cargo\n").is_err());
+    assert!(validate_process_inventory(b"rustc.exe\n").is_err());
+    assert!(validate_process_inventory(b"bash\nps\n").is_ok());
+}
+#[test]
 fn without_yes_or_dry_run_never_deletes() {
     let f = Fixture::new(true);
     assert!(f.run(&f.args()).is_err());

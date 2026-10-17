@@ -106,15 +106,24 @@ fn running_process_names() -> Result<Vec<u8>, String> {
     }
     Ok(out.stdout)
 }
-fn ensure_no_builds() -> Result<(), String> {
-    let names =
-        String::from_utf8(running_process_names()?).map_err(|_| "process names not valid UTF-8")?;
-    if let Some(name) = names.lines().find(|name| active_build_name(name)) {
-        return Err(format!(
-            "active compiler/build {name:?} detected; refusing cleanup"
-        ));
+fn validate_process_inventory(data: &[u8]) -> Result<(), String> {
+    let names = std::str::from_utf8(data).map_err(|_| "process names not valid UTF-8")?;
+    let mut observed = 0usize;
+    for name in names.lines().map(str::trim).filter(|name| !name.is_empty()) {
+        observed += 1;
+        if active_build_name(name) {
+            return Err(format!(
+                "active compiler/build {name:?} detected; refusing cleanup"
+            ));
+        }
+    }
+    if observed == 0 {
+        return Err("empty process inventory; refusing cleanup".into());
     }
     Ok(())
+}
+fn ensure_no_builds() -> Result<(), String> {
+    validate_process_inventory(&running_process_names()?)
 }
 
 fn real_ancestors(path: &Path) -> Result<(), String> {
