@@ -284,6 +284,7 @@ fn poll_fatal_rejects_owned_guardian_zero_even_after_shutdown_attribution() {
         updates_rx,
         worker: None,
         shutdown_attributed: true,
+        shutdown_failed: false,
         shutdown_sent: None,
         #[cfg(test)]
         shutdown_denial_fence: None,
@@ -367,6 +368,7 @@ fn shutdown_worker_error_reaps_registered_group_after_zero_guardian_exit() {
             ))
         })),
         shutdown_attributed: true,
+        shutdown_failed: false,
         shutdown_sent: None,
         #[cfg(test)]
         shutdown_denial_fence: None,
@@ -401,5 +403,11 @@ fn shutdown_worker_error_reaps_registered_group_after_zero_guardian_exit() {
     assert!(
         lock_generation(&current_generation).is_none(),
         "worker failure retained stale group authority"
+    );
+    let second = primary.shutdown();
+    assert!(
+        matches!(second, Err(RuntimeError::Lifecycle { ref source, .. })
+            if source.kind() == io::ErrorKind::NotConnected),
+        "a previously failed Guardian shutdown cannot return success on retry: first={error}; second={second:?}"
     );
 }

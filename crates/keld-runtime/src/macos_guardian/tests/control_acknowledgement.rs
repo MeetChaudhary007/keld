@@ -40,6 +40,7 @@ while (!(await input.read()).done) {}
         updates_rx,
         worker: None,
         shutdown_attributed: false,
+        shutdown_failed: false,
         shutdown_sent: None,
         #[cfg(test)]
         shutdown_denial_fence: None,
@@ -83,12 +84,16 @@ fn control_eof_acknowledgment_is_order_independent_and_attributed() {
         }
         let result = reader.join().expect("one owned EOF reader joins");
         let status = primary.shutdown().expect("ACK peer EOF and owned reap");
+        let repeat_status = primary
+            .shutdown()
+            .expect("a successful attributed shutdown remains an idempotent success");
         println!(
             "KEL143_RUNTIME_ACK_EOF ack_first={ack_first} ack_at_eof={observed} peer_status={status:?}"
         );
         assert_eq!(observed, ack_first);
         result.expect("either ordered actual EOF/ACK completes cleanly");
         assert!(status.success());
+        assert!(repeat_status.success());
     }
 }
 

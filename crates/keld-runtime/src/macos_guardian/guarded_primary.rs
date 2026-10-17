@@ -36,6 +36,9 @@ pub struct GuardedPrimary {
     pub(super) updates_rx: Receiver<GuardedPrimaryUpdate>,
     pub(super) worker: Option<JoinHandle<Result<(), RuntimeError>>>,
     pub(super) shutdown_attributed: bool,
+    /// An earlier shutdown returned a fatal error after consuming OS/worker
+    /// witnesses. Re-reading cached child status must not erase that failure.
+    pub(super) shutdown_failed: bool,
     #[cfg(test)]
     pub(super) shutdown_sent: Option<mpsc::SyncSender<()>>,
     /// Scoped native test proof: denial lock must remain held until S is
@@ -150,6 +153,7 @@ impl GuardedPrimary {
             updates_rx,
             worker: Some(worker),
             shutdown_attributed: false,
+            shutdown_failed: false,
             #[cfg(test)]
             shutdown_sent: None,
             #[cfg(test)]
@@ -291,6 +295,27 @@ impl GuardedPrimary {
     /// Returns a typed failure for timeout, unexpected guardian exit, current
     /// group cleanup failure, or generation worker failure.
     pub fn shutdown(&mut self) -> Result<ExitStatus, RuntimeError> {
+        if self.shutdown_failed {
+            return Err(lifecycle_error(
+                "macOS guardian generation shutdown",
+                io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "an earlier Guardian shutdown failed; terminal failure cannot be retried as success",
+                ),
+            ));
+        }
+        let result = self.shutdown_once();
+        if result.is_err() {
+            // Cleanup consumed the worker and group witnesses; a later call
+            // cannot turn the original failed shutdown into fresh success.
+            self.shutdown_failed = true;
+        }
+        result
+    }
+
+    /// Performs exactly one owned OS/worker teardown transaction; the public
+    /// wrapper retains a failed terminal outcome across later calls.
+    fn shutdown_once(&mut self) -> Result<ExitStatus, RuntimeError> {
         let mut failures = Vec::new();
         if let Err(error) = self.prepare_orderly_shutdown() {
             failures.push(error);
