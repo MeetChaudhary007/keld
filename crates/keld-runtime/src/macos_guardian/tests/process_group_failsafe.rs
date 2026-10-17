@@ -1,5 +1,6 @@
 // Group-leader disappearance does not establish group disappearance. An
 // unrelated process in the same private group can outlive the original leader.
+use std::io::Write as _;
 use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
 use std::process::{Child, Command, Stdio};
 use std::thread;
@@ -13,6 +14,10 @@ use super::super::process_group::{
     finish_group_termination, install_test_ambiguous_probe_receipt, observe_group_identity,
     terminate_attested_group, terminate_registered_group, validate_guardian_child_group,
 };
+
+mod cleanup_authority;
+mod native_descendant;
+use self::native_descendant::spawn_held_native_descendant;
 
 // Test-owned direct Child identity ensures a failing negative oracle never
 // leaves an unrelated native process alive after panic/unwind.
@@ -53,15 +58,22 @@ fn foreign_group_is_not_a_guardian_owned_direct_child() {
 
 #[test]
 fn reaped_leader_does_not_mask_live_process_group_when_signal_is_denied() {
-    let mut command = Command::new("/bin/sh");
-    command
-        .args(["-c", "sleep 25 >/dev/null 2>&1 & exit 0"])
-        .process_group(0)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    let mut leader = command.spawn().expect("private process group leader");
-    let group_pid = leader.id();
+    let (mut rescue, group_pid, _descendant) = spawn_held_native_descendant();
+    let birth = rescue
+        .original_birth
+        .expect("original leader birth is retained");
+    let leader = &mut rescue
+        .leader
+        .as_mut()
+        .expect("owned original group leader")
+        .0;
+    leader
+        .stdin
+        .as_mut()
+        .expect("held shell exit gate")
+        .write_all(b"E\n")
+        .expect("release original shell");
+    leader.stdin.take();
     let raw_group = i32::try_from(group_pid).expect("group ID fits signed PID");
     assert!(leader.wait().expect("reap shell group leader").success());
 
@@ -69,8 +81,9 @@ fn reaped_leader_does_not_mask_live_process_group_when_signal_is_denied() {
     let leader_gone = nix::unistd::getpgid(Some(Pid::from_raw(raw_group)));
     let group_probe = kill(Pid::from_raw(-raw_group), None);
     let outcome = finish_group_termination(Err(Errno::EPERM), || group_probe);
-    // Clean the isolated process group even if an assertion below fails.
-    let cleanup = terminate_registered_group(group_pid);
+    // Retain original birth for rescue after the leader has been reaped.
+    // The surrounding owner runs it on any earlier panic/unwind as well.
+    let cleanup = terminate_attested_group(birth);
     assert_eq!(leader_gone, Err(Errno::ESRCH));
     assert_eq!(group_probe, Ok(()), "descendant still owns group");
     assert!(
@@ -124,57 +137,28 @@ fn stale_group_birth_cannot_signal_a_live_unrelated_native_group() {
     assert_eq!(status.signal(), Some(9));
 }
 
-struct TestOwnedDescendantGroup {
-    group: Pid,
-    member: Pid,
-}
-
-impl Drop for TestOwnedDescendantGroup {
-    fn drop(&mut self) {
-        // Only rescue the group while the birth-witnessed fixture descendant
-        // remains inside it; never blindly target an old numeric PGID.
-        if self.group != nix::unistd::getpgrp()
-            && nix::unistd::getpgid(Some(self.member)) == Ok(self.group)
-        {
-            let _ = nix::sys::signal::killpg(self.group, nix::sys::signal::Signal::SIGKILL);
-        }
-    }
-}
-
 #[test]
 fn reaped_registered_group_leader_does_not_strand_live_descendant() {
-    use std::io::Read as _;
-    let mut command = Command::new("/bin/sh");
-    command
-        .args(["-c", "sleep 30 >/dev/null 2>&1 & echo $!; exit 0"])
-        .process_group(0)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-    let mut leader = command
-        .spawn()
-        .expect("native group with surviving descendant");
-    let group = leader.id();
-    let birth = observe_group_identity(group).expect("original leader birth");
-    let mut output = String::new();
-    leader
-        .stdout
-        .take()
-        .expect("owned child pid observer")
-        .read_to_string(&mut output)
-        .expect("read exact child pid");
-    let child_pid: i32 = output.trim().parse().expect("native descendant pid");
-    let child = Pid::from_raw(child_pid);
+    let (mut rescue, group, child) = spawn_held_native_descendant();
+    let birth = rescue
+        .original_birth
+        .expect("original native group birth retained");
     let group_pid = Pid::from_raw(i32::try_from(group).expect("valid PGID"));
-    let _rescue = TestOwnedDescendantGroup {
-        group: group_pid,
-        member: child,
-    };
     assert_eq!(
         nix::unistd::getpgid(Some(child)),
         Ok(group_pid),
         "known live descendant is in original group"
     );
+    // Now intentionally let the original leader exit and be reaped. Its
+    // descendant stays in the enrolled group to exercise the actual fallback.
+    let leader = &mut rescue.leader.as_mut().expect("owned native group leader").0;
+    leader
+        .stdin
+        .as_mut()
+        .expect("held exit gate")
+        .write_all(b"E\n")
+        .expect("release original shell leader");
+    leader.stdin.take();
     assert!(leader.wait().expect("reap departed group leader").success());
     assert_eq!(
         nix::unistd::getpgid(Some(group_pid)),
@@ -194,7 +178,7 @@ fn reaped_registered_group_leader_does_not_strand_live_descendant() {
         );
         std::thread::yield_now();
     }
-    // The product disappearance was proven before _rescue Drop.
+    // Product disappearance was proven before attested rescue and Child Drop.
 }
 
 #[test]

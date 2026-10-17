@@ -8,11 +8,25 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use nix::errno::Errno;
-use nix::sys::signal::{Signal, kill};
+use nix::sys::signal::kill;
 use nix::unistd::{Pid, getpgid};
 
-use super::super::{GUARDIAN_SHUTDOWN_DEADLINE, GuardianBootstrap, run};
+use super::super::process_group::{
+    GroupIdentity, observe_group_identity, terminate_attested_group,
+};
+use super::super::{GUARDIAN_SHUTDOWN_DEADLINE, GuardianBootstrap, RuntimeError, run};
 use super::test_support::{await_spawned_gate, kernel_process_image, verified_real_bun};
+
+mod cleanup_authority;
+
+fn stop_guardian_at_pre_registration_gate(
+    original_birth: GroupIdentity,
+) -> Result<(), RuntimeError> {
+    // The original private Guardian was launched in its own process group.
+    // A saved numeric PID from a delayed observer cannot signal a recycled
+    // outsider after concurrent host-side registration rejection/reap.
+    terminate_attested_group(original_birth)
+}
 
 const ROLE_ENV: &str = "KELD_TEST_GENERIC_PRE_REGISTER_ROLE";
 const MARKER_ENV: &str = "KELD_TEST_GENERIC_PRE_REGISTER_MARKER";
@@ -74,6 +88,8 @@ fn real_generic_guardian_sigkill_before_kgr1_registration_denies_bun_exec() {
     let guardian_pid = bootstrap
         .guardian_pid()
         .expect("host retains true Guardian child");
+    let guardian_birth =
+        observe_group_identity(guardian_pid).expect("pin original isolated native Guardian birth");
     // This is a test-only external observer; ownership and final wait remain
     // with the production GuardianBootstrap::register_until call below.
     let observer = thread::spawn(move || {
@@ -106,11 +122,13 @@ fn real_generic_guardian_sigkill_before_kgr1_registration_denies_bun_exec() {
             thread::yield_now();
         }
         let killed_at = Instant::now();
-        kill(
-            Pid::from_raw(i32::try_from(guardian_pid).expect("Guardian pid fits")),
-            Signal::SIGKILL,
-        )
-        .expect("SIGKILL actual Guardian, not host");
+        assert_eq!(
+            observe_group_identity(guardian_pid).expect("original Guardian must still be live"),
+            guardian_birth,
+            "the original Guardian must retain its birth at the true crash cut"
+        );
+        stop_guardian_at_pre_registration_gate(guardian_birth)
+            .expect("SIGKILL attested original Guardian group, not host or a recycled outsider");
         // Guardian's pre-exec permit writer must be parent-only. Otherwise the
         // child would wait for its independent five-second polling timeout.
         let deadline = Instant::now() + Duration::from_secs(3);
