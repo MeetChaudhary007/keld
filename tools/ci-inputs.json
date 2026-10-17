@@ -374,7 +374,7 @@
         "packages/*",
         "justfile"
       ],
-      "sha256": "8cc413ffa72563b6289ed115e265aaeb320061ae60e342985014cb915661ab42"
+      "sha256": "bf1118c9ac0c5c484f84f00dc52f5b2d5119769f8d03bf6eea8a99118f68034f"
     },
     "policy-readers": {
       "patterns": [
@@ -384,14 +384,14 @@
         ".githooks/*",
         "rust-toolchain.toml"
       ],
-      "sha256": "bbaa210cddcea5162a985fd536c6023ab4170410746211d5f7096e700eb7311c"
+      "sha256": "89f0a7723603162c554b00f8ea1ee0f5334c33811c7e093c7c300b6a38439d5d"
     },
     "audit-readers": {
       "patterns": [
         "docs/audits/*.py",
         "justfile"
       ],
-      "sha256": "7f00c1aeb098cb5176c83fc3ae4c2070d2ac32f8059bdee632cb71c4d76b631e"
+      "sha256": "0e0fe217f8ff4dc2a44e8b8b3fec79cbbe2a05bb2bec4c2fb3a1a5d4ac93e355"
     },
     "rustdoc-readers": {
       "patterns": [
@@ -401,13 +401,13 @@
         "rust-toolchain.toml",
         ".cargo/*"
       ],
-      "sha256": "891848f43776a8f65cb05ec9da4d86114c3ae069c66ce2e48b57467b1bb052d6"
+      "sha256": "78e88bd49db6484dd4d2a2282ae4c9e722c122536a78a46d37a64c25c37a8b6d"
     },
     "dependency-command": {
       "patterns": [
         "justfile"
       ],
-      "sha256": "05684d6c898c75bf3c8e9898fcfad33e50b17a5b70a3335d8cbb8c0d5d9b679b"
+      "sha256": "eb6ae36f15ce6b1808aaf7e0f561a518cbf94da91470b4e76b240476b4d6cde8"
     },
     "status-test-readers": {
       "patterns": [
@@ -417,7 +417,7 @@
         "rust-toolchain.toml",
         "justfile"
       ],
-      "sha256": "d5607a76d73ac869abff10834482799d8707275d6e852992b3a4432e53cd9b54"
+      "sha256": "930f1c4ec39503cacf5c114be233145abcc53bd0e99ad4f380aa5f5b1142e558"
     }
   },
   "live_inputs": {
