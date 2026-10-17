@@ -2125,6 +2125,30 @@ fn dispatch_app_navigation_completion(
     }
 }
 
+// The shipping Tao adapter is also exercised by a real native EventLoop test.
+// A missing send_event must fail the test, even when the state reduction works.
+fn dispatch_app_navigation_completion_with_proxy(
+    completion: windows::core::Result<bool>,
+    web_error: Option<String>,
+    events: &Sender<AppWindowEvent>,
+    ready: &AtomicBool,
+    failed: &AtomicBool,
+    diagnostic: &Mutex<FirstNavigationDiagnostic>,
+    wake: &EventLoopProxy<WindowsLoopEvent>,
+) {
+    dispatch_app_navigation_completion(
+        completion,
+        web_error,
+        events,
+        ready,
+        failed,
+        diagnostic,
+        |event| {
+            let _ = wake.send_event(event);
+        },
+    );
+}
+
 fn install_app_navigation_handler(
     webview: &ICoreWebView2,
     events: Sender<AppWindowEvent>,
@@ -2155,16 +2179,14 @@ fn install_app_navigation_handler(
         } else {
             (Err(windows::core::Error::from(E_POINTER)), None)
         };
-        dispatch_app_navigation_completion(
+        dispatch_app_navigation_completion_with_proxy(
             completion,
             web_error,
             &events,
             &ready,
             &failed,
             &diagnostic,
-            |event| {
-                let _ = wake.send_event(event);
-            },
+            &wake,
         );
         Ok(())
     }));
@@ -4339,6 +4361,73 @@ mod tests {
             }
             other => panic!("callback failure must produce typed Navigate: {other:?}"),
         }
+    }
+
+    #[test]
+    fn real_tao_navigation_failure_adapter_posts_a_wake() {
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::mpsc::{self, TryRecvError};
+        use std::time::{Duration, Instant};
+        use tao::event::Event;
+        use tao::event_loop::{ControlFlow, EventLoopBuilder};
+        use tao::platform::run_return::EventLoopExtRunReturn;
+        use tao::platform::windows::EventLoopBuilderExtWindows;
+
+        // A test-owned Windows event loop exercises the real EventLoopProxy,
+        // without creating a WebView2 controller or moving COM off its STA.
+        let mut builder = EventLoopBuilder::<super::WindowsLoopEvent>::with_user_event();
+        builder.with_any_thread(true);
+        builder.with_dpi_aware(false);
+        let mut loop_ = builder.build();
+        let proxy = loop_.create_proxy();
+        let (events_tx, events_rx) = mpsc::channel();
+        let ready = AtomicBool::new(false);
+        let failed = AtomicBool::new(false);
+        let diagnostic = Mutex::new(super::FirstNavigationDiagnostic::new());
+
+        super::dispatch_app_navigation_completion_with_proxy(
+            Err(windows::core::Error::from(
+                windows::Win32::Foundation::E_POINTER,
+            )),
+            None,
+            &events_tx,
+            &ready,
+            &failed,
+            &diagnostic,
+            &proxy,
+        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut woke = false;
+        loop_.run_return(|event, _, flow| {
+            if matches!(
+                event,
+                Event::UserEvent(super::WindowsLoopEvent::ProfileReleaseWake)
+            ) {
+                woke = true;
+                *flow = ControlFlow::Exit;
+            } else if Instant::now() >= deadline {
+                *flow = ControlFlow::Exit;
+            } else {
+                *flow = ControlFlow::WaitUntil(deadline);
+            }
+        });
+        assert!(
+            woke,
+            "production adapter must deliver real Tao wake before 2s"
+        );
+        assert!(failed.load(Ordering::Acquire));
+        assert!(!ready.load(Ordering::Acquire));
+        assert!(matches!(events_rx.try_recv(), Err(TryRecvError::Empty)));
+        let result = super::finish_app_run_with_diagnostic(
+            &diagnostic,
+            failed.load(Ordering::Acquire),
+            false,
+            false,
+            0,
+        );
+        assert!(matches!(result, Err(WvError::Navigate(message)) if
+            message.contains("is_success_hresult=0x80004003")));
     }
 
     #[test]
