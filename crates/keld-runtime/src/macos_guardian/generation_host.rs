@@ -1,4 +1,5 @@
 //! One owner for host-side primary generation control and recovery transitions.
+use super::generation_wire::initial_generation_record_timeout;
 use super::process_group::validate_guardian_child_group;
 use super::{
     BoundRoleGeneration, CONTROL_CLEAR, CONTROL_CLEARED, CONTROL_PREPARE, CONTROL_PREPARED,
@@ -94,7 +95,10 @@ pub(super) fn run_generation_host(
         if first_record_pending && Instant::now() >= admission.first_record_deadline {
             return Err(initial_generation_record_timeout());
         }
-        let record = match control_reader.poll(&mut control) {
+        let record = match control_reader.poll_until(
+            &mut control,
+            first_record_pending.then_some(admission.first_record_deadline),
+        ) {
             Ok(record) => record,
             Err(error) if runtime_io_kind(&error) == Some(io::ErrorKind::UnexpectedEof) => {
                 let result = finish_generation_control_eof(
@@ -336,16 +340,6 @@ pub(super) fn run_generation_host(
             return Err(error);
         }
     }
-}
-
-fn initial_generation_record_timeout() -> RuntimeError {
-    lifecycle_error(
-        "macOS guardian initial generation registration deadline",
-        io::Error::new(
-            io::ErrorKind::TimedOut,
-            "authenticated Guardian supplied no complete first KGC1 record before its original deadline",
-        ),
-    )
 }
 
 fn rejected_recovery() -> RuntimeError {

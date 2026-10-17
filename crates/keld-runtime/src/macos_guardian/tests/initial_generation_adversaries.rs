@@ -27,14 +27,38 @@ fn zero_first_kgc1_guardian_role() {
     let (endpoint, token) = parse_app_link(&link).expect("private authenticated KGC1 link");
     let mut control = UnixStream::connect(endpoint).expect("connect genuine KGC1 endpoint");
     handshake_client(&mut control, &token).expect("authenticate exact Guardian peer");
+    // Publish the independent role-selection witness before any deliberately
+    // slow writes. The parent must not infer a selected test from libtest's
+    // exit status alone.
+    std::fs::write(&receipt, kind.as_bytes()).expect("publish exact role selection");
     match kind.as_str() {
         "zero" => {}
         "partial" => control
             .write_all(b"KGC1")
             .expect("send partial private record"),
+        "drip" => {
+            // A byte every 10ms is faster than the 20ms socket read timeout,
+            // so the old reader stayed *inside* one poll call until its
+            // independent five-second frame deadline rather than honoring
+            // the original two-second authenticated bootstrap deadline.
+            for _ in 0..400 {
+                match control.write_all(b"K") {
+                    Ok(()) => {}
+                    Err(source)
+                        if matches!(
+                            source.kind(),
+                            io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset
+                        ) =>
+                    {
+                        break;
+                    }
+                    Err(source) => panic!("send KGC1 adversarial byte: {source}"),
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
         other => panic!("unknown first-record adversary {other}"),
     }
-    std::fs::write(receipt, kind.as_bytes()).expect("publish exact role selection");
     // Hold control open without another byte while the host's existing
     // initial-authentication deadline expires. EOF must not be fabricated by
     // the test to turn the zero-byte case into a different failure.
@@ -109,4 +133,9 @@ fn authenticated_zero_byte_first_kgc1_cannot_hold_host_generation_worker() {
 #[test]
 fn authenticated_partial_first_kgc1_cannot_extend_original_deadline() {
     native_initial_record_denial("partial");
+}
+
+#[test]
+fn authenticated_byte_drip_first_kgc1_cannot_extend_original_deadline() {
+    native_initial_record_denial("drip");
 }
