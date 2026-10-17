@@ -191,13 +191,9 @@ impl GenerationControlReader {
                         self.started = Some(Instant::now());
                     }
                     self.filled += read;
-                    if self.filled == GENERATION_CONTROL_RECORD_LEN {
-                        self.filled = 0;
-                        self.started = None;
-                        let record = decode_generation_control(&self.bytes)?;
-                        self.bytes.fill(0);
-                        return Ok(Some(record));
-                    }
+                    // The final read must obey the same per-record deadline
+                    // as every partial read. Completing the frame does not
+                    // erase the retained start time or authorize a late ACK.
                     if self
                         .started
                         .is_some_and(|started| started.elapsed() >= GUARDIAN_SHUTDOWN_DEADLINE)
@@ -209,6 +205,13 @@ impl GenerationControlReader {
                                 "generation-control record exceeded its read deadline",
                             ),
                         ));
+                    }
+                    if self.filled == GENERATION_CONTROL_RECORD_LEN {
+                        self.filled = 0;
+                        self.started = None;
+                        let record = decode_generation_control(&self.bytes)?;
+                        self.bytes.fill(0);
+                        return Ok(Some(record));
                     }
                 }
                 Err(source) if source.kind() == io::ErrorKind::Interrupted => {}

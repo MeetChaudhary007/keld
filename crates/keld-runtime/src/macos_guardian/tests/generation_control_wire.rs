@@ -76,6 +76,37 @@ fn generation_control_partial_record_has_one_overall_deadline() {
 }
 
 #[test]
+fn subsequent_kgc1_record_cannot_complete_on_an_expired_final_byte() {
+    // A previously started, incomplete KGC1 record has a single shared
+    // deadline even if the final byte happens to be ready immediately.
+    let record = GenerationControlRecord::new(CONTROL_REVOKE, 11);
+    let mut bytes = Vec::new();
+    write_generation_control(&mut bytes, &record).expect("exact full control record");
+    let mut prefix = SplitControlReader {
+        bytes: bytes[..GENERATION_CONTROL_RECORD_LEN - 1].to_vec(),
+        offset: 0,
+        block_next: false,
+    };
+    let mut decoder = GenerationControlReader::new();
+    while prefix.offset < prefix.bytes.len() {
+        assert!(
+            decoder
+                .poll(&mut prefix)
+                .expect("incomplete native-sized KGC1 record")
+                .is_none(),
+            "partial KGC1 must not publish any transition"
+        );
+    }
+    assert_eq!(decoder.filled, GENERATION_CONTROL_RECORD_LEN - 1);
+    decoder.started = Instant::now().checked_sub(GUARDIAN_SHUTDOWN_DEADLINE);
+    let mut final_byte = &bytes[GENERATION_CONTROL_RECORD_LEN - 1..];
+    let refusal = decoder
+        .poll(&mut final_byte)
+        .expect_err("expired final KGC1 byte must not authorize a transition");
+    assert!(refusal.to_string().contains("read deadline"), "{refusal}");
+}
+
+#[test]
 fn first_kgc1_deadline_stops_continuous_successful_one_byte_reads() {
     // Unlike a scheduler-driven socket drip, this reader never yields
     // WouldBlock. Without an absolute deadline inside the reader's loop, it
