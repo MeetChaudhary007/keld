@@ -2099,6 +2099,32 @@ use guarded_navigation::canonical_webview_identity;
 use guarded_navigation::webview2_permission_state;
 use guarded_navigation::{install_guarded_media_permissions, navigate_initial};
 
+// Called from the COM callback on its owning STA. The injectable event sink
+// makes the exact failure dispatch independently testable without moving COM.
+fn dispatch_app_navigation_completion(
+    completion: windows::core::Result<bool>,
+    web_error: Option<String>,
+    events: &Sender<AppWindowEvent>,
+    ready: &AtomicBool,
+    failed: &AtomicBool,
+    diagnostic: &Mutex<FirstNavigationDiagnostic>,
+    wake: impl FnOnce(WindowsLoopEvent),
+) {
+    let first_success = diagnostic
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .completed(completion, web_error, ready, failed);
+    if first_success {
+        let _ = events.send(AppWindowEvent::NavigationReady);
+    } else if failed.load(Ordering::Acquire)
+        && initial_navigation_failure_is_fatal(ready.load(Ordering::Acquire))
+    {
+        // Shipping callback posts this event through tao EventLoopProxy.
+        // No COM interface escapes the creating STA.
+        wake(WindowsLoopEvent::ProfileReleaseWake);
+    }
+}
+
 fn install_app_navigation_handler(
     webview: &ICoreWebView2,
     events: Sender<AppWindowEvent>,
@@ -2129,19 +2155,17 @@ fn install_app_navigation_handler(
         } else {
             (Err(windows::core::Error::from(E_POINTER)), None)
         };
-        let first_success = diagnostic
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .completed(completion, web_error, &ready, &failed);
-        if first_success {
-            let _ = events.send(AppWindowEvent::NavigationReady);
-        } else if failed.load(Ordering::Acquire)
-            && initial_navigation_failure_is_fatal(ready.load(Ordering::Acquire))
-        {
-            // Wake the loop immediately to return the existing typed Navigate
-            // failure. The event itself grants no authority or navigation.
-            let _ = wake.send_event(WindowsLoopEvent::ProfileReleaseWake);
-        }
+        dispatch_app_navigation_completion(
+            completion,
+            web_error,
+            &events,
+            &ready,
+            &failed,
+            &diagnostic,
+            |event| {
+                let _ = wake.send_event(event);
+            },
+        );
         Ok(())
     }));
     let mut token = 0_i64;
@@ -3198,16 +3222,26 @@ fn finish_app_run_flags(
     fatal: &AtomicBool,
     code: i32,
 ) -> Result<(), WvError> {
-    let result = finish_app_run(
+    finish_app_run_with_diagnostic(
+        &engine.navigation_diagnostic,
         engine.navigation_failed.load(Ordering::Acquire),
         navigation_timed_out.load(Ordering::Acquire),
         fatal.load(Ordering::Acquire),
         code,
-    );
+    )
+}
+
+fn finish_app_run_with_diagnostic(
+    diagnostic: &Mutex<FirstNavigationDiagnostic>,
+    navigation_failed: bool,
+    navigation_timed_out: bool,
+    fatal: bool,
+    code: i32,
+) -> Result<(), WvError> {
+    let result = finish_app_run(navigation_failed, navigation_timed_out, fatal, code);
     match result {
         Err(WvError::Navigate(message)) => {
-            let evidence = engine
-                .navigation_diagnostic
+            let evidence = diagnostic
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .snapshot();
@@ -4241,6 +4275,118 @@ mod tests {
     fn only_initial_navigation_failure_is_startup_fatal() {
         assert!(initial_navigation_failure_is_fatal(false));
         assert!(!initial_navigation_failure_is_fatal(true));
+    }
+
+    #[test]
+    fn com_callback_error_wakes_ui_loop_and_finishes_with_typed_navigation_failure() {
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::mpsc::{self, TryRecvError};
+
+        let (events_tx, events_rx) = mpsc::channel();
+        let (wake_tx, wake_rx) = mpsc::channel();
+        let ready = AtomicBool::new(false);
+        let failed = AtomicBool::new(false);
+        let diagnostic = Mutex::new(super::FirstNavigationDiagnostic::new());
+        super::dispatch_app_navigation_completion(
+            Err(windows::core::Error::from(
+                windows::Win32::Foundation::E_POINTER,
+            )),
+            None,
+            &events_tx,
+            &ready,
+            &failed,
+            &diagnostic,
+            |event| {
+                let _ = wake_tx.send(event);
+            },
+        );
+
+        assert!(
+            failed.load(Ordering::Acquire),
+            "callback must fail startup immediately"
+        );
+        assert!(!ready.load(Ordering::Acquire));
+        assert!(matches!(events_rx.try_recv(), Err(TryRecvError::Empty)));
+        assert!(
+            matches!(
+                wake_rx.try_recv(),
+                Ok(super::WindowsLoopEvent::ProfileReleaseWake)
+            ),
+            "callback must request a tao event-loop wake for a failed COM result"
+        );
+        let result = super::finish_app_run_with_diagnostic(
+            &diagnostic,
+            failed.load(Ordering::Acquire),
+            false,
+            false,
+            0,
+        );
+        match result {
+            Err(WvError::Navigate(message)) => {
+                assert!(
+                    message.contains("initial renderer navigation failed"),
+                    "{message}"
+                );
+                assert!(
+                    message.contains("navigation-completed-com-error"),
+                    "{message}"
+                );
+                assert!(
+                    message.contains("is_success_hresult=0x80004003"),
+                    "{message}"
+                );
+            }
+            other => panic!("callback failure must produce typed Navigate: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn completed_navigation_and_late_com_error_do_not_wake_or_fail_startup() {
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::mpsc::{self, TryRecvError};
+
+        let (events_tx, events_rx) = mpsc::channel();
+        let (wake_tx, wake_rx) = mpsc::channel();
+        let ready = AtomicBool::new(false);
+        let failed = AtomicBool::new(false);
+        let diagnostic = Mutex::new(super::FirstNavigationDiagnostic::new());
+        super::dispatch_app_navigation_completion(
+            Ok(true),
+            None,
+            &events_tx,
+            &ready,
+            &failed,
+            &diagnostic,
+            |event| {
+                let _ = wake_tx.send(event);
+            },
+        );
+        assert!(matches!(
+            events_rx.try_recv(),
+            Ok(super::AppWindowEvent::NavigationReady)
+        ));
+        assert!(matches!(wake_rx.try_recv(), Err(TryRecvError::Empty)));
+
+        super::dispatch_app_navigation_completion(
+            Err(windows::core::Error::from(
+                windows::Win32::Foundation::E_POINTER,
+            )),
+            None,
+            &events_tx,
+            &ready,
+            &failed,
+            &diagnostic,
+            |event| {
+                let _ = wake_tx.send(event);
+            },
+        );
+        assert!(ready.load(Ordering::Acquire));
+        assert!(!failed.load(Ordering::Acquire));
+        assert!(matches!(events_rx.try_recv(), Err(TryRecvError::Empty)));
+        assert!(matches!(wake_rx.try_recv(), Err(TryRecvError::Empty)));
+        assert!(super::finish_app_run_with_diagnostic(&diagnostic, false, false, false, 0).is_ok());
     }
 
     #[test]
