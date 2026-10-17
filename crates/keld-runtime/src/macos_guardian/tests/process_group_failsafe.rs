@@ -2,14 +2,16 @@
 // unrelated process in the same private group can outlive the original leader.
 use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
 use std::process::{Child, Command, Stdio};
+use std::thread;
 
 use nix::errno::Errno;
 use nix::sys::signal::kill;
 use nix::unistd::Pid;
 
+use super::super::GUARDIAN_SHUTDOWN_DEADLINE;
 use super::super::process_group::{
-    finish_group_termination, observe_group_identity, terminate_attested_group,
-    terminate_registered_group, validate_guardian_child_group,
+    finish_group_termination, install_test_ambiguous_probe_receipt, observe_group_identity,
+    terminate_attested_group, terminate_registered_group, validate_guardian_child_group,
 };
 
 // Test-owned direct Child identity ensures a failing negative oracle never
@@ -18,7 +20,11 @@ struct TestOwnedGroupChild(Child);
 
 impl Drop for TestOwnedGroupChild {
     fn drop(&mut self) {
-        let _ = self.0.kill();
+        // A test may have reaped its owned Child already. Never issue a late
+        // numeric-PID kill after wait() could have released that identity.
+        if matches!(self.0.try_wait(), Ok(None)) {
+            let _ = self.0.kill();
+        }
         let _ = self.0.wait();
     }
 }
@@ -189,4 +195,138 @@ fn reaped_registered_group_leader_does_not_strand_live_descendant() {
         std::thread::yield_now();
     }
     // The product disappearance was proven before _rescue Drop.
+}
+
+#[test]
+fn reaped_leader_with_temporarily_unreaped_dead_member_clears_without_false_host_fault() {
+    let mut leader = TestOwnedGroupChild(
+        Command::new("/bin/sleep")
+            .arg("30")
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("test-owned original group leader"),
+    );
+    let group = leader.0.id();
+    let original = observe_group_identity(group).expect("original kernel group birth");
+    let group_raw = i32::try_from(group).expect("group fits positive PID");
+    let mut member = TestOwnedGroupChild(
+        Command::new("/bin/sleep")
+            .arg("30")
+            .process_group(group_raw)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("another test-owned member of the exact group"),
+    );
+    assert_eq!(
+        nix::unistd::getpgid(Some(Pid::from_raw(
+            i32::try_from(member.0.id()).expect("member PID")
+        ))),
+        Ok(Pid::from_raw(group_raw)),
+        "the un-reaped member belongs to the enrolled group"
+    );
+    terminate_registered_group(group).expect("signal only the test-owned group");
+    assert_eq!(
+        leader.0.wait().expect("reap original leader").signal(),
+        Some(9)
+    );
+    assert_eq!(
+        nix::unistd::getpgid(Some(Pid::from_raw(group_raw))),
+        Err(Errno::ESRCH),
+        "original leader birth is gone before host CLEAR"
+    );
+    assert_eq!(
+        kill(Pid::from_raw(-group_raw), None),
+        Err(Errno::EPERM),
+        "Darwin must report a temporarily zombie-only group as ambiguous"
+    );
+    // A separate actual OS Child owner holds the killed group member until
+    // the *shipping* fallback has observed its own first ESRCH + EPERM pair.
+    // This exact receipt, rather than a sleep or scheduler hope, prevents a
+    // mutant without the retry from accidentally passing after an early reap.
+    let (observed_tx, observed_rx) = std::sync::mpsc::channel();
+    let _probe_receipt = install_test_ambiguous_probe_receipt(group, observed_tx);
+    let reaper = thread::spawn(move || {
+        observed_rx
+            .recv_timeout(GUARDIAN_SHUTDOWN_DEADLINE)
+            .expect("host observed real ambiguous zombie-only group before reap");
+        member.0.wait().expect("reap held killed group member")
+    });
+    let result = terminate_attested_group(original);
+    assert_eq!(
+        reaper.join().expect("group-member reaper joins").signal(),
+        Some(9)
+    );
+    result.expect("originally enrolled group becomes provably absent after OS reap");
+    assert_eq!(kill(Pid::from_raw(-group_raw), None), Err(Errno::ESRCH));
+}
+
+#[test]
+fn reaped_leader_with_persistently_unreaped_member_must_not_claim_clear() {
+    let mut leader = TestOwnedGroupChild(
+        Command::new("/bin/sleep")
+            .arg("30")
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("test-owned originally enrolled group leader"),
+    );
+    let group = leader.0.id();
+    let original = observe_group_identity(group).expect("original group kernel birth");
+    let raw = i32::try_from(group).expect("positive native group PID");
+    let mut member = TestOwnedGroupChild(
+        Command::new("/bin/sleep")
+            .arg("30")
+            .process_group(raw)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("test-owned second member"),
+    );
+    assert_eq!(
+        nix::unistd::getpgid(Some(Pid::from_raw(
+            i32::try_from(member.0.id()).expect("native member PID")
+        ))),
+        Ok(Pid::from_raw(raw))
+    );
+    terminate_registered_group(group).expect("signal original real group");
+    assert_eq!(
+        leader.0.wait().expect("reap original leader").signal(),
+        Some(9)
+    );
+    assert_eq!(
+        nix::unistd::getpgid(Some(Pid::from_raw(raw))),
+        Err(Errno::ESRCH)
+    );
+    assert_eq!(kill(Pid::from_raw(-raw), None), Err(Errno::EPERM));
+
+    let error = terminate_attested_group(original)
+        .expect_err("unreaped zombie-only group is not a proven-empty native group");
+    assert!(
+        error
+            .to_string()
+            .contains("registered group identity unavailable"),
+        "permanent ambiguous group must remain a fatal owner-state fault: {error}"
+    );
+    assert_eq!(
+        kill(Pid::from_raw(-raw), None),
+        Err(Errno::EPERM),
+        "the host did not signal or forget an unproven group"
+    );
+    assert_eq!(
+        member
+            .0
+            .wait()
+            .expect("reap final native group member")
+            .signal(),
+        Some(9)
+    );
+    assert_eq!(kill(Pid::from_raw(-raw), None), Err(Errno::ESRCH));
 }

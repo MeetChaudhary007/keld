@@ -3,6 +3,8 @@ use std::io;
 use std::process::{Child, ChildStdin, ExitStatus};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
+#[cfg(test)]
+use std::{cell::RefCell, sync::mpsc};
 
 use nix::errno::Errno;
 use nix::libc;
@@ -10,7 +12,8 @@ use nix::sys::signal::{Signal, kill, killpg};
 use nix::unistd::{Pid, getpgid};
 
 use super::{
-    GUARDIAN_SHUTDOWN_DEADLINE, RuntimeError, collapse_failures, lifecycle_error, nix_io_error,
+    GENERATION_CONTROL_POLL, GUARDIAN_SHUTDOWN_DEADLINE, RuntimeError, collapse_failures,
+    lifecycle_error, nix_io_error,
 };
 
 /// Kernel birth identity of the exact enrolled process-group leader.
@@ -58,6 +61,53 @@ impl LocalGroupWitness {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(identity);
     }
+}
+
+// Exact native negative-control receipt. It is local to the calling test
+// thread and fires only AFTER the real kernel reports missing leader + EPERM,
+// so the external test-owned zombie cannot be reaped before the first probe.
+#[cfg(test)]
+thread_local! {
+    static AMBIGUOUS_GROUP_PROBE_RECEIPT: RefCell<Option<(u32, mpsc::Sender<()>)>> = const { RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(super) struct TestAmbiguousProbeReceipt;
+
+#[cfg(test)]
+impl Drop for TestAmbiguousProbeReceipt {
+    fn drop(&mut self) {
+        AMBIGUOUS_GROUP_PROBE_RECEIPT.with(|slot| *slot.borrow_mut() = None);
+    }
+}
+
+#[cfg(test)]
+pub(super) fn install_test_ambiguous_probe_receipt(
+    group: u32,
+    sender: mpsc::Sender<()>,
+) -> TestAmbiguousProbeReceipt {
+    AMBIGUOUS_GROUP_PROBE_RECEIPT.with(|slot| {
+        assert!(
+            slot.borrow().is_none(),
+            "only one native probe receipt owner"
+        );
+        *slot.borrow_mut() = Some((group, sender));
+    });
+    TestAmbiguousProbeReceipt
+}
+
+#[cfg(test)]
+fn report_test_ambiguous_probe(group: u32) {
+    AMBIGUOUS_GROUP_PROBE_RECEIPT.with(|slot| {
+        let mut receipt = slot.borrow_mut();
+        if receipt
+            .as_ref()
+            .is_some_and(|(expected, _)| *expected == group)
+            && let Some((_, sender)) = receipt.take()
+        {
+            let _ = sender.send(());
+        }
+    });
 }
 
 #[cfg(test)]
@@ -195,26 +245,55 @@ pub(super) fn terminate_attested_group(group: GroupIdentity) -> Result<(), Runti
         )),
         Err(observation) => {
             let raw = validate_group_pid(group.pid)?;
-            let leader = getpgid(Some(Pid::from_raw(raw)));
-            let group_live = kill(Pid::from_raw(-raw), None);
-            match (leader, group_live) {
-                (_, Err(Errno::ESRCH)) => Ok(()),
-                // A fully reaped leader may leave a real native Bun group
-                // with descendants. Unlike a *live mismatched leader*, this
-                // exact PID is absent; preserve the guardian's existing
-                // group-wide reaping behavior, not an accidental leader-only
-                // cleanup that strands same-group descendants.
-                (Err(Errno::ESRCH), Ok(())) => terminate_registered_group(group.pid),
-                _ => Err(collapse_failures(vec![
-                    observation,
-                    lifecycle_error(
-                        "macOS guardian registered group identity unavailable",
-                        io::Error::new(
-                            io::ErrorKind::PermissionDenied,
-                            "live process-group leader identity is unproven",
-                        ),
-                    ),
-                ])),
+            // Darwin may report EPERM for kill(-PGID, 0) when the enrolled
+            // leader has been reaped but another already-killed group member
+            // is still a zombie awaiting its *own* parent's wait(). A single
+            // such observation does not prove either that a live member is
+            // authorized to signal or that an empty group can be forgotten.
+            // Retain the original fail-closed rule and retry ONLY the safe
+            // absence probe, within a fraction of the existing shutdown
+            // deadline. Never signal on an ambiguous EPERM or an extant PID.
+            let reap_deadline = Instant::now() + GUARDIAN_SHUTDOWN_DEADLINE / 4;
+            let mut saw_ambiguous_group = false;
+            loop {
+                let leader = getpgid(Some(Pid::from_raw(raw)));
+                let group_live = kill(Pid::from_raw(-raw), None);
+                #[cfg(test)]
+                if matches!(
+                    (&leader, &group_live),
+                    (Err(Errno::ESRCH), Err(Errno::EPERM))
+                ) {
+                    report_test_ambiguous_probe(group.pid);
+                }
+                match (leader, group_live) {
+                    (_, Err(Errno::ESRCH)) => break Ok(()),
+                    // A reaped leader can still have a live same-group
+                    // descendant; retain the original group-wide cleanup.
+                    (Err(Errno::ESRCH), Ok(())) if !saw_ambiguous_group => {
+                        break terminate_registered_group(group.pid);
+                    }
+                    (Err(Errno::ESRCH), Err(Errno::EPERM)) if Instant::now() < reap_deadline => {
+                        // EPERM may also denote an inaccessible group. If
+                        // that numeric PGID is later recycled and becomes
+                        // signallable, its new members are NOT ours. After
+                        // one ambiguous observation only ESRCH may succeed;
+                        // never start a new killpg from a delayed probe.
+                        saw_ambiguous_group = true;
+                        std::thread::sleep(GENERATION_CONTROL_POLL);
+                    }
+                    _ => {
+                        break Err(collapse_failures(vec![
+                            observation,
+                            lifecycle_error(
+                                "macOS guardian registered group identity unavailable",
+                                io::Error::new(
+                                    io::ErrorKind::PermissionDenied,
+                                    "live process-group leader identity is unproven",
+                                ),
+                            ),
+                        ]));
+                    }
+                }
             }
         }
     }
