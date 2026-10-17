@@ -5,10 +5,16 @@ use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use super::super::process_group::{GroupIdentity, observe_group_identity};
 use nix::errno::Errno;
 use nix::fcntl::{FcntlArg, FdFlag, fcntl};
 use nix::sys::signal::kill;
 use nix::unistd::{Pid, pipe};
+
+/// Tests construct a real owned native group before installing a host owner.
+pub(super) fn test_group_identity(pid: u32) -> GroupIdentity {
+    observe_group_identity(pid).expect("live native group leader has a kernel birth identity")
+}
 
 pub(super) fn long_running_command() -> Command {
     let mut command = Command::new("/usr/bin/tail");

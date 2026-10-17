@@ -12,6 +12,37 @@ use super::{
     GUARDIAN_SHUTDOWN_DEADLINE, RuntimeError, collapse_failures, lifecycle_error, nix_io_error,
 };
 
+/// Kernel birth identity of the exact enrolled process-group leader.
+///
+/// A PGID is only a number, not a stable kernel handle. Keep the start time
+/// observed *before* acknowledging registration, and recheck it at host-side
+/// fail-safe signaling. If the original leader disappears or the number is
+/// recycled, never authorize a signal from that stale enrollment alone.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct GroupIdentity {
+    pub(super) pid: u32,
+    real_uid: libc::uid_t,
+    started_sec: u64,
+    started_usec: u64,
+}
+
+#[cfg(test)]
+impl GroupIdentity {
+    pub(super) fn altered_birth_for_test(mut self) -> Self {
+        self.started_usec = self.started_usec.wrapping_add(1);
+        self
+    }
+
+    pub(super) const fn unverified_for_test(pid: u32) -> Self {
+        Self {
+            pid,
+            real_uid: 0,
+            started_sec: 0,
+            started_usec: 0,
+        }
+    }
+}
+
 pub(super) fn validate_group_pid(group: u32) -> Result<i32, RuntimeError> {
     if group == 0 {
         return Err(lifecycle_error(
@@ -52,30 +83,50 @@ pub(super) fn validate_group_leader(group: u32) -> Result<i32, RuntimeError> {
 /// returning a retention ACK, verify that the *actual* process-group leader
 /// is the retained Guardian's direct child rather than an unrelated group.
 #[allow(unsafe_code)] // read-only, exact-size macOS PROC_PIDTBSDINFO observation
-pub(super) fn validate_guardian_child_group(
-    group_pid: u32,
-    guardian_pid: u32,
-) -> Result<(), RuntimeError> {
-    let pid = validate_group_leader(group_pid)?;
-    // SAFETY: proc_bsdinfo consists of integer fields and fixed arrays; a
-    // zeroed instance is a valid writable C output buffer. The kernel copies
-    // the process snapshot and retains no pointer after proc_pidinfo returns.
+fn observe_group_leader_bsdinfo(group_pid: u32) -> Result<libc::proc_bsdinfo, RuntimeError> {
+    let pid = validate_group_pid(group_pid)?;
+    // SAFETY: proc_bsdinfo is an integer/fixed-array C output structure.
+    // The kernel writes at most its exact size and retains no pointer.
     let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
     let size = i32::try_from(std::mem::size_of::<libc::proc_bsdinfo>()).map_err(|source| {
         lifecycle_error(
-            "macOS guardian registered child lineage",
+            "macOS guardian registered group identity",
             io::Error::new(io::ErrorKind::InvalidData, source),
         )
     })?;
-    // SAFETY: the initialized buffer is writable for exactly `size` bytes,
-    // and pid is a validated c_int. No pointer is used after this call.
+    // SAFETY: initialized writable exact-size buffer for a checked c_int PID.
     let observed =
         unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 0, (&raw mut info).cast(), size) };
-    if observed != size
-        || info.pbi_pid != group_pid
-        || info.pbi_pgid != group_pid
-        || info.pbi_ppid != guardian_pid
-    {
+    if observed != size || info.pbi_pid != group_pid || info.pbi_pgid != group_pid {
+        return Err(lifecycle_error(
+            "macOS guardian registered group identity",
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "the registered group leader is missing, inaccessible or not its own PGID",
+            ),
+        ));
+    }
+    Ok(info)
+}
+
+pub(super) fn observe_group_identity(group_pid: u32) -> Result<GroupIdentity, RuntimeError> {
+    let info = observe_group_leader_bsdinfo(group_pid)?;
+    Ok(GroupIdentity {
+        pid: group_pid,
+        real_uid: info.pbi_ruid,
+        started_sec: info.pbi_start_tvsec,
+        started_usec: info.pbi_start_tvusec,
+    })
+}
+
+/// A private authenticated KGR1/KGC1 PID cannot substitute another process:
+/// require the exact Guardian's live direct child before retaining authority.
+pub(super) fn validate_guardian_child_group(
+    group_pid: u32,
+    guardian_pid: u32,
+) -> Result<GroupIdentity, RuntimeError> {
+    let info = observe_group_leader_bsdinfo(group_pid)?;
+    if info.pbi_ppid != guardian_pid {
         return Err(lifecycle_error(
             "macOS guardian registered child lineage",
             io::Error::new(
@@ -84,7 +135,55 @@ pub(super) fn validate_guardian_child_group(
             ),
         ));
     }
-    Ok(())
+    Ok(GroupIdentity {
+        pid: group_pid,
+        real_uid: info.pbi_ruid,
+        started_sec: info.pbi_start_tvsec,
+        started_usec: info.pbi_start_tvusec,
+    })
+}
+
+/// Host fallback for an *enrolled kernel birth*, not a caller-provided PGID.
+/// Refuse a live leader whose birth no longer matches. If the original leader
+/// has been reaped but its process group survives through descendants, retain
+/// the existing group cleanup: on Darwin the PID allocator reserves a PGID
+/// while that group has members. This is not a kernel-held group handle, so an
+/// empty/recycled group between inspections remains a documented race.
+pub(super) fn terminate_attested_group(group: GroupIdentity) -> Result<(), RuntimeError> {
+    match observe_group_identity(group.pid) {
+        Ok(current) if current == group => terminate_registered_group(group.pid),
+        Ok(_) => Err(lifecycle_error(
+            "macOS guardian registered group identity changed",
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "process-group leader PID was reused; refusing unowned group signal",
+            ),
+        )),
+        Err(observation) => {
+            let raw = validate_group_pid(group.pid)?;
+            let leader = getpgid(Some(Pid::from_raw(raw)));
+            let group_live = kill(Pid::from_raw(-raw), None);
+            match (leader, group_live) {
+                (_, Err(Errno::ESRCH)) => Ok(()),
+                // A fully reaped leader may leave a real native Bun group
+                // with descendants. Unlike a *live mismatched leader*, this
+                // exact PID is absent; preserve the guardian's existing
+                // group-wide reaping behavior, not an accidental leader-only
+                // cleanup that strands same-group descendants.
+                (Err(Errno::ESRCH), Ok(())) => terminate_registered_group(group.pid),
+                _ => Err(collapse_failures(vec![
+                    observation,
+                    lifecycle_error(
+                        "macOS guardian registered group identity unavailable",
+                        io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            "live process-group leader identity is unproven",
+                        ),
+                    ),
+                ])),
+            }
+        }
+    }
 }
 
 pub(super) fn terminate_registered_group(group: u32) -> Result<(), RuntimeError> {
@@ -170,7 +269,6 @@ pub(super) fn reap_pending_guardian(child: &mut Child) -> Result<ExitStatus, Run
 pub(super) fn reject_host_registration(
     mut child: Child,
     liveness_writer: ChildStdin,
-    group_pid: Option<u32>,
     error: RuntimeError,
 ) -> RuntimeError {
     drop(liveness_writer);
@@ -187,12 +285,7 @@ pub(super) fn reject_host_registration(
         }
         Err(cleanup) => failures.push(cleanup),
     }
-    // A rejected Guardian exiting zero says nothing about the previously
-    // enrolled Bun process group. Always retire it before returning.
-    if let Some(group_pid) = group_pid
-        && let Err(cleanup) = terminate_registered_group(group_pid)
-    {
-        failures.push(cleanup);
-    }
+    // No untrusted numeric PID belongs in this pre-registration cleanup API.
+    // Post-enrollment rejection runs its separate birth-attested group cleanup.
     collapse_failures(failures)
 }

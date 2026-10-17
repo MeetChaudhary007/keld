@@ -63,7 +63,10 @@ fn prepare_retired_owner(fence: Option<GenerationProvisionFence>) -> RetiredOwne
     let state = Arc::clone(&recovery);
     let worker = thread::spawn(move || {
         run_generation_host(
-            std::process::id(),
+            super::super::super::generation_host::GenerationHostAdmission::new(
+                std::process::id(),
+                std::time::Instant::now() + super::GUARDIAN_SHUTDOWN_DEADLINE,
+            ),
             host,
             &updates_tx,
             &current,

@@ -91,7 +91,6 @@ impl GuardianBootstrap {
                     return Err(reject_host_registration(
                         child,
                         liveness_writer,
-                        None,
                         lifecycle_error(
                             "macOS guardian supervised-Quit acknowledgment",
                             io::Error::other("spawned guardian has no acknowledgment reader"),
@@ -103,12 +102,7 @@ impl GuardianBootstrap {
             None
         };
         if let Err(error) = require_close_on_exec(&liveness_writer) {
-            return Err(reject_host_registration(
-                child,
-                liveness_writer,
-                None,
-                error,
-            ));
+            return Err(reject_host_registration(child, liveness_writer, error));
         }
         Ok(Self {
             child: Some(child),
@@ -181,7 +175,7 @@ impl GuardianBootstrap {
                 )
             })?
             .id();
-        validate_guardian_child_group(group_pid, guardian_pid)
+        let group_identity = validate_guardian_child_group(group_pid, guardian_pid)
             .map_err(|error| self.reject_registration(error))?;
 
         let child = self.child.take().ok_or_else(|| {
@@ -200,7 +194,7 @@ impl GuardianBootstrap {
             child,
             liveness_writer,
             self.quit_ack_reader.take(),
-            group_pid,
+            group_identity,
         )?;
         // Only the test build can stop this shipping-path transition after
         // the host has taken custody but before the Guardian can permit exec.
@@ -292,18 +286,12 @@ impl GuardianBootstrap {
             )
         })?;
         if let Err(error) = require_close_on_exec(&liveness_writer) {
-            return Err(reject_host_registration(
-                child,
-                liveness_writer,
-                None,
-                error,
-            ));
+            return Err(reject_host_registration(child, liveness_writer, error));
         }
         let Some(quit_ack_reader) = self.quit_ack_reader.take() else {
             return Err(reject_host_registration(
                 child,
                 liveness_writer,
-                None,
                 lifecycle_error(
                     "macOS guardian generation acknowledgment",
                     io::Error::new(
@@ -318,6 +306,7 @@ impl GuardianBootstrap {
             liveness_writer,
             quit_ack_reader,
             control,
+            deadline,
             #[cfg(test)]
             registration_fence,
         )
@@ -330,7 +319,7 @@ impl GuardianBootstrap {
         let Some(liveness_writer) = self.liveness_writer.take() else {
             return error;
         };
-        reject_host_registration(child, liveness_writer, None, error)
+        reject_host_registration(child, liveness_writer, error)
     }
 }
 

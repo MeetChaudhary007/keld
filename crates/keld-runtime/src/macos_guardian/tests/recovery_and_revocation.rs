@@ -171,6 +171,7 @@ fn attributed_control_eof_keeps_partial_and_registered_failures_fatal() {
             Some(RegisteredPrimaryGeneration {
                 attempt: 2,
                 group_pid: 42,
+                group_identity: None, // inert EOF-state fixture, never signal this numeric PID
             }),
         ),
     ] {

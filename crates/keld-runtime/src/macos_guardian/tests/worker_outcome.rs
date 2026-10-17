@@ -44,6 +44,7 @@ fn premature_successful_generation_worker_exit_reaps_unattributed_group() {
     let current_generation = Arc::new(Mutex::new(Some(RegisteredPrimaryGeneration {
         attempt: 1,
         group_pid,
+        group_identity: Some(super::test_support::test_group_identity(group_pid)),
     })));
     let (_updates_tx, updates_rx) = mpsc::channel();
     let mut primary = GuardedPrimary {
@@ -135,6 +136,7 @@ fn zero_guardian_exit_with_successful_worker_reaps_registered_group() {
     let current_generation = Arc::new(Mutex::new(Some(RegisteredPrimaryGeneration {
         attempt: 1,
         group_pid,
+        group_identity: Some(super::test_support::test_group_identity(group_pid)),
     })));
     let recovery = Arc::new(Mutex::new(RecoveryState::new()));
     lock_recovery(&recovery).shutdown_acknowledged = true;
@@ -214,6 +216,7 @@ fn poll_fatal_inspection_error_reaps_registered_group() {
     let current_generation = Arc::new(Mutex::new(Some(RegisteredPrimaryGeneration {
         attempt: 1,
         group_pid,
+        group_identity: Some(super::test_support::test_group_identity(group_pid)),
     })));
     let (_tx, updates_rx) = mpsc::channel();
     let mut primary = GuardedPrimary {

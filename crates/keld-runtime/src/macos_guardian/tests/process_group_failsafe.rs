@@ -1,15 +1,27 @@
 // Group-leader disappearance does not establish group disappearance. An
 // unrelated process in the same private group can outlive the original leader.
-use std::os::unix::process::CommandExt as _;
-use std::process::{Command, Stdio};
+use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
+use std::process::{Child, Command, Stdio};
 
 use nix::errno::Errno;
 use nix::sys::signal::kill;
 use nix::unistd::Pid;
 
 use super::super::process_group::{
-    finish_group_termination, terminate_registered_group, validate_guardian_child_group,
+    finish_group_termination, observe_group_identity, terminate_attested_group,
+    terminate_registered_group, validate_guardian_child_group,
 };
+
+// Test-owned direct Child identity ensures a failing negative oracle never
+// leaves an unrelated native process alive after panic/unwind.
+struct TestOwnedGroupChild(Child);
+
+impl Drop for TestOwnedGroupChild {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
 
 #[test]
 fn foreign_group_is_not_a_guardian_owned_direct_child() {
@@ -68,4 +80,113 @@ fn denied_group_signal_is_only_ignorable_after_group_absence_proof() {
     assert!(finish_group_termination(Err(Errno::EPERM), || Err(Errno::EPERM)).is_err());
     assert!(finish_group_termination(Err(Errno::EPERM), || Ok(())).is_err());
     assert!(finish_group_termination(Err(Errno::EIO), || Err(Errno::ESRCH)).is_err());
+}
+
+#[test]
+fn stale_group_birth_cannot_signal_a_live_unrelated_native_group() {
+    let mut outsider = TestOwnedGroupChild(
+        Command::new("/bin/sleep")
+            .arg("30")
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("test owns real live group"),
+    );
+    let pid = outsider.0.id();
+    let birth = observe_group_identity(pid).expect("kernel birth of test-owned group");
+    let changed_birth = birth.altered_birth_for_test();
+    let refusal = terminate_attested_group(changed_birth)
+        .expect_err("a mismatched registered birth cannot authorize SIGKILL");
+    let alive = outsider
+        .0
+        .try_wait()
+        .expect("inspect exact live outsider")
+        .is_none();
+    // Product outcome is sampled BEFORE the test's rescue cleanup.
+    terminate_attested_group(birth).expect("terminate actual attested native group");
+    let status = outsider.0.wait().expect("reap exact test-owned outsider");
+    assert!(
+        refusal.to_string().contains("identity changed"),
+        "missing native birth-mismatch denial: {refusal}"
+    );
+    assert!(
+        alive,
+        "forged birth identity killed an unrelated live group"
+    );
+    assert_eq!(status.signal(), Some(9));
+}
+
+struct TestOwnedDescendantGroup {
+    group: Pid,
+    member: Pid,
+}
+
+impl Drop for TestOwnedDescendantGroup {
+    fn drop(&mut self) {
+        // Only rescue the group while the birth-witnessed fixture descendant
+        // remains inside it; never blindly target an old numeric PGID.
+        if self.group != nix::unistd::getpgrp()
+            && nix::unistd::getpgid(Some(self.member)) == Ok(self.group)
+        {
+            let _ = nix::sys::signal::killpg(self.group, nix::sys::signal::Signal::SIGKILL);
+        }
+    }
+}
+
+#[test]
+fn reaped_registered_group_leader_does_not_strand_live_descendant() {
+    use std::io::Read as _;
+    let mut command = Command::new("/bin/sh");
+    command
+        .args(["-c", "sleep 30 >/dev/null 2>&1 & echo $!; exit 0"])
+        .process_group(0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut leader = command
+        .spawn()
+        .expect("native group with surviving descendant");
+    let group = leader.id();
+    let birth = observe_group_identity(group).expect("original leader birth");
+    let mut output = String::new();
+    leader
+        .stdout
+        .take()
+        .expect("owned child pid observer")
+        .read_to_string(&mut output)
+        .expect("read exact child pid");
+    let child_pid: i32 = output.trim().parse().expect("native descendant pid");
+    let child = Pid::from_raw(child_pid);
+    let group_pid = Pid::from_raw(i32::try_from(group).expect("valid PGID"));
+    let _rescue = TestOwnedDescendantGroup {
+        group: group_pid,
+        member: child,
+    };
+    assert_eq!(
+        nix::unistd::getpgid(Some(child)),
+        Ok(group_pid),
+        "known live descendant is in original group"
+    );
+    assert!(leader.wait().expect("reap departed group leader").success());
+    assert_eq!(
+        nix::unistd::getpgid(Some(group_pid)),
+        Err(Errno::ESRCH),
+        "kernel no longer exposes original leader birth"
+    );
+    terminate_attested_group(birth)
+        .expect("original registered group must still reap surviving descendants");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        if kill(child, None) == Err(Errno::ESRCH) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "host fallback stranded original same-group descendant after leader reap"
+        );
+        std::thread::yield_now();
+    }
+    // The product disappearance was proven before _rescue Drop.
 }

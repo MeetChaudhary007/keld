@@ -22,9 +22,11 @@ mod supervised_bootstrap;
 
 mod generic_pre_registration_crash;
 mod guardian_crash_pre_registration;
+mod initial_generation_adversaries;
 mod liveness_and_shutdown;
 mod pre_registration_host_death;
 mod process_group_failsafe;
+mod registration_record_adversaries;
 mod rejected_registration_deadline;
 pub(super) mod retained_ack;
 

@@ -302,7 +302,7 @@ fn rejected_registration_reaps_wedged_guardian_within_shutdown_deadline() {
         io::Error::new(io::ErrorKind::PermissionDenied, "refused registration"),
     );
     let rendered = assert_guardian_cleanup_bounded(guardian_pid, move || {
-        Some(reject_host_registration(child, writer, None, error).to_string())
+        Some(reject_host_registration(child, writer, error).to_string())
     })
     .expect("rejection is retained");
     assert!(rendered.contains("refused registration"), "{rendered}");
@@ -352,7 +352,9 @@ fn rejected_writer_with_clean_guardian_exit_reaps_enrolled_group() {
         .expect("successful guardian stand-in");
     let writer = guardian.stdin.take().expect("sole liveness writer");
     fcntl(&writer, FcntlArg::F_SETFD(FdFlag::empty())).expect("force registered-owner rejection");
-    let error = HostGuardian::from_registered_parts(guardian, writer, None, group_pid)
+    let identity = super::super::process_group::observe_group_identity(group_pid)
+        .expect("test-owned group identity before FD failure");
+    let error = HostGuardian::from_registered_parts(guardian, writer, None, identity)
         .expect_err("inheritable writer must be rejected");
     assert!(
         error.to_string().contains("require FD_CLOEXEC"),

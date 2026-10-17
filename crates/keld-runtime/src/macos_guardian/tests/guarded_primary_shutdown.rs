@@ -347,6 +347,7 @@ fn shutdown_worker_error_reaps_registered_group_after_zero_guardian_exit() {
     let current_generation = Arc::new(Mutex::new(Some(RegisteredPrimaryGeneration {
         attempt: 1,
         group_pid,
+        group_identity: Some(super::test_support::test_group_identity(group_pid)),
     })));
     let (_tx, updates_rx) = mpsc::channel();
     let mut primary = GuardedPrimary {

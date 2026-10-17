@@ -4,6 +4,7 @@ use std::os::unix::net::UnixStream;
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
+use std::time::Instant;
 
 use super::private_record_relay::private_record_relay;
 use super::records_and_cut_types::{
@@ -47,7 +48,10 @@ impl ControlPlane {
         let host_recovery = Arc::clone(&recovery);
         let host = thread::spawn(move || {
             run_generation_host(
-                std::process::id(), // actual child groups originate in this test process
+                super::super::super::generation_host::GenerationHostAdmission::new(
+                    std::process::id(), // actual child groups originate in this test process
+                    Instant::now() + super::GUARDIAN_SHUTDOWN_DEADLINE,
+                ),
                 host_control,
                 &updates_tx,
                 &host_current,

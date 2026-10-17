@@ -1,11 +1,15 @@
 //! Host-owned persistent guardian and exact registered-generation lifecycle.
+use super::generation_host::GenerationHostAdmission;
+use super::process_group::{GroupIdentity, terminate_attested_group};
+#[cfg(test)]
+use super::terminate_registered_group;
 use super::{
     Arc, BoundRoleGeneration, Child, ChildStdin, ChildStdout, Duration, ExitStatus,
     GUARDIAN_SHUTDOWN_DEADLINE, Instant, JoinHandle, Mutex, Receiver, RecoveryState, RoleEvent,
     RuntimeError, SUPERVISED_ORDERLY_SHUTDOWN, SUPERVISED_QUIT_ACCEPTED, Write, collapse_failures,
     io, lifecycle_error, lock_recovery, mpsc, read_supervised_orderly_ack,
     read_supervised_quit_ack, reject_host_registration, run_generation_host,
-    set_liveness_nonblocking, terminate_registered_group, thread,
+    set_liveness_nonblocking, thread,
 };
 
 /// One host-visible update from the guarded primary-generation owner.
@@ -38,6 +42,37 @@ pub struct GuardedPrimary {
 pub(super) struct RegisteredPrimaryGeneration {
     pub(super) attempt: u32,
     pub(super) group_pid: u32,
+    pub(super) group_identity: Option<GroupIdentity>,
+}
+
+impl RegisteredPrimaryGeneration {
+    pub(super) const fn authenticated(attempt: u32, group_identity: GroupIdentity) -> Self {
+        Self {
+            attempt,
+            group_pid: group_identity.pid,
+            group_identity: Some(group_identity),
+        }
+    }
+}
+
+fn terminate_generation(generation: RegisteredPrimaryGeneration) -> Result<(), RuntimeError> {
+    if let Some(identity) = generation.group_identity {
+        return terminate_attested_group(identity);
+    }
+    #[cfg(test)]
+    {
+        // Older synthetic-only control/error fixtures explicitly supply no
+        // kernel witness. They never stand in for production enrollment.
+        terminate_registered_group(generation.group_pid)
+    }
+    #[cfg(not(test))]
+    Err(lifecycle_error(
+        "macOS guardian missing native generation identity",
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "authenticated generation has no registered leader birth proof",
+        ),
+    ))
 }
 
 impl GuardedPrimary {
@@ -46,6 +81,7 @@ impl GuardedPrimary {
         liveness_writer: ChildStdin,
         quit_ack_reader: ChildStdout,
         control: std::os::unix::net::UnixStream,
+        first_record_deadline: Instant,
         #[cfg(test)] registration_fence: Option<
             super::generation_host::GenerationRegistrationFence,
         >,
@@ -63,7 +99,6 @@ impl GuardedPrimary {
                 return Err(reject_host_registration(
                     child,
                     liveness_writer,
-                    None,
                     lifecycle_error("macOS guardian generation process inspection", source),
                 ));
             }
@@ -75,12 +110,12 @@ impl GuardedPrimary {
         let recovery_for_worker = Arc::clone(&recovery_decision);
         // Bind every later KGC1 SPAWNED record to this retained OS child.
         // A valid control token alone does not authorize an arbitrary PGID.
-        let guardian_pid = child.id();
+        let admission = GenerationHostAdmission::new(child.id(), first_record_deadline);
         let worker = match thread::Builder::new()
             .name("keld-runtime-guardian-generation-host".to_owned())
             .spawn(move || {
                 run_generation_host(
-                    guardian_pid,
+                    admission,
                     control,
                     &updates_tx,
                     &generation_for_worker,
@@ -96,7 +131,6 @@ impl GuardedPrimary {
                 return Err(reject_host_registration(
                     child,
                     liveness_writer,
-                    None,
                     lifecycle_error("macOS guardian generation host worker", source),
                 ));
             }
@@ -146,6 +180,9 @@ impl GuardedPrimary {
     ///
     /// Returns the owning group-signal failure.
     pub fn fail_current_generation(&self, attempt: u32) -> Result<(), RuntimeError> {
+        // The generation lock remains held through kernel identity inspection
+        // and signaling. Otherwise concurrent KGC1 CLEAR could retire this
+        // attempt and publish a successor between the host's read and SIGKILL.
         let current = lock_generation(&self.current_generation);
         let Some(generation) = *current else {
             return Ok(());
@@ -153,7 +190,7 @@ impl GuardedPrimary {
         if generation.attempt != attempt {
             return Ok(());
         }
-        terminate_registered_group(generation.group_pid)
+        terminate_generation(generation)
     }
 
     /// Waits for one generation update up to `timeout`.
@@ -202,11 +239,10 @@ impl GuardedPrimary {
             Ok(None) => {}
             Ok(Some(status)) => {
                 self.liveness_writer.take();
-                let group_pid = take_generation(&self.current_generation)
-                    .map_or(0, |generation| generation.group_pid);
-                let cleanup_error = (group_pid != 0)
-                    .then(|| terminate_registered_group(group_pid).err())
-                    .flatten()
+                let generation = take_generation(&self.current_generation);
+                let group_pid = generation.map_or(0, |generation| generation.group_pid);
+                let cleanup_error = generation
+                    .and_then(|generation| terminate_generation(generation).err())
                     .map(|error| io::Error::other(error.to_string()));
                 Err(RuntimeError::GuardianExited {
                     group_pid,
@@ -307,11 +343,10 @@ impl GuardedPrimary {
         if let Some(observed) = status
             && !observed.success()
         {
-            let group_pid = take_generation(&self.current_generation)
-                .map_or(0, |generation| generation.group_pid);
-            let cleanup_error = (group_pid != 0)
-                .then(|| terminate_registered_group(group_pid).err())
-                .flatten()
+            let generation = take_generation(&self.current_generation);
+            let group_pid = generation.map_or(0, |generation| generation.group_pid);
+            let cleanup_error = generation
+                .and_then(|generation| terminate_generation(generation).err())
                 .map(|error| io::Error::other(error.to_string()));
             failures.push(RuntimeError::GuardianExited {
                 group_pid,
@@ -405,9 +440,7 @@ impl GuardedPrimary {
     }
 
     fn fail_safe_current_group(&self) -> Result<(), RuntimeError> {
-        take_generation(&self.current_generation).map_or(Ok(()), |generation| {
-            terminate_registered_group(generation.group_pid)
-        })
+        take_generation(&self.current_generation).map_or(Ok(()), terminate_generation)
     }
 }
 

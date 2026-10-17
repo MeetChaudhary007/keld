@@ -11,11 +11,12 @@ use nix::fcntl::{FcntlArg, FdFlag, fcntl};
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 
+use super::super::process_group::GroupIdentity;
 use super::super::{
     GUARDIAN_SHUTDOWN_DEADLINE, HostGuardian, RuntimeError, run_with_registration,
     terminate_registered_group,
 };
-use super::test_support::{assert_gone, liveness_pipe, long_running_command};
+use super::test_support::{assert_gone, liveness_pipe, long_running_command, test_group_identity};
 
 mod bootstrap_admission;
 
@@ -123,8 +124,9 @@ fn guardian_death_is_typed_and_cannot_leave_the_group() {
         .stderr(Stdio::null());
     let mut guardian = guardian_command.spawn().expect("spawn guardian stand-in");
     let writer = guardian.stdin.take().expect("guardian liveness writer");
-    let mut owner = HostGuardian::from_registered_parts(guardian, writer, None, group_pid)
-        .expect("register host guardian owner");
+    let mut owner =
+        HostGuardian::from_registered_parts(guardian, writer, None, test_group_identity(group_pid))
+            .expect("register host guardian owner");
     kill(
         Pid::from_raw(i32::try_from(owner.guardian_pid()).expect("guardian pid fits i32")),
         Signal::SIGKILL,
@@ -161,8 +163,9 @@ fn orderly_shutdown_closes_the_same_liveness_writer() {
         .stderr(Stdio::null());
     let mut guardian = guardian_command.spawn().expect("spawn guardian stand-in");
     let writer = guardian.stdin.take().expect("guardian liveness writer");
-    let mut owner = HostGuardian::from_registered_parts(guardian, writer, None, group_pid)
-        .expect("register host guardian owner");
+    let mut owner =
+        HostGuardian::from_registered_parts(guardian, writer, None, test_group_identity(group_pid))
+            .expect("register host guardian owner");
     let status = owner.shutdown().expect("orderly EOF shutdown");
     assert!(status.success());
     assert_eq!(owner.group_pid(), None);
@@ -190,8 +193,9 @@ fn zero_exit_guardian_shutdown_reaps_still_registered_group() {
         .stderr(Stdio::null());
     let mut guardian = cmd.spawn().expect("successful EOF guardian");
     let writer = guardian.stdin.take().expect("guardian liveness writer");
-    let mut owner = HostGuardian::from_registered_parts(guardian, writer, None, group_pid)
-        .expect("registered owner");
+    let mut owner =
+        HostGuardian::from_registered_parts(guardian, writer, None, test_group_identity(group_pid))
+            .expect("registered owner");
 
     let status = owner.shutdown().expect("successful guardian shutdown");
     assert!(status.success());
@@ -229,8 +233,9 @@ fn dropping_wedged_registered_guardian_enforces_shutdown_deadline() {
     let mut guardian = guardian_command.spawn().expect("spawn wedged guardian");
     let guardian_pid = guardian.id();
     let writer = guardian.stdin.take().expect("sole liveness writer");
-    let owner = HostGuardian::from_registered_parts(guardian, writer, None, group_pid)
-        .expect("register owned guardian");
+    let owner =
+        HostGuardian::from_registered_parts(guardian, writer, None, test_group_identity(group_pid))
+            .expect("register owned guardian");
 
     let (done_tx, done_rx) = mpsc::sync_channel(1);
     let drop_worker = thread::spawn(move || {
@@ -283,8 +288,9 @@ fn orderly_shutdown_deadline_kills_guardian_and_registered_group() {
     let mut guardian = guardian_command.spawn().expect("spawn wedged guardian");
     let guardian_pid = guardian.id();
     let writer = guardian.stdin.take().expect("guardian liveness writer");
-    let mut owner = HostGuardian::from_registered_parts(guardian, writer, None, group_pid)
-        .expect("register timeout owner");
+    let mut owner =
+        HostGuardian::from_registered_parts(guardian, writer, None, test_group_identity(group_pid))
+            .expect("register timeout owner");
 
     let error = owner
         .shutdown_until(Instant::now())
@@ -313,8 +319,13 @@ fn rejected_host_registration_waits_the_guardian() {
     let mut guardian = guardian_command.spawn().expect("spawn guardian stand-in");
     let guardian_pid = guardian.id();
     let writer = guardian.stdin.take().expect("guardian liveness writer");
-    let error = HostGuardian::from_registered_parts(guardian, writer, None, 0)
-        .expect_err("zero group must reject registration");
+    let error = HostGuardian::from_registered_parts(
+        guardian,
+        writer,
+        None,
+        GroupIdentity::unverified_for_test(0),
+    )
+    .expect_err("zero group must reject registration");
     assert!(
         error.to_string().contains("process group is zero"),
         "{error}"
@@ -334,8 +345,13 @@ fn unrepresentable_group_is_rejected_and_guardian_is_waited() {
     let mut guardian = guardian_command.spawn().expect("spawn guardian stand-in");
     let guardian_pid = guardian.id();
     let writer = guardian.stdin.take().expect("guardian liveness writer");
-    let error = HostGuardian::from_registered_parts(guardian, writer, None, u32::MAX)
-        .expect_err("unrepresentable group must reject registration");
+    let error = HostGuardian::from_registered_parts(
+        guardian,
+        writer,
+        None,
+        GroupIdentity::unverified_for_test(u32::MAX),
+    )
+    .expect_err("unrepresentable group must reject registration");
     assert!(error.to_string().contains("exceeds c_int"), "{error}");
     let guardian_pid = i32::try_from(guardian_pid).expect("guardian pid fits i32");
     assert_eq!(kill(Pid::from_raw(guardian_pid), None), Err(Errno::ESRCH));
@@ -357,8 +373,9 @@ fn inheritable_writer_rejection_waits_the_guardian() {
     let guardian_pid = guardian.id();
     let writer = guardian.stdin.take().expect("guardian liveness writer");
     fcntl(&writer, FcntlArg::F_SETFD(FdFlag::empty())).expect("make test writer inheritable");
-    let error = HostGuardian::from_registered_parts(guardian, writer, None, group_pid)
-        .expect_err("inheritable writer must reject registration");
+    let error =
+        HostGuardian::from_registered_parts(guardian, writer, None, test_group_identity(group_pid))
+            .expect_err("inheritable writer must reject registration");
     assert!(error.to_string().contains("require FD_CLOEXEC"), "{error}");
     let guardian_pid = i32::try_from(guardian_pid).expect("guardian pid fits i32");
     assert_eq!(kill(Pid::from_raw(guardian_pid), None), Err(Errno::ESRCH));

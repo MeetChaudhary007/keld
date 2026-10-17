@@ -26,6 +26,23 @@ pub(super) struct GenerationRegistrationFence {
     pub(super) release: Receiver<()>,
 }
 
+/// The retained Guardian PID and the original authenticated-bootstrap deadline
+/// belong to one generation-control host admission, not separate callers.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct GenerationHostAdmission {
+    guardian_pid: u32,
+    first_record_deadline: Instant,
+}
+
+impl GenerationHostAdmission {
+    pub(super) const fn new(guardian_pid: u32, first_record_deadline: Instant) -> Self {
+        Self {
+            guardian_pid,
+            first_record_deadline,
+        }
+    }
+}
+
 #[derive(Default)]
 pub(super) struct HostGenerationState {
     pub(super) lease: Option<RoleGenerationLease>,
@@ -37,7 +54,7 @@ pub(super) struct HostGenerationState {
 
 #[allow(clippy::too_many_lines)] // one owner keeps every private protocol transition contiguous
 pub(super) fn run_generation_host(
-    guardian_pid: u32,
+    admission: GenerationHostAdmission,
     mut control: std::os::unix::net::UnixStream,
     updates_tx: &Sender<GuardedPrimaryUpdate>,
     current_generation: &Mutex<Option<RegisteredPrimaryGeneration>>,
@@ -64,11 +81,19 @@ pub(super) fn run_generation_host(
     );
     let mut state = HostGenerationState::default();
     let mut control_reader = GenerationControlReader::new();
+    let mut first_record_pending = true;
     loop {
         if let Some(lease) = state.lease.as_mut() {
             lease.poll()?;
         }
         forward_generation_updates(updates_tx, &bound_rx, &events_rx)?;
+        // Authentication is not permission to hold the host's generation
+        // worker forever with an open zero-byte KGC1 stream. The first fixed
+        // control record shares the ORIGINAL authenticated-bootstrap deadline;
+        // unlike the existing per-record timer, this includes zero bytes.
+        if first_record_pending && Instant::now() >= admission.first_record_deadline {
+            return Err(initial_generation_record_timeout());
+        }
         let record = match control_reader.poll(&mut control) {
             Ok(record) => record,
             Err(error) if runtime_io_kind(&error) == Some(io::ErrorKind::UnexpectedEof) => {
@@ -84,6 +109,16 @@ pub(super) fn run_generation_host(
             }
             Err(error) => return Err(error),
         };
+        if first_record_pending {
+            if Instant::now() >= admission.first_record_deadline {
+                // A fully buffered late frame is not accepted after the
+                // original deadline merely because a read completed.
+                return Err(initial_generation_record_timeout());
+            }
+            if record.is_some() {
+                first_record_pending = false;
+            }
+        }
         let expected_attempt = lock_recovery(recovery_decision).expected_attempt;
         if let Some(record) = record {
             if state.pending_prepare.is_some() {
@@ -135,12 +170,12 @@ pub(super) fn run_generation_host(
                     // The authenticated Guardian is still untrusted input.
                     // Before granting an app link or recording a killable PGID,
                     // prove this leader is its actual direct OS child.
-                    validate_guardian_child_group(record.pid, guardian_pid)?;
+                    let group_identity =
+                        validate_guardian_child_group(record.pid, admission.guardian_pid)?;
                     current.child_spawned(record.pid, record.attempt)?;
-                    *lock_generation(current_generation) = Some(RegisteredPrimaryGeneration {
-                        attempt: record.attempt,
-                        group_pid: record.pid,
-                    });
+                    *lock_generation(current_generation) = Some(
+                        RegisteredPrimaryGeneration::authenticated(record.attempt, group_identity),
+                    );
                     forward_generation_updates(updates_tx, &bound_rx, &events_rx)?;
                     #[cfg(test)]
                     if let Some(fence) =
@@ -301,6 +336,16 @@ pub(super) fn run_generation_host(
             return Err(error);
         }
     }
+}
+
+fn initial_generation_record_timeout() -> RuntimeError {
+    lifecycle_error(
+        "macOS guardian initial generation registration deadline",
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            "authenticated Guardian supplied no complete first KGC1 record before its original deadline",
+        ),
+    )
 }
 
 fn rejected_recovery() -> RuntimeError {
