@@ -116,9 +116,14 @@ actions:
 ```bash
 just --version       # verify minimum version (1.55.0+)
 just --list          # discover all public recipes with descriptions
-just --show ci       # safely inspect recipe definition and dependencies without executing
+just --show ci       # inspect the CI entrypoint without executing it
 just fmt-check       # fast, non-mutating formatting check
 ```
+
+The `ci` recipe delegates to `tools/ci_local.py`. `just --show ci` displays
+that entrypoint, not the full gate dependency list. To inspect the actual
+gates and their dependencies, read `ci-inventory`, `ci-policy`, and the
+referenced recipes in the root [`justfile`](../../justfile).
 
 When optional tools are missing, specific fallbacks apply to individual components
 (e.g., `cargo test --workspace` can run a partial workspace test suite when
